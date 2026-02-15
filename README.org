@@ -78,11 +78,36 @@ Enable mode:
 
 =M-x org-ai-skills-mode=
 
-Future versions will support:
-- Skill discovery
-- Planner execution
-- Run ticket generation
-- Proposal workflow
+* Usage (Skill Spec v1)
+
+Load and inspect the first skill spec:
+
+#+begin_example
+(add-to-list 'load-path "/path/to/org-ai-skills/elisp")
+(require 'org-ai-skills)
+
+;; Discover skill files under skills/
+(org-ai-skills-discover-skill-files)
+
+;; Parse and validate one skill
+(setq skill
+      (org-ai-skills-parse-skill-file
+       "/path/to/org-ai-skills/skills/001-generate-structured-notes.org"))
+#+end_example
+
+Build a structured payload for gptel:
+
+#+begin_example
+(org-ai-skills-build-gptel-payload
+ skill
+ "Draft a product specification for org-ai-skills plugin")
+#+end_example
+
+Load gptel from straight checkout path if needed:
+
+#+begin_example
+(org-ai-skills-require-gptel "~/.emacs.d/straight/repos/gptel/")
+#+end_example
 
 * Contribution
 

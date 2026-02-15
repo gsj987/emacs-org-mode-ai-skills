@@ -1,0 +1,23 @@
+* Skill: Generate Structured Notes
+:PROPERTIES:
+:SKILL_ID: gen-notes
+:END:
+
+#+EFFECT: pure
+#+INVOCATION: suggest
+#+CONTEXT: project
+#+DETERMINISM: deterministic
+
+** Description
+Transform selected Org content into a concise, structured outline.
+
+** Inputs
+- org-selection
+
+** Outputs
+- structured-org-outline
+
+** Steps
+1. Analyze heading and paragraph structure.
+2. Propose concise section headers.
+3. Return an Org subtree with TODO markers where useful.
