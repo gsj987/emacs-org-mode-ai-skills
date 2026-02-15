@@ -1,0 +1,21 @@
+# Emacs byte-compiled files
+*.elc
+
+# Emacs lock and autosave files
+.#*
+#*#
+\#*\#
+*~
+
+# Org and editor temp files
+*.tmp
+*.swp
+*.swo
+
+# Test and coverage artifacts
+*.lcov
+coverage/
+
+# OS metadata
+.DS_Store
+Thumbs.db

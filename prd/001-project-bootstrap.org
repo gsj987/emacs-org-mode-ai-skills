@@ -1,0 +1,46 @@
+#+TITLE: PRD 001 - Project Bootstrap Initialization
+#+STARTUP: overview
+
+* Problem
+The repository is missing the baseline project structure and initial
+implementation required by =README.org= usage instructions.
+Users cannot load =org-ai-skills= from =elisp/= or run ERT tests because
+the expected files and directories do not yet exist.
+
+* Scope
+- In scope:
+  - Create baseline directories: =elisp/=, =tests/=, =skills/=.
+  - Add a minimal loadable Emacs Lisp module: =org-ai-skills.el=.
+  - Add a minimal toggleable minor mode: =org-ai-skills-mode=.
+  - Add ERT tests for loadability and mode behavior.
+  - Run tests locally.
+- Out of scope:
+  - Planner, run ticket, proposal, governance implementations.
+  - Runtime skill execution features.
+
+* Constraints
+- Technical constraints:
+  - Keep implementation minimal, testable, and free of hidden global mutation.
+  - Follow Emacs Lisp best practices for package header and =provide=.
+- Process constraints:
+  - PRD must exist before code changes.
+  - Tests must be added and executed.
+
+* Expected Behavior
+- The package can be loaded via:
+  - =(add-to-list 'load-path ".../elisp")=
+  - =(require 'org-ai-skills)=
+- =org-ai-skills-mode= can be enabled and disabled without errors.
+- ERT tests run successfully in batch mode.
+
+* Tasks
+- [X] Create baseline directories and initial files.
+- [X] Implement minimal =org-ai-skills.el= with minor mode.
+- [X] Add ERT tests in =tests/=.
+- [X] Execute tests and verify passing status.
+- [X] Update worklog with implementation and test result.
+
+* Worklog
+- 2026-02-15 :: Implemented project bootstrap: created =elisp/=, =tests/=, =skills/=, added
+  minimal =org-ai-skills.el= module with =org-ai-skills-mode=, and added ERT tests for
+  feature loading and mode toggling. Test status: pass (2/2, batch ERT).

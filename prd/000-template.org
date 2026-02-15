@@ -1,0 +1,25 @@
+#+TITLE: PRD Template
+#+STARTUP: overview
+
+* Problem
+Describe the problem this task solves.
+
+* Scope
+- In scope:
+- Out of scope:
+
+* Constraints
+- Technical constraints:
+- Process constraints:
+
+* Expected Behavior
+- Behavior 1:
+- Behavior 2:
+
+* Tasks
+- [ ] Task one
+- [ ] Task two
+- [ ] Task three
+
+* Worklog
+- YYYY-MM-DD :: Summary of work completed. Test status: pass/fail.

@@ -1,0 +1,94 @@
+#+TITLE: org-ai-skills
+#+STARTUP: overview
+
+* Project Goal
+
+org-ai-skills is an experimental Emacs system for defining, executing,
+and evolving AI Skills using Org Mode and gptel.
+
+The system treats Skills as structured cognitive procedures
+that can be planned, executed, reviewed, and evolved safely.
+
+This project aims to:
+
+- Define a minimal Skill specification model
+- Separate Skill spec from Run state
+- Provide Planner + Run Ticket mechanism
+- Enable controlled Skill self-evolution
+- Use dev-agent-work style AI-driven development workflow
+
+This is an experimental cognitive runtime for Emacs.
+
+* Architecture Overview
+
+Core concepts:
+- Skill Spec (Org-defined, read-only)
+- Run Ticket (execution instance)
+- Proposal (change suggestion)
+- Governance Gate (approval before commit)
+
+System layers:
+
+1. Skill Registry
+2. Planner
+3. Execution via gptel
+4. Run Tracking
+5. Proposal & Governance
+
+* Directory Structure
+
+- elisp/         → Emacs Lisp source code
+- skills/        → Skill spec definitions
+- prd/           → Product requirement documents
+- tests/         → ERT test cases
+
+* Development Workflow
+
+This project follows an AI-assisted workflow inspired by:
+https://github.com/farra/dev-agent-work
+
+Each feature iteration includes:
+
+1. Write or update PRD in prd/ following the =prd/000-template.org= 
+2. Implement feature in elisp/
+3. Write ERT tests
+4. Run tests locally
+5. Update README if behavior changes
+6. Append entry to the prd org file
+
+No direct feature implementation without PRD.
+
+* Testing
+
+We use ERT for testing.
+
+To run tests:
+=M-x ert RET t RET=
+
+All new features must include tests.
+
+* Usage (Initial Version)
+
+Add to init.el:
+
+=(add-to-list 'load-path "/path/to/org-ai-skills/elisp")=
+=(require 'org-ai-skills)=
+
+Enable mode:
+
+=M-x org-ai-skills-mode=
+
+Future versions will support:
+- Skill discovery
+- Planner execution
+- Run ticket generation
+- Proposal workflow
+
+* Contribution
+
+All changes must:
+
+- Include PRD update
+- Pass tests
+- Update worklog
+- Be reviewed through governance workflow
