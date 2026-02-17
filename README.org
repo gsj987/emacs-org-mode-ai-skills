@@ -80,6 +80,71 @@ Enable mode:
 
 * Usage (Skill Spec v1)
 
+** org-skill Spec (v1)
+
+The first =org-skill= spec is file-based and validated with explicit rules.
+
+Scope in v1:
+- Discover only =*.org= files under =skills/=
+- Parse one skill per file (top-level heading)
+- Validate required fields and semantic tag values
+- Return deterministic structured data for gptel integration
+
+Required structure:
+- Heading: =* Skill: <Skill Name>=
+- Property drawer key: =:SKILL_ID: <id>=
+- Required semantic tags:
+  - =#+EFFECT:= one of =pure/local/external/irreversible=
+  - =#+INVOCATION:= one of =auto/suggest/manual=
+  - =#+CONTEXT:= one of =buffer/project/global=
+  - =#+DETERMINISM:= one of =deterministic/heuristic=
+- Required section: =** Description=
+
+Minimal valid example:
+
+#+begin_example
+* Skill: Generate Structured Notes
+:PROPERTIES:
+:SKILL_ID: gen-notes
+:END:
+
+#+EFFECT: pure
+#+INVOCATION: suggest
+#+CONTEXT: project
+#+DETERMINISM: deterministic
+
+** Description
+Transform selected Org content into a concise, structured outline.
+#+end_example
+
+Parse output contract (=org-ai-skills-parse-skill-file=):
+- Returns plist keys:
+  - =:file=
+  - =:title=
+  - =:skill-id=
+  - =:description=
+  - =:tags= with nested plist:
+    - =:effect=
+    - =:invocation=
+    - =:context=
+    - =:determinism=
+
+Failure behavior:
+- Signals =org-ai-skills-parse-error= for:
+  - Missing required fields/section
+  - Invalid semantic tag values
+  - Unreadable skill files
+- Parser is read-only and does not modify files under =skills/=
+
+gptel mapping contract (=org-ai-skills-build-gptel-payload=):
+- Returns plist keys:
+  - =:skill-id=
+  - =:skill-title=
+  - =:goal=
+  - =:description=
+  - =:tags=
+  - =:prompt=
+
 Load and inspect the first skill spec:
 
 #+begin_example

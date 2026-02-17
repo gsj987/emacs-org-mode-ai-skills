@@ -186,3 +186,4 @@ agent 在调度前可以参考这些标签做决策
 - 2026-02-15 :: Refined PRD with concrete scope boundaries, acceptance scenarios, and executable task breakdown for implementation review. Test status: not run.
 - 2026-02-15 :: Added gptel integration requirements, ERT gptel loading assumptions, and structured-data verification criteria. Test status: not run.
 - 2026-02-15 :: Implemented first skill spec file, skill discovery/parser/validator APIs, Skill->gptel payload mapping, and ERT coverage for success/failure/read-only/gptel loading scenarios. Test status: pass (8/8, batch ERT).
+- 2026-02-17 :: Clarified =README.org= org-skill v1 specification with explicit structure contract, allowed semantic tag values, parser output schema, error semantics, and gptel payload mapping to reduce ambiguity in usage docs. Test status: pass (8/8, batch ERT).
