@@ -311,6 +311,30 @@
       (org-ai-skills-embark-rewrite-subtree-action "target")
       (should (eq called #'org-ai-skills-org-rewrite-subtree)))))
 
+(ert-deftest org-ai-skills-embark-action-delegates-to-planner-commands ()
+  "Embark planner adapters should dispatch to their interactive commands."
+  (let (calls)
+    (cl-letf (((symbol-function 'call-interactively)
+               (lambda (command &optional _record-flag _keys)
+                 (push command calls))))
+      (org-ai-skills-embark-plan-and-run-subtree-action "target")
+      (org-ai-skills-embark-plan-and-run-subtree-repeat-task-action "target"))
+    (should (member #'org-ai-skills-org-plan-and-run-subtree calls))
+    (should (member #'org-ai-skills-org-plan-and-run-subtree-repeat-task calls))))
+
+(ert-deftest org-ai-skills-plan-and-run-caches-last-task ()
+  "Planner command should persist last task for reuse helper."
+  (let ((org-ai-skills--last-planner-task nil)
+        received-task)
+    (cl-letf (((symbol-function 'org-ai-skills-run-task-with-planner)
+               (lambda (task _subtree _options _callback)
+                 (setq received-task task))))
+      (org-ai-skills-org-plan-and-run-subtree
+       '(:heading "Leaf" :level 3 :text "*** Leaf\n")
+       "Normalize and shorten"))
+    (should (string= received-task "Normalize and shorten"))
+    (should (string= org-ai-skills--last-planner-task "Normalize and shorten"))))
+
 (ert-deftest org-ai-skills-embark-install-action-registers-org-heading-map ()
   "Embark install helper should register the org heading action map."
   (let ((had-bound (boundp 'embark-keymap-alist))
@@ -327,9 +351,206 @@
             (should (eq (lookup-key (symbol-value
                                      (cdr (assq 'org-heading embark-keymap-alist)))
                                     (kbd "R"))
-                        #'org-ai-skills-embark-rewrite-subtree-action))))
+                        #'org-ai-skills-embark-rewrite-subtree-action))
+            (should (eq (lookup-key (symbol-value
+                                     (cdr (assq 'org-heading embark-keymap-alist)))
+                                    (kbd "P"))
+                        #'org-ai-skills-embark-plan-and-run-subtree-action))
+            (should (eq (lookup-key (symbol-value
+                                     (cdr (assq 'org-heading embark-keymap-alist)))
+                                    (kbd "p"))
+                        #'org-ai-skills-embark-plan-and-run-subtree-repeat-task-action))))
       (if had-bound
           (set 'embark-keymap-alist old-value)
         (makunbound 'embark-keymap-alist)))))
+
+(ert-deftest org-ai-skills-plan-repeat-errors-without-last-task ()
+  "Planner repeat helper should fail when no prior task exists."
+  (let ((org-ai-skills--last-planner-task nil))
+    (should-error
+     (org-ai-skills-org-plan-and-run-subtree-repeat-task '(:heading "Leaf"))
+     :type 'org-ai-skills-planner-error)))
+
+(ert-deftest org-ai-skills-plan-repeat-reuses-last-task ()
+  "Planner repeat helper should forward cached task."
+  (let ((org-ai-skills--last-planner-task "Refine notes")
+        called-target
+        called-task)
+    (cl-letf (((symbol-function 'org-ai-skills-org-plan-and-run-subtree)
+               (lambda (target task)
+                 (setq called-target target)
+                 (setq called-task task))))
+      (org-ai-skills-org-plan-and-run-subtree-repeat-task '(:heading "Leaf")))
+    (should (equal called-target '(:heading "Leaf")))
+    (should (string= called-task "Refine notes"))))
+
+(ert-deftest org-ai-skills-read-planner-task-preset-errors-when-missing ()
+  "Reading preset should fail when no presets configured."
+  (let ((org-ai-skills-planner-task-presets nil))
+    (should-error (org-ai-skills-read-planner-task-preset)
+                  :type 'org-ai-skills-planner-error)))
+
+(ert-deftest org-ai-skills-plan-run-preset-forwards-mapped-task ()
+  "Preset planner command should map preset id to task text."
+  (let ((org-ai-skills-planner-task-presets
+         '(("notes" . "Convert to concise notes"))))
+    (cl-letf (((symbol-function 'org-ai-skills-org-plan-and-run-subtree)
+               (lambda (target task)
+                 (setq org-ai-skills-test--captured-target target)
+                 (setq org-ai-skills-test--captured-task task))))
+      (org-ai-skills-org-plan-and-run-subtree-preset '(:heading "Leaf") "notes")
+      (should (equal org-ai-skills-test--captured-target '(:heading "Leaf")))
+      (should (string= org-ai-skills-test--captured-task "Convert to concise notes")))))
+
+(ert-deftest org-ai-skills-define-plan-run-preset-command-uses-fixed-task ()
+  "Generated preset command should invoke planner with fixed task."
+  (let ((command 'org-ai-skills-test--fixed-task-command)
+        captured-target
+        captured-task)
+    (fmakunbound command)
+    (org-ai-skills-define-plan-run-preset-command
+     org-ai-skills-test--fixed-task-command
+     "Turn subtree into action items")
+    (unwind-protect
+        (cl-letf (((symbol-function 'org-ai-skills-org-plan-and-run-subtree)
+                   (lambda (target task)
+                     (setq captured-target target)
+                     (setq captured-task task))))
+          (funcall command '(:heading "Leaf"))
+          (should (equal captured-target '(:heading "Leaf")))
+          (should (string= captured-task "Turn subtree into action items")))
+      (fmakunbound command))))
+
+(ert-deftest org-ai-skills-load-skill-metadata-returns-meta-only-shape ()
+  "Metadata loader should provide planner-safe minimal fields."
+  (let* ((meta (car (org-ai-skills-load-skill-metadata
+                     (expand-file-name "skills" org-ai-skills-test--project-root)))))
+    (should (string= (plist-get meta :skill-id) "gen-notes"))
+    (should (stringp (plist-get meta :summary)))
+    (should-not (plist-member meta :contracts))
+    (should-not (plist-member meta :requirements))
+    (should-not (plist-member meta :function-calls))))
+
+(ert-deftest org-ai-skills-build-planner-request-serializes-metadata-array ()
+  "Planner request builder should serialize metadata list without json type errors."
+  (let* ((metadata (org-ai-skills-load-skill-metadata
+                    (expand-file-name "skills" org-ai-skills-test--project-root)))
+         (request (org-ai-skills-build-planner-request
+                   "Polish this subtree"
+                   metadata
+                   '(:task "Polish this subtree" :steps nil :plan-revision 1)))
+         (prompt (plist-get request :prompt)))
+    (should (stringp prompt))
+    (should (string-match-p "\"skill-id\":\"gen-notes\"" prompt))
+    (should (string-match-p "Skill metadata list (JSON):" prompt))))
+
+(ert-deftest org-ai-skills-build-planner-request-supports-non-ascii-task ()
+  "Planner request prompt should remain valid with non-ASCII task text."
+  (let* ((metadata (org-ai-skills-load-skill-metadata
+                    (expand-file-name "skills" org-ai-skills-test--project-root)))
+         (request (org-ai-skills-build-planner-request
+                   "优化和重写我的章节，让他有足够的说服力"
+                   metadata
+                   '(:task "优化和重写我的章节，让他有足够的说服力"
+                     :steps nil
+                     :plan-revision 1)))
+         (prompt (plist-get request :prompt))
+         (payload (list :messages
+                        (vector (list :role "user" :content prompt)))))
+    (should (multibyte-string-p prompt))
+    (should (string-match-p "优化和重写我的章节" prompt))
+    (should (stringp (json-serialize payload :null-object :null :false-object :json-false)))))
+
+(ert-deftest org-ai-skills-build-planner-request-handles-completed-step-skill-list ()
+  "Planner request should serialize completed step summaries with list skill ids."
+  (let* ((metadata (org-ai-skills-load-skill-metadata
+                    (expand-file-name "skills" org-ai-skills-test--project-root)))
+         (run-state '(:task "优化和重写我的章节，让他有足够的说服力"
+                     :plan-revision 1
+                     :steps ((:step-id 1
+                              :skills ("gen-notes")
+                              :goal "Optimize and rewrite"
+                              :output "* LLM Skill 在 Org-mode 中的优势"))
+                     :latest-output nil))
+         (request (org-ai-skills-build-planner-request
+                   "优化和重写我的章节，让他有足够的说服力"
+                   metadata
+                   run-state))
+         (prompt (plist-get request :prompt)))
+    (should (stringp prompt))
+    (should (string-match-p "\"skills\":\\[\"gen-notes\"\\]" prompt))))
+
+(ert-deftest org-ai-skills-parse-planner-response-validates-known-skills ()
+  "Planner response parser should reject unknown skill ids."
+  (let* ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
+         (json "{\"candidates\":[{\"skill_id\":\"unknown\",\"why\":\"x\",\"score\":0.2}],\"plan\":[{\"step_id\":\"s1\",\"goal\":\"g\",\"skills\":[\"unknown\"],\"input_from\":[\"task\"],\"expected_output\":\"o\"}],\"replan_signal\":{\"enabled\":false,\"condition\":\"\"}}"))
+    (should-error (org-ai-skills-parse-planner-response json metadata)
+                  :type 'org-ai-skills-planner-error)))
+
+(ert-deftest org-ai-skills-parse-planner-response-enforces-skill-limit-reject ()
+  "Planner parser should fail when step skill count exceeds configured limit."
+  (let* ((org-ai-skills-planner-max-skills-per-step 1)
+         (org-ai-skills-planner-overflow-strategy 'reject)
+         (metadata (list '(:skill-id "s1")
+                         '(:skill-id "s2")))
+         (json "{\"candidates\":[],\"plan\":[{\"step_id\":\"s1\",\"goal\":\"g\",\"skills\":[\"s1\",\"s2\"],\"input_from\":[\"task\"],\"expected_output\":\"o\"}],\"replan_signal\":{\"enabled\":false,\"condition\":\"\"}}"))
+    (should-error (org-ai-skills-parse-planner-response json metadata)
+                  :type 'org-ai-skills-planner-error)))
+
+(ert-deftest org-ai-skills-parse-planner-response-enforces-skill-limit-split ()
+  "Planner parser should auto-split oversized steps when configured."
+  (let* ((org-ai-skills-planner-max-skills-per-step 1)
+         (org-ai-skills-planner-max-steps 5)
+         (org-ai-skills-planner-overflow-strategy 'split)
+         (metadata (list '(:skill-id "s1")
+                         '(:skill-id "s2")))
+         (json "{\"candidates\":[],\"plan\":[{\"step_id\":\"s1\",\"goal\":\"g\",\"skills\":[\"s1\",\"s2\"],\"input_from\":[\"task\"],\"expected_output\":\"o\"}],\"replan_signal\":{\"enabled\":false,\"condition\":\"\"}}")
+         (parsed (org-ai-skills-parse-planner-response json metadata))
+         (plan (plist-get parsed :plan)))
+    (should (= (length plan) 2))
+    (should (equal (plist-get (car plan) :skills) '("s1")))
+    (should (equal (plist-get (cadr plan) :skills) '("s2")))))
+
+(ert-deftest org-ai-skills-parse-planner-response-accepts-skill-objects-in-step ()
+  "Planner parser should accept step skills as objects with skill_id."
+  (let* ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
+         (json "{\"candidates\":[{\"skill_id\":\"gen-notes\",\"why\":\"fit\",\"score\":0.9}],\"plan\":[{\"step_id\":1,\"goal\":\"Rewrite\",\"skills\":[{\"skill_id\":\"gen-notes\",\"input_from\":[\"user\"],\"expected_output\":\"out\"}]}],\"replan_signal\":{\"enabled\":false,\"condition\":\"\"}}")
+         (parsed (org-ai-skills-parse-planner-response json metadata))
+         (plan (plist-get parsed :plan)))
+    (should (= (length plan) 1))
+    (should (equal (plist-get (car plan) :skills) '("gen-notes")))))
+
+(ert-deftest org-ai-skills-execute-plan-step-loads-only-selected-skills ()
+  "Step execution should lazily load only skills referenced by the step."
+  (let (loaded-ids callback-run-state)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (skill-id &optional _directory)
+                 (push skill-id loaded-ids)
+                 (list :skill-id skill-id
+                       :title (format "Skill %s" skill-id)
+                       :description "desc"
+                       :outputs nil
+                       :contracts nil
+                       :requirements nil)))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback "*** Result\nBody\n"))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :goal "g" :skills ("alpha" "beta") :expected-output "o")
+       '(:task "task" :subtree (:text "*** Input\n"))
+       (lambda (run-state _output)
+         (setq callback-run-state run-state))))
+    (should (equal (sort loaded-ids #'string<) '("alpha" "beta")))
+    (should (equal (plist-get (car (plist-get callback-run-state :steps)) :skills)
+                   '("alpha" "beta")))))
+
+(ert-deftest org-ai-skills-maybe-replan-enforces-max-replans ()
+  "Replan helper should stop when max replan count is reached."
+  (let ((org-ai-skills-planner-max-replans 1))
+    (should-error
+     (org-ai-skills-maybe-replan
+      '(:replans 1 :latest-output "[[REPLAN]]")
+      '(:replan-signal (:enabled t) :plan ((:step-id "s2" :skills ("gen-notes")))))
+     :type 'org-ai-skills-planner-error)))
 
 ;;; org-ai-skills-test.el ends here

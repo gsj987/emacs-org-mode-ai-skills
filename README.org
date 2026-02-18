@@ -235,6 +235,68 @@ Embark integration:
 - Registers action key =R= on target type =org-heading=.
 - Trigger =R= from Embark on an Org heading target to run rewrite flow.
 
+* Usage (Autonomous Planner + Lazy Skill Loading)
+
+Planner mode adds automatic skill candidate selection, multi-step execution, and optional replanning.
+
+Core model:
+- Planner phase uses metadata-only skill index:
+  - =org-ai-skills-load-skill-metadata=
+- Execution phase lazy-loads full skill context only for selected step skills:
+  - =org-ai-skills-load-skill-by-id=
+- Planner command:
+  - =M-x org-ai-skills-org-plan-and-run-subtree=
+  - =M-x org-ai-skills-org-plan-and-run-subtree-repeat-task= (reuse previous planner task)
+  - =M-x org-ai-skills-org-plan-and-run-subtree-preset= (select preset task intent)
+
+Planner APIs:
+- Build planner request:
+  - =(org-ai-skills-build-planner-request task metadata run-state)=
+- Parse planner response:
+  - =(org-ai-skills-parse-planner-response response-text metadata)=
+- Run task with planner orchestration:
+  - =(org-ai-skills-run-task-with-planner task subtree)=
+
+Balancing controls:
+- =org-ai-skills-planner-max-steps= (default 6)
+- =org-ai-skills-planner-max-replans= (default 2)
+- =org-ai-skills-planner-auto-replan= (default t)
+- =org-ai-skills-planner-max-skills-per-step= (default 2)
+- =org-ai-skills-planner-batching-mode= (=quality-first=, =balanced=, =speed-first=)
+- =org-ai-skills-planner-overflow-strategy= (=reject= or =split=)
+
+Behavior notes:
+- If planner returns too many skills in one step:
+  - =reject=: signal planner validation error.
+  - =split=: auto-split one oversized step into bounded step parts.
+- Debug logging includes planner events, step composition reason, and per-step skill ids.
+- Planner task reuse:
+  - Last task is cached in =org-ai-skills--last-planner-task=.
+  - Repeat command reruns planner on selected subtree with cached task.
+  - If no prior task exists, repeat command signals a planner error.
+- Embark keys on =org-heading=:
+  - =R= manual single-skill rewrite
+  - =P= planner run (prompt task)
+  - =p= planner rerun with last task
+
+Preset intents for common tasks:
+#+begin_example
+(setq org-ai-skills-planner-task-presets
+      '(("meeting-notes" . "Rewrite into concise meeting notes with decisions and action items")
+        ("rfc-brief" . "Rewrite into RFC format: Problem, Proposal, Risks, Open Questions")
+        ("zh-polish" . "Polish wording and clarity; keep Chinese language and Org structure")))
+#+end_example
+
+Generate a keybind-friendly fixed-task command:
+#+begin_example
+(org-ai-skills-define-plan-run-preset-command
+ org-ai-skills-plan-rfc-brief
+ "Rewrite into RFC format: Problem, Proposal, Risks, Open Questions")
+
+;; Example keybind
+(global-set-key (kbd "C-c a r") #'org-ai-skills-plan-rfc-brief)
+#+end_example
+
 * Contribution
 
 All changes must:

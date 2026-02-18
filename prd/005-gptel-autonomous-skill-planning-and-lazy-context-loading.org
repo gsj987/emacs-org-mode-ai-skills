@@ -1,0 +1,315 @@
+#+TITLE: PRD 005 - gptel Autonomous Skill Planning and Lazy Context Loading
+#+STARTUP: overview
+
+* Problem
+Current workflow requires users to manually select one skill before rewrite execution.
+This blocks autonomous task completion, makes multi-skill composition hard, and can add
+unnecessary prompt bloat when multiple skills exist.
+
+The system also lacks a planning loop where gptel can:
+- Identify skill candidates for a task
+- Create a multi-step plan
+- Replan when new information appears after step execution
+
+To support controlled autonomy, we need a planner-oriented runtime that keeps
+skill loading minimal and explicit.
+
+* Scope
+- In scope:
+  - Add metadata-only skill discovery for planner decisions.
+  - Add a planner contract so gptel can propose candidates and multi-step plans.
+  - Add lazy full-skill loading: full skill sections are injected only for selected skills.
+  - Add execution loop for step-by-step skill composition.
+  - Add replan mechanism after each step (bounded and observable).
+  - Add helper flow to reuse the last planner task without retyping.
+  - Add preset-task planner helpers so common task intents can be invoked as commands.
+  - Add Embark shortcuts for planner run and planner rerun-with-last-task.
+  - Add tests for metadata loading, plan parsing, lazy-load guarantees, and replan flow.
+  - Update README with autonomous planning usage and controls.
+- Out of scope:
+  - Runtime mutation of skill spec files.
+  - Arbitrary tool execution outside current gptel-based rewrite/request flow.
+  - Infinite/fully open-ended autonomous loops without safety bounds.
+
+* Constraints
+- Technical constraints:
+  - Preserve spec vs run separation: skill specs remain read-only.
+  - Planner selection phase must use skill metadata only (no full section injection).
+  - Full skill context (contracts/requirements/function-calls/raw sections) is loaded only
+    for skills selected in active plan steps.
+  - Planner and replan outputs must be structured and machine-validated.
+  - Execution loop must be bounded (max steps, max replans) to avoid runaway loops.
+  - Per-step skill composition must be bounded to prevent context overload.
+  - Planner should balance quality and speed when deciding single-skill vs multi-skill steps.
+  - Backward compatibility for existing manual rewrite flow must be preserved.
+- Process constraints:
+  - Follow AGENTS workflow: PRD -> implementation -> tests -> test run -> README -> worklog.
+
+* Expected Behavior
+- Behavior 1:
+  - User provides one high-level task; system can auto-select relevant skills.
+- Behavior 2:
+  - Candidate selection and planning use only per-skill metadata.
+- Behavior 3:
+  - For each plan step, runtime loads full content only for the selected step skill(s).
+- Behavior 4:
+  - Runtime executes plan steps sequentially and stores step outputs as run state.
+- Behavior 5:
+  - Runtime can trigger replan when step output introduces new constraints/facts.
+- Behavior 6:
+  - Planner decisions and replan revisions are observable through debug logs.
+- Behavior 7:
+  - Existing command =org-ai-skills-org-rewrite-subtree= remains usable as-is.
+- Behavior 8:
+  - Multi-skill batching per step is allowed but must respect a strict max-skill-per-step limit.
+- Behavior 9:
+  - User can rerun planner flow on a new subtree using the previously entered planner task.
+- Behavior 10:
+  - Embark exposes separate actions for planner run (prompt task) and planner rerun (reuse last task).
+- Behavior 11:
+  - User can run planner with predefined task intents via reusable preset-task commands.
+
+* Spec Design
+
+** 1) Skill Metadata Index (Planner Input)
+Introduce a metadata-only parser/output for planner stage.
+
+New API (proposed):
+- =org-ai-skills-load-skill-metadata (&optional directory)=
+
+Metadata contract per skill (no full context sections):
+#+begin_example
+(:skill-id "gen-notes"
+ :title "Generate Structured Notes"
+ :file "/path/skills/001-generate-structured-notes.org"
+ :tags (:effect "pure" :invocation "suggest" :context "project" :determinism "deterministic")
+ :summary "Transform selected Org content into a concise, structured outline.")
+#+end_example
+
+Policy:
+- =:summary= is derived from a minimal extract (e.g., first sentence/line of Description).
+- Planner prompt gets only this metadata list.
+- No contracts/requirements/function-calls/raw-sections at this stage.
+
+** 2) Planner Request/Response Contract
+Add planner builder/parser for strict structured planning.
+
+New APIs (proposed):
+- =org-ai-skills-build-planner-request (task metadata-list run-state)=
+- =org-ai-skills-parse-planner-response (text)=
+
+Planner response contract (validated plist/JSON):
+#+begin_example
+(:candidates
+  ((:skill-id "gen-notes" :why "Best for structure normalization" :score 0.91)
+   (:skill-id "rewrite-style" :why "Tone/style refinement" :score 0.78))
+ :plan
+  ((:step-id "s1"
+    :goal "Normalize structure"
+    :skills ("gen-notes")
+    :input-from ("task")
+    :expected-output "Clean Org subtree")
+   (:step-id "s2"
+    :goal "Apply concise style"
+    :skills ("rewrite-style")
+    :input-from ("s1")
+    :expected-output "Final concise subtree"))
+ :replan-signal
+  (:enabled t :condition "If new constraints appear in step output"))
+#+end_example
+
+Validation rules:
+- Unknown skill ids are rejected.
+- Plan must have >=1 step and <= configured max steps.
+- Each step must reference at least one known skill id.
+
+** 3) Lazy Full-Skill Loading
+Add id-based full loader for execution stage.
+
+New API (proposed):
+- =org-ai-skills-load-skill-by-id (skill-id &optional directory)=
+
+Execution rule:
+- During plan execution, runtime resolves each referenced skill id and loads full parsed skill
+  via existing parser only at that step.
+- Only selected step skill contexts are injected into step prompt payload.
+
+Observability rule:
+- Debug entry records which skill ids were metadata-only vs fully loaded at each phase.
+
+** 4) Plan Execution Runtime
+Add a bounded orchestration loop with explicit run state.
+
+New APIs (proposed):
+- =org-ai-skills-run-task-with-planner (task subtree &optional options)=
+- =org-ai-skills-execute-plan-step (step run-state)=
+- =org-ai-skills-maybe-replan (run-state planner-context)=
+
+Run-state contract (in-memory, deterministic shape):
+#+begin_example
+(:run-id "uuid-or-timestamp-id"
+ :task "User task"
+ :subtree (...)
+ :metadata-snapshot (...)
+ :plan-revision 1
+ :steps
+  ((:step-id "s1" :status done :skills ("gen-notes") :output "..."))
+ :final-output nil
+ :events (...))
+#+end_example
+
+Execution policy:
+- Sequential step execution.
+- Each step can compose 1..N selected skills in prompt context.
+- Step output is persisted into run-state and becomes input for subsequent steps.
+
+** 5) Replan Policy
+After each step, call planner with updated run-state summary to decide whether to keep or revise plan.
+
+Controls (proposed defcustoms):
+- =org-ai-skills-planner-max-steps= (default 6)
+- =org-ai-skills-planner-max-replans= (default 2)
+- =org-ai-skills-planner-auto-replan= (default t)
+- =org-ai-skills-planner-max-skills-per-step= (default 2)
+- =org-ai-skills-planner-batching-mode= (default =balanced=; options: =quality-first=, =balanced=, =speed-first=)
+
+Replan triggers:
+- Planner explicitly returns replan-required flag.
+- Runtime detects unresolved constraints marker in step output.
+
+Safety:
+- Stop with explicit error when limits are exceeded.
+- Preserve run-state and debug trace for postmortem.
+
+** 6) Skill Composition Balancing Policy
+Planner must choose how many skills to combine in one step using an explicit policy.
+
+Policy inputs:
+- estimated context cost (combined prompt/context size)
+- dependency tightness between selected skills
+- latency target implied by batching mode
+- determinism/effect tags (prefer fewer mixed-risk skills in one step)
+
+Decision rules:
+- Hard limit: number of skills in a step must not exceed
+  =org-ai-skills-planner-max-skills-per-step=.
+- In =quality-first= mode:
+  - default to one skill per step unless dependency is strong and context cost is low.
+- In =balanced= mode:
+  - allow limited batching (up to max) when skills are complementary and expected to reduce round-trips.
+- In =speed-first= mode:
+  - prefer batching up to max limit unless context cost crosses threshold.
+
+Fallback rule:
+- If planner returns too many skills for a step, runtime either:
+  - rejects plan as validation error, or
+  - auto-splits into multiple steps (configurable; default: reject for explicitness).
+
+** 7) UX and Commands
+Add planner-enabled command while preserving manual command.
+
+New command (proposed):
+- =org-ai-skills-org-plan-and-run-subtree=
+  - Inputs: task instruction, rewrite scope target.
+  - Flow: metadata discovery -> candidate/plan -> step execution -> optional replans -> apply final rewrite.
+
+Additional helper command:
+- =org-ai-skills-org-plan-and-run-subtree-repeat-task=
+  - Uses cached last planner task.
+  - Prompts for rewrite scope target, not task text.
+  - Errors explicitly when no prior planner task exists.
+
+Preset-task commands:
+- =org-ai-skills-org-plan-and-run-subtree-preset=
+  - Prompts for rewrite scope target + preset id, then executes planner with mapped preset task text.
+- =org-ai-skills-define-plan-run-preset-command=
+  - Macro to define keybind-friendly dedicated commands bound to a fixed task string.
+
+Embark action keys (proposed):
+- =R= manual single-skill rewrite (existing)
+- =P= planner run (prompt task)
+- =p= planner rerun with last task
+
+Manual flow remains:
+- =org-ai-skills-org-rewrite-subtree= unchanged for direct single-skill usage.
+
+** 8) Debug and Governance Alignment
+Extend debug capture to include:
+- Metadata snapshot hash/count
+- Candidate list with scores/reasons
+- Plan revisions and diff summary
+- Per-step composition decision (why batched vs split)
+- Per-step loaded skill ids and prompt payloads
+- Replan trigger reason and decision
+
+This keeps behavior auditable and aligned with controlled evolution principles.
+
+* Acceptance Scenarios
+1. Metadata-only planning
+- Given N skills in =skills/=, planner request includes only metadata fields, not full sections.
+
+2. Lazy full-load enforcement
+- Given plan step selects one skill, only that skill full context is loaded/injected.
+
+3. Multi-skill composition
+- Given step with multiple skills, request context contains all selected skill contexts and no unselected ones.
+
+4. Replan success path
+- Given step output contains new constraint, runtime produces plan revision and continues.
+
+5. Replan bound safety
+- Given repeated replan triggers beyond limit, runtime aborts with explicit planner error.
+
+6. Step composition bound safety
+- Given planner step with skill count above max limit, runtime rejects (or splits if configured).
+
+7. Unknown skill guard
+- Given planner returns unknown skill id, runtime rejects plan with validation error.
+
+8. Backward compatibility
+- Existing manual rewrite command still works and test suite remains green.
+
+9. Debug trace completeness
+- Debug mode captures candidate selection, plan revisions, and per-step load details.
+
+10. Reuse-last-task helper
+- Given a prior planner run, rerun command uses cached task and does not prompt for task text.
+
+11. Missing-last-task guard
+- Given no prior planner run, rerun command fails with explicit planner error.
+
+12. Preset-task command execution
+- Given a configured preset task, preset command runs planner without task-text prompt.
+
+13. Fixed-task generated command
+- Given a generated preset command, invoking it runs planner with its fixed task string.
+
+* Tasks
+- [X] Add metadata-only skill loader and contract tests.
+- [X] Add planner request/response builder + strict parser/validator.
+- [X] Add skill-id full loader for lazy execution-stage context injection.
+- [X] Implement bounded plan execution runtime and run-state model.
+- [X] Implement optional replan loop with limits and clear failure signaling.
+- [X] Add planner-enabled interactive command.
+- [X] Extend debug logging for planner/replan events.
+- [X] Add ERT coverage for metadata-only planning, lazy-load guarantees, replan behavior, and compatibility.
+- [X] Run batch ERT and record results.
+- [X] Update README usage/docs for planner + lazy-loading flow.
+- [X] Add helper command to rerun planner with last task and add Embark bindings.
+- [X] Add ERT tests for planner task reuse helper and Embark planner keybindings.
+- [X] Add preset-task planner command and preset-to-task mapping.
+- [X] Add macro/helper for generating fixed-task plan-run commands.
+- [X] Add ERT tests for preset command flow and generated command behavior.
+- [X] Append worklog after implementation.
+
+* Worklog
+- 2026-02-18 :: Drafted PRD for autonomous skill planning, lazy full-skill context loading, and bounded replan orchestration with gptel. Test status: not run.
+- 2026-02-18 :: Implemented planner-driven subtree rewrite flow with metadata-only skill discovery, lazy full-skill loading by step, structured planner request/response validation, max-skills-per-step balancing controls (reject/split overflow strategy), bounded replan loop, new interactive command =org-ai-skills-org-plan-and-run-subtree=, and expanded debug visibility for planner/step events; added ERT coverage for planner constraints and lazy-load behavior; updated README planner usage section. Test status: pass (29/29, batch ERT).
+- 2026-02-18 :: Extended PRD to support planner task reuse helper and Embark planner shortcut actions for repeatable task execution without retyping. Test status: not run.
+- 2026-02-18 :: Implemented planner task reuse cache and helper command (=org-ai-skills-org-plan-and-run-subtree-repeat-task=), added Embark planner actions/keys (=P= prompt task, =p= repeat last task), expanded ERT coverage for cache/repeat and Embark delegation, and updated README planner usage. Test status: pass (33/33, batch ERT).
+- 2026-02-18 :: Extended PRD to include preset-task planner command helpers for common task intents and generated fixed-task command workflow. Test status: not run.
+- 2026-02-18 :: Implemented planner preset-task mapping (=org-ai-skills-planner-task-presets=), added preset command (=org-ai-skills-org-plan-and-run-subtree-preset=), introduced generated fixed-task command macro (=org-ai-skills-define-plan-run-preset-command=), expanded README with preset/command examples, and added ERT coverage for preset lookup and generated-command execution. Test status: pass (36/36, batch ERT).
+- 2026-02-18 :: Fixed planner JSON serialization bug in =org-ai-skills-build-planner-request= by encoding list-like payload fields as vectors for unambiguous JSON arrays (prevents =wrong-type-argument symbolp= on metadata list), and added regression ERT for planner request serialization. Test status: pass (37/37, batch ERT).
+- 2026-02-18 :: Fixed planner prompt JSON encoding for non-ASCII tasks by decoding JSON snippets to multibyte UTF-8 before prompt composition (prevents =wrong-type-argument json-value-p= during gptel request encoding with Chinese task text), and added regression ERT for non-ASCII planner request serialization. Test status: pass (38/38, batch ERT).
+- 2026-02-18 :: Fixed replan-state planner request serialization for completed steps by normalizing =:skills= lists to JSON arrays (vectors) in step summaries (prevents =wrong-type-argument consp nil= in =json-serialize=), and added regression ERT covering completed-step list serialization. Test status: pass (39/39, batch ERT).
+- 2026-02-18 :: Hardened planner response parsing to accept step skill entries as either string skill ids or nested objects with =skill_id=/=skill-id= (prevents false unknown-skill errors when model emits richer skill entries inside =skills= list), and added regression ERT for object-style skill entries. Test status: pass (40/40, batch ERT).
