@@ -173,6 +173,13 @@ Build a structured payload for gptel:
  "Draft a product specification for org-ai-skills plugin")
 #+end_example
 
+Example skill set for composition testing:
+- =skills/001-generate-structured-notes.org=
+  - Expands and structures subtree content with richer detail.
+- =skills/002-simplify-for-twitter-post.org=
+  - Compresses subtree content into concise, tweet-ready wording
+    (including <= 280 character tweet sentence constraint in contracts).
+
 Load gptel from straight checkout path if needed:
 
 #+begin_example

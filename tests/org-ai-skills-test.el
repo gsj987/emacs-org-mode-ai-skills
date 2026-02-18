@@ -16,6 +16,9 @@
 (defconst org-ai-skills-test--first-skill-file
   (expand-file-name "skills/001-generate-structured-notes.org" org-ai-skills-test--project-root))
 
+(defconst org-ai-skills-test--twitter-skill-file
+  (expand-file-name "skills/002-simplify-for-twitter-post.org" org-ai-skills-test--project-root))
+
 (defconst org-ai-skills-test--gptel-dir
   (expand-file-name "~/.emacs.d/straight/repos/gptel/"))
 
@@ -48,6 +51,18 @@
     (should (listp (plist-get skill :contracts)))
     (should (listp (plist-get skill :requirements)))
     (should (listp (plist-get skill :function-calls)))
+    (should (plist-get skill :raw-sections))))
+
+(ert-deftest org-ai-skills-parse-twitter-simplification-skill-success ()
+  "Twitter simplification example skill should parse to a structured object."
+  (let ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--twitter-skill-file)))
+    (should (string= (plist-get skill :skill-id) "simplify-twitter"))
+    (should (string= (plist-get skill :title) "Simplify For Twitter Post"))
+    (should (string= (plist-get (plist-get skill :tags) :invocation) "suggest"))
+    (should (member "produce at least one tweet-ready sentence no longer than 280 characters"
+                    (plist-get skill :contracts)))
+    (should (member "remove unnecessary verbosity, repetition, and filler"
+                    (plist-get skill :requirements)))
     (should (plist-get skill :raw-sections))))
 
 (ert-deftest org-ai-skills-parse-new-sections-for-context-bundle ()
@@ -486,6 +501,28 @@
          (json "{\"candidates\":[{\"skill_id\":\"unknown\",\"why\":\"x\",\"score\":0.2}],\"plan\":[{\"step_id\":\"s1\",\"goal\":\"g\",\"skills\":[\"unknown\"],\"input_from\":[\"task\"],\"expected_output\":\"o\"}],\"replan_signal\":{\"enabled\":false,\"condition\":\"\"}}"))
     (should-error (org-ai-skills-parse-planner-response json metadata)
                   :type 'org-ai-skills-planner-error)))
+
+(ert-deftest org-ai-skills-parse-planner-response-rejects-empty-plan-by-default ()
+  "Planner parser should reject empty plan for initial planning."
+  (let* ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
+         (json "{\"candidates\":[],\"plan\":[],\"replan_signal\":{\"enabled\":false,\"condition\":\"\"}}"))
+    (should-error (org-ai-skills-parse-planner-response json metadata)
+                  :type 'org-ai-skills-planner-error)))
+
+(ert-deftest org-ai-skills-parse-planner-response-allows-empty-plan-for-replan ()
+  "Planner parser should allow empty plan in replan context."
+  (let* ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
+         (json "{\"candidates\":[],\"plan\":[],\"replan_signal\":{\"enabled\":false,\"condition\":\"\"}}")
+         (parsed (org-ai-skills-parse-planner-response json metadata t)))
+    (should (equal (plist-get parsed :plan) nil))
+    (should-not (plist-get (plist-get parsed :replan-signal) :enabled))))
+
+(ert-deftest org-ai-skills-parse-planner-response-ignores-empty-skill-steps-on-replan ()
+  "Replan parser should ignore no-op steps with empty skill list."
+  (let* ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
+         (json "{\"candidates\":[],\"plan\":[{\"step_id\":3,\"goal\":\"Task complete\",\"skills\":[],\"input_from\":[],\"expected_output\":null,\"composition_reason\":\"done\"}],\"replan_signal\":{\"enabled\":false,\"condition\":null}}")
+         (parsed (org-ai-skills-parse-planner-response json metadata t)))
+    (should (equal (plist-get parsed :plan) nil))))
 
 (ert-deftest org-ai-skills-parse-planner-response-enforces-skill-limit-reject ()
   "Planner parser should fail when step skill count exceeds configured limit."

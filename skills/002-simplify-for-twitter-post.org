@@ -1,0 +1,38 @@
+* Skill: Simplify For Twitter Post
+:PROPERTIES:
+:SKILL_ID: simplify-twitter
+:END:
+
+#+EFFECT: pure
+#+INVOCATION: suggest
+#+CONTEXT: project
+#+DETERMINISM: deterministic
+
+** Description
+Rewrite selected Org content into concise, tweet-ready wording while preserving the core message and source language.
+
+** Inputs
+- org-selection
+
+** Outputs
+- concise-org-subtree
+- include one tweet-ready sentence under the rewritten subtree
+- tweet-ready sentence should be short, clear, and actionable
+- keep final output in valid Org syntax only (no analysis text)
+
+** Contracts
+- preserve the original language of the selected section
+- keep the core claim and key evidence from source content
+- produce at least one tweet-ready sentence no longer than 280 characters
+- return only final Org artifact
+
+** Requirements
+- maintain valid Org heading structure at selected subtree level
+- remove unnecessary verbosity, repetition, and filler
+- avoid adding unsupported claims or new external facts
+- keep wording easy to understand for broad audience
+
+** Steps
+1. Identify the core message and strongest supporting point in the selected subtree.
+2. Rewrite the subtree in concise language while keeping key meaning intact.
+3. Add a tweet-ready sentence (<= 280 characters) in the same language as source.

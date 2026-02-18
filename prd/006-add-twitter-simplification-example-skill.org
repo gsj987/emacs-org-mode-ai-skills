@@ -1,0 +1,47 @@
+#+TITLE: PRD 006 - Add Twitter Simplification Example Skill
+#+STARTUP: overview
+
+* Problem
+Current examples include only one skill focused on expanding structure and detail.
+To validate multi-skill composition scenarios (expand + simplify), we need a second
+example skill that compresses content into a concise, post-ready form.
+
+For practical testing, this skill should target tweet-ready constraints so users can
+verify short-form output behavior in planner/step composition.
+
+* Scope
+- In scope:
+  - Add a new skill spec file under =skills/= for simplifying content to tweet-ready form.
+  - Define explicit constraints for concise and postable output.
+  - Add ERT coverage that parses and validates the new skill spec.
+  - Update README to mention the additional example skill and intended usage.
+- Out of scope:
+  - Changing runtime planner logic or parser contracts.
+  - Adding platform API integration or automatic posting.
+
+* Constraints
+- Technical constraints:
+  - Skill file must follow current org-skill parser contract (required tags/sections).
+  - Skill spec files remain static/read-only at runtime.
+  - Keep compatibility with existing tests and skill discovery ordering.
+- Process constraints:
+  - Follow AGENTS workflow: PRD -> implementation -> tests -> test run -> README -> worklog.
+
+* Expected Behavior
+- Behavior 1:
+  - New skill file parses successfully with skill-id, tags, description, outputs/contracts/requirements.
+- Behavior 2:
+  - Skill intent clearly enforces concise, tweet-ready rewriting constraints.
+- Behavior 3:
+  - Existing and new tests pass without regressions.
+
+* Tasks
+- [X] Add new skill file in =skills/= for Twitter-ready simplification.
+- [X] Add ERT test(s) validating parse result of the new skill.
+- [X] Update README to mention the new example skill.
+- [X] Run batch ERT and record results.
+- [X] Append worklog with implementation and test status.
+
+* Worklog
+- 2026-02-18 :: Drafted PRD for adding a second example skill focused on tweet-ready simplification to support multi-skill composition testing. Test status: not run.
+- 2026-02-18 :: Added new skill spec =skills/002-simplify-for-twitter-post.org= with concise/tweet-ready contracts, added parser ERT for the new skill, updated README example skill set section, and ran batch ERT. Test status: pass (41/41, batch ERT).

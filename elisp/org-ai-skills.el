@@ -447,6 +447,12 @@ Return a list of one or more normalized steps."
     (org-ai-skills--plist-value entry :skill-id :skill_id))
    (t entry)))
 
+(defun org-ai-skills--planner-step-has-skills-p (step)
+  "Return non-nil when normalized planner STEP contains at least one skill id."
+  (let* ((skills-raw (or (plist-get step :skills) nil))
+         (skills (mapcar #'org-ai-skills--normalize-step-skill-entry skills-raw)))
+    (and (listp skills) skills)))
+
 (defun org-ai-skills--normalize-planner-candidate (candidate known-skill-ids)
   "Normalize one planner CANDIDATE against KNOWN-SKILL-IDS."
   (let* ((skill-id (or (org-ai-skills--plist-value candidate :skill-id :skill_id)
@@ -468,8 +474,9 @@ Return a list of one or more normalized steps."
         :expected-output (or (org-ai-skills--plist-value step :expected-output :expected_output) "")
         :composition-reason (or (org-ai-skills--plist-value step :composition-reason :composition_reason) "")))
 
-(defun org-ai-skills-parse-planner-response (text metadata-list)
-  "Parse planner TEXT into normalized structure using METADATA-LIST."
+(defun org-ai-skills-parse-planner-response (text metadata-list &optional allow-empty-plan)
+  "Parse planner TEXT into normalized structure using METADATA-LIST.
+When ALLOW-EMPTY-PLAN is non-nil, an empty plan is accepted."
   (let* ((json-object (org-ai-skills--extract-json-object text))
          (raw (json-parse-string
                json-object
@@ -481,15 +488,24 @@ Return a list of one or more normalized steps."
                                   metadata-list))
          (candidates-raw (or (plist-get raw :candidates) nil))
          (plan-raw (or (plist-get raw :plan) nil))
+         (normalized-plan-raw
+          (mapcar #'org-ai-skills--normalize-planner-step plan-raw))
+         (effective-plan-raw
+          (if allow-empty-plan
+              (cl-remove-if-not #'org-ai-skills--planner-step-has-skills-p normalized-plan-raw)
+            normalized-plan-raw))
          (replan-raw (or (org-ai-skills--plist-value raw :replan-signal :replan_signal)
                          nil)))
-    (unless (and (listp plan-raw) plan-raw)
+    (unless (listp plan-raw)
+      (signal 'org-ai-skills-planner-error
+              (list "Planner response must include plan list")))
+    (when (and (not allow-empty-plan) (null effective-plan-raw))
       (signal 'org-ai-skills-planner-error
               (list "Planner response must include non-empty plan")))
-    (when (> (length plan-raw) org-ai-skills-planner-max-steps)
+    (when (> (length effective-plan-raw) org-ai-skills-planner-max-steps)
       (signal 'org-ai-skills-planner-error
               (list (format "Planner response exceeds max steps (%d > %d)"
-                            (length plan-raw)
+                            (length effective-plan-raw)
                             org-ai-skills-planner-max-steps))))
     (let* ((normalized-candidates
             (mapcar (lambda (candidate)
@@ -499,9 +515,9 @@ Return a list of one or more normalized steps."
             (apply #'append
                    (mapcar (lambda (step)
                              (org-ai-skills--validate-planner-step
-                              (org-ai-skills--normalize-planner-step step)
+                              step
                               known-skill-ids))
-                           plan-raw)))
+                           effective-plan-raw)))
            (replan-enabled (and replan-raw
                                 (org-ai-skills--plist-value replan-raw :enabled)))
            (replan-condition (and replan-raw
@@ -834,10 +850,12 @@ Only skills referenced by STEP are loaded from DIRECTORY."
   (let ((request (org-ai-skills-build-planner-request task metadata run-state)))
     (org-ai-skills-gptel-dispatch-rewrite
      request
-     (lambda (&rest response)
-       (let* ((text (apply #'org-ai-skills--extract-gptel-response-text response))
-              (parsed (org-ai-skills-parse-planner-response text metadata)))
-         (funcall callback parsed))))))
+      (lambda (&rest response)
+        (let* ((text (apply #'org-ai-skills--extract-gptel-response-text response))
+              (parsed (org-ai-skills-parse-planner-response
+                       text metadata (and (listp (plist-get run-state :steps))
+                                           (plist-get run-state :steps)))))
+          (funcall callback parsed))))))
 
 (defun org-ai-skills--run-plan-steps (task metadata run-state plan callback &optional directory)
   "Run PLAN steps recursively for TASK and METADATA.
