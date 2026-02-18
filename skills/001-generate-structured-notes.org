@@ -16,6 +16,8 @@ Transform selected Org content into a concise, structured outline.
 
 ** Outputs
 - structured-org-outline
+- output must be the final Org artifact only (no explanations, no thinking trace, no progress narration)
+- rewritten content must preserve the original language of the selected section
 
 ** Steps
 1. Analyze heading and paragraph structure.

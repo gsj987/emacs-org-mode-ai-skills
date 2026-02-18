@@ -5,6 +5,8 @@
 ;;; Code:
 
 (require 'ert)
+(require 'cl-lib)
+(require 'org)
 (add-to-list 'load-path (expand-file-name "../elisp" (file-name-directory (or load-file-name buffer-file-name))))
 (require 'org-ai-skills)
 
@@ -90,5 +92,149 @@
                       org-ai-skills-test--gptel-dir)))
   (should (org-ai-skills-require-gptel org-ai-skills-test--gptel-dir))
   (should (featurep 'gptel)))
+
+(ert-deftest org-ai-skills-org-resolve-subtree-current-heading ()
+  "Resolve nearest heading subtree from point in Org content."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Top\n** Child\n*** Leaf\nLeaf body.\n")
+    (search-backward "Leaf body.")
+    (let ((subtree (org-ai-skills-org-resolve-subtree 'current)))
+      (should (equal (plist-get subtree :heading) "Leaf"))
+      (should (= (plist-get subtree :level) 3))
+      (should (eq (plist-get subtree :context-mode) 'current))
+      (should (= (plist-get subtree :levels-up) 0))
+      (should (string-prefix-p "*** Leaf" (plist-get subtree :text))))))
+
+(ert-deftest org-ai-skills-org-resolve-subtree-upper-level ()
+  "Resolve ancestor heading when expanding upper levels."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Top\n** Child\n*** Leaf\nLeaf body.\n")
+    (search-backward "Leaf body.")
+    (let ((subtree (org-ai-skills-org-resolve-subtree 'upper-level 1)))
+      (should (equal (plist-get subtree :heading) "Child"))
+      (should (= (plist-get subtree :level) 2))
+      (should (eq (plist-get subtree :context-mode) 'upper-level))
+      (should (= (plist-get subtree :levels-up) 1))
+      (should (string-prefix-p "** Child" (plist-get subtree :text))))))
+
+(ert-deftest org-ai-skills-org-resolve-subtree-errors-without-heading ()
+  "Subtree resolution should fail when point is before first heading."
+  (with-temp-buffer
+    (org-mode)
+    (insert "No heading here.\n")
+    (goto-char (point-min))
+    (should-error (org-ai-skills-org-resolve-subtree 'current)
+                  :type 'org-ai-skills-org-context-error)))
+
+(ert-deftest org-ai-skills-org-resolve-subtree-errors-on-invalid-expansion ()
+  "Upper-level expansion should fail when ancestor does not exist."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Top\n** Child\n")
+    (goto-char (point-max))
+    (should-error (org-ai-skills-org-resolve-subtree 'upper-level 5)
+                  :type 'org-ai-skills-org-context-error)))
+
+(ert-deftest org-ai-skills-build-gptel-rewrite-request-structure ()
+  "Rewrite payload should include subtree content and context metadata."
+  (let* ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--first-skill-file))
+         (subtree '(:heading "Leaf"
+                    :text "*** Leaf\nBody\n"
+                    :context-mode current
+                    :levels-up 0))
+         (request (org-ai-skills-build-gptel-rewrite-request
+                   skill subtree "Rewrite with concise style")))
+    (should (equal (plist-get request :skill-id) "gen-notes"))
+    (should (equal (plist-get request :headline) "Leaf"))
+    (should (eq (plist-get request :context-mode) 'current))
+    (should (string-match-p "Rewrite with concise style"
+                            (plist-get request :prompt)))
+    (should (string-match-p "\\*\\*\\* Leaf"
+                            (plist-get request :prompt)))))
+
+(ert-deftest org-ai-skills-gptel-dispatch-errors-when-gptel-missing ()
+  "Dispatch should fail with explicit error when gptel is unavailable."
+  (let ((original-featurep (symbol-function 'featurep)))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (if (eq feature 'gptel)
+                     nil
+                   (funcall original-featurep feature))))
+              ((symbol-function 'org-ai-skills-require-gptel)
+               (lambda (&optional _gptel-dir) nil)))
+      (should-error (org-ai-skills-gptel-dispatch-rewrite
+                     '(:prompt "rewrite")
+                     #'ignore)
+                    :type 'org-ai-skills-gptel-error))))
+
+(ert-deftest org-ai-skills-org-context-candidates-show-path-preview ()
+  "Rewrite target candidates should include current and ancestor path previews."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Top\n** Child\n*** Leaf\nLeaf body.\n")
+    (search-backward "Leaf body.")
+    (let ((candidates (org-ai-skills-org-collect-context-candidates)))
+      (should (= (length candidates) 3))
+      (should (string-match-p "\\[current\\] Top/Child/Leaf"
+                              (car (nth 0 candidates))))
+      (should (string-match-p "\\[up:1\\] Top/Child"
+                              (car (nth 1 candidates))))
+      (should (equal (plist-get (cdr (nth 0 candidates)) :heading) "Leaf"))
+      (should (equal (plist-get (cdr (nth 1 candidates)) :heading) "Child")))))
+
+(ert-deftest org-ai-skills-org-read-rewrite-target-uses-selected-preview ()
+  "Selected preview candidate should resolve to expected target subtree."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Top\n** Child\n*** Leaf\nLeaf body.\n")
+    (search-backward "Leaf body.")
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (_prompt collection &rest _rest)
+                 (nth 1 collection))))
+      (let ((target (org-ai-skills-org-read-rewrite-target)))
+        (should (equal (plist-get target :heading) "Child"))
+        (should (eq (plist-get target :context-mode) 'upper-level))
+        (should (= (plist-get target :levels-up) 1))))))
+
+(ert-deftest org-ai-skills-sanitize-rewrite-output-fixes-level-and-preface ()
+  "Sanitizer should remove explanation preface and enforce target level."
+  (let* ((subtree '(:level 2 :heading "Child"))
+         (raw "Here is the rewrite:\n*** Child Revised\n**** Sub\nBody\n")
+         (cleaned (org-ai-skills--sanitize-rewrite-output raw subtree)))
+    (should-not (string-match-p "Here is the rewrite" cleaned))
+    (should (string-prefix-p "** Child Revised" cleaned))
+    (should (string-match-p "^\\*\\*\\* Sub$" cleaned))))
+
+(ert-deftest org-ai-skills-embark-action-delegates-to-rewrite-command ()
+  "Embark adapter should dispatch to the interactive rewrite command."
+  (let (called)
+    (cl-letf (((symbol-function 'call-interactively)
+               (lambda (command &optional _record-flag _keys)
+                 (setq called command))))
+      (org-ai-skills-embark-rewrite-subtree-action "target")
+      (should (eq called #'org-ai-skills-org-rewrite-subtree)))))
+
+(ert-deftest org-ai-skills-embark-install-action-registers-org-heading-map ()
+  "Embark install helper should register the org heading action map."
+  (let ((had-bound (boundp 'embark-keymap-alist))
+        (old-value (and (boundp 'embark-keymap-alist)
+                        (symbol-value 'embark-keymap-alist))))
+    (unwind-protect
+        (progn
+          (set 'embark-keymap-alist nil)
+          (cl-letf (((symbol-function 'require)
+                     (lambda (feature &optional _filename _noerror)
+                       (eq feature 'embark))))
+            (should (org-ai-skills-embark-install-action))
+            (should (assq 'org-heading embark-keymap-alist))
+            (should (eq (lookup-key (symbol-value
+                                     (cdr (assq 'org-heading embark-keymap-alist)))
+                                    (kbd "R"))
+                        #'org-ai-skills-embark-rewrite-subtree-action))))
+      (if had-bound
+          (set 'embark-keymap-alist old-value)
+        (makunbound 'embark-keymap-alist)))))
 
 ;;; org-ai-skills-test.el ends here

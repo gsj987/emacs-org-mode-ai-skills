@@ -1,0 +1,74 @@
+#+TITLE: PRD 003 - Org Subheadline Rewrite via gptel Skill
+#+STARTUP: overview
+
+* Problem
+Users need a fast way to rewrite content inside Org files by sending a selected
+sub-headline subtree to gptel with a skill-guided prompt.
+Current workflow is manual and does not provide structured context expansion
+(e.g., include nearest enclosing headline or move to upper-level headline before send).
+
+* Scope
+- In scope:
+  - Add a basic Org-mode integration flow to rewrite a selected sub-headline via gptel.
+  - Provide an Embark-like entry action from point/headline selection.
+  - Support context expansion modes before sending to gptel:
+    - Use current nearest headline subtree.
+    - Expand to upper-level headline (org-refile-like level jump).
+  - Integrate with existing skill prompt mapping so rewrite is skill-constrained.
+  - Return rewritten content in a predictable insertion/update flow.
+  - Add tests for selection, context expansion, payload construction, and failure cases.
+- Out of scope:
+  - Full Embark package dependency and deep action framework integration.
+  - Multi-file project-wide context assembly.
+  - Autonomous headline selection without user trigger.
+  - Non-Org major mode support.
+
+* Constraints
+- Technical constraints:
+  - Must work in Org buffers with deterministic subtree boundary detection.
+  - Must preserve Spec vs Run separation (no runtime mutation of skill spec files).
+  - gptel integration should be through testable pure-data payload helpers where possible.
+  - Errors must be explicit (no subtree at point, invalid level expansion, gptel unavailable).
+  - Keep functions small and composable in =elisp/=.
+- Process constraints:
+  - Follow AGENTS workflow: PRD -> implementation -> tests -> test run -> README -> worklog.
+  - Do not ship behavior that is not captured in this PRD.
+
+* Expected Behavior
+- Behavior 1:
+  - User can trigger a rewrite action at an Org headline/sub-headline.
+- Behavior 2:
+  - System resolves a target subtree from point using selected context mode.
+- Behavior 3:
+  - Context mode "current" sends nearest headline subtree.
+- Behavior 4:
+  - Context mode "upper-level" expands to an ancestor headline based on selected level step.
+- Behavior 5:
+  - System builds a skill-guided gptel request payload from resolved subtree text.
+- Behavior 6:
+  - On success, rewritten content is inserted or replaces the target subtree per command contract.
+- Behavior 7:
+  - On failure, user gets actionable error messages without partial silent edits.
+
+* Tasks
+- [X] Define command UX and API for Org rewrite action (interactive + internal function boundaries).
+- [X] Implement subtree resolution helpers for:
+  - [X] current nearest headline
+  - [X] upper-level ancestor expansion
+- [X] Implement rewrite request builder that combines subtree text + selected skill metadata.
+- [X] Implement minimal gptel dispatch wrapper for rewrite action.
+- [X] Implement result application strategy (replace subtree body or full subtree; finalize exact rule in implementation notes).
+- [X] Add ERT tests:
+  - [X] subtree detection from point
+  - [X] ancestor expansion behavior
+  - [X] payload structure correctness
+  - [X] error paths (no headline, invalid expansion, missing gptel)
+- [X] Run batch ERT and record results.
+- [X] Update =README.org= usage docs for Org rewrite workflow.
+- [X] Append implementation summary and test status to worklog.
+
+* Worklog
+- 2026-02-17 :: Drafted PRD for Org sub-headline rewrite with gptel skill integration, including context expansion modes and test plan. Test status: not run.
+- 2026-02-17 :: Implemented Org subtree rewrite integration with context expansion (=current= / =upper-level=), skill-based rewrite payload construction, gptel dispatch wrapper, async subtree replacement flow, README usage updates, and ERT coverage for success/error scenarios. Test status: pass (14/14, batch ERT).
+- 2026-02-17 :: Added optional Embark adapter integration: Org heading action keymap (key =R=), install helper for Embark registration, delegation action to subtree rewrite command, README Embark usage notes, and ERT coverage for registration/delegation behavior. Test status: pass (16/16, batch ERT).
+- 2026-02-17 :: Fixed rewrite UX and output quality issues from manual validation: replaced context mode prompt with org-refile-like scope preview selector (current + ancestors), enforced subtree level normalization on rewritten result replacement, added output sanitization to strip prefatory chatter/code fences, strengthened rewrite prompt to require artifact-only response, updated skill output contract note, and expanded ERT coverage for these cases. Test status: pass (19/19, batch ERT).

@@ -174,6 +174,47 @@ Load gptel from straight checkout path if needed:
 (org-ai-skills-require-gptel "~/.emacs.d/straight/repos/gptel/")
 #+end_example
 
+* Usage (Org Subtree Rewrite via gptel)
+
+This feature rewrites an Org headline subtree with skill-guided prompting.
+
+Interactive flow:
+- Open any Org buffer.
+- Place point in a target headline subtree.
+- Run:
+  - =M-x org-ai-skills-org-rewrite-subtree=
+- Choose rewrite scope from minibuffer preview list (org-refile-like):
+  - = [current] Top/Child/Leaf=
+  - = [up:1] Top/Child=
+  - = [up:2] Top=
+- Choose a skill from =skills/=.
+- Optional: add a custom rewrite instruction.
+
+Core APIs:
+- Resolve target subtree:
+  - =(org-ai-skills-org-resolve-subtree 'current)=
+  - =(org-ai-skills-org-resolve-subtree 'upper-level 1)=
+- Build rewrite request payload:
+  - =(org-ai-skills-build-gptel-rewrite-request skill subtree "Rewrite concisely")=
+- Dispatch to gptel:
+  - =(org-ai-skills-gptel-dispatch-rewrite request callback)=
+- Install Embark action on Org headings:
+  - =(org-ai-skills-embark-install-action)=
+
+Failure behavior:
+- Signals =org-ai-skills-org-context-error= for invalid Org context/ranges.
+- Signals =org-ai-skills-gptel-error= if gptel is unavailable.
+
+Output handling:
+- Rewrite prompt enforces artifact-only output (no explanation/progress text).
+- Response sanitizer strips leading chatter/code fences and normalizes heading levels
+  so replacement root level always matches selected target subtree level.
+
+Embark integration:
+- Requires Embark installed.
+- Registers action key =R= on target type =org-heading=.
+- Trigger =R= from Embark on an Org heading target to run rewrite flow.
+
 * Contribution
 
 All changes must:
