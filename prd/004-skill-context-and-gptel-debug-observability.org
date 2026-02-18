@@ -1,0 +1,194 @@
+#+TITLE: PRD 004 - Full Skill Context Injection and gptel Debug Observability
+#+STARTUP: overview
+
+* Problem
+Current rewrite flow does not pass complete skill content/contracts to gptel.
+Only partial parsed data is used, so constraints defined in skill sections
+(e.g., Outputs language rule) may not affect model behavior.
+
+Current debugging is also weak: users cannot reliably inspect the exact payload
+and prompt sent to gptel for each call.
+
+* Scope
+- In scope:
+  - Extend skill parsing so rewrite calls can include full skill context.
+  - Design and implement a structured "skill context bundle" for gptel requests.
+  - Include contracts/requirements and callable function descriptors in request context.
+  - Add explicit debug tooling to inspect exact payload passed to gptel.
+  - Add tests for parsing, context injection, and debug capture.
+  - Update README usage for new debug workflow and context model.
+- Out of scope:
+  - Real tool-calling execution engine with multi-step autonomous planner loops.
+  - Runtime mutation of skill files.
+  - External telemetry backends.
+
+* Constraints
+- Technical constraints:
+  - Keep skill spec files read-only at runtime.
+  - Context bundle must be deterministic and testable.
+  - Backward compatibility: existing APIs should keep working or have clear migration.
+  - Debug feature must be opt-in (or bounded), to avoid noisy buffers in normal use.
+  - No hidden state mutation; debug logs should be explicit and user-controllable.
+- Process constraints:
+  - Follow AGENTS workflow: PRD -> implementation -> tests -> test run -> README -> worklog.
+
+* Expected Behavior
+- Behavior 1:
+  - Rewrite request contains complete skill-derived context, not only title/description.
+- Behavior 2:
+  - Contracts/requirements from skill spec are represented as structured fields in payload.
+- Behavior 3:
+  - Optional callable function specs are passed to request context when present.
+- Behavior 4:
+  - User can inspect exact request sent to gptel (prompt + structured context).
+- Behavior 5:
+  - Debug output clearly ties to buffer/headline/timestamp for traceability.
+- Behavior 6:
+  - When debug mode is disabled, runtime behavior remains clean and unchanged for users.
+
+* Spec Design
+
+** 1) Skill Spec Extension (Org)
+This PRD proposes extending skill parsing to extract additional sections while
+keeping current v1 fields.
+
+Proposed recognized sections (in addition to current Description/Inputs/Outputs/Steps):
+- =** Contracts=
+- =** Requirements=
+- =** Function Calls=
+
+Example (proposed skill file fragment):
+#+begin_example
+** Contracts
+- Output must be final artifact only.
+- Preserve original language of selected section.
+
+** Requirements
+- Preserve Org heading hierarchy.
+- Do not add external references unless present in source.
+
+** Function Calls
+- name: normalize-headings
+  when: before-return
+  args: (target-level)
+- name: summarize-verbose-paragraph
+  when: optional
+  args: (max-sentences)
+#+end_example
+
+Parsing policy:
+- Missing new sections is allowed (empty list/string defaults).
+- Existing required fields remain unchanged.
+- Parser output must include raw + normalized representations.
+
+** 2) Parsed Data Contract (Elisp plist)
+Proposed parser output additions:
+- =:contracts= list of strings
+- =:requirements= list of strings
+- =:function-calls= list of plists
+  - each plist keys: =:name= =:when= =:args= =:raw=
+- =:raw-sections= plist map for debuggability
+
+Proposed shape:
+#+begin_example
+(:skill-id "gen-notes"
+ :title "Generate Structured Notes"
+ :description "..."
+ :tags (:effect "pure" ...)
+ :contracts ("Output must be final artifact only" ...)
+ :requirements ("Preserve Org heading hierarchy" ...)
+ :function-calls ((:name "normalize-headings" :when "before-return" :args "(target-level)" :raw "...") ...)
+ :raw-sections (:description "..." :outputs "..." :contracts "..." :requirements "..." :function-calls "..."))
+#+end_example
+
+** 3) gptel Request Context Contract
+Introduce a stable context bundle passed into rewrite request builder:
+- =:skill-context= plist with:
+  - =:meta= (id/title/tags)
+  - =:contracts=
+  - =:requirements=
+  - =:function-calls=
+  - =:source-subtree= (headline/level/path/text)
+
+Prompt policy:
+- Prompt text should explicitly reference contracts and requirements.
+- Prompt must request artifact-only output and language preservation.
+
+Proposed request shape:
+#+begin_example
+(:prompt "..."
+ :goal "..."
+ :skill-id "gen-notes"
+ :skill-context
+   (:meta (...)
+    :contracts (...)
+    :requirements (...)
+    :function-calls (...)
+    :source-subtree (...)))
+#+end_example
+
+** 4) Debug Observability Spec
+Add debug capture for every rewrite dispatch.
+
+Proposed user-facing controls:
+- Variable: =org-ai-skills-debug-enabled= (boolean, default nil)
+- Variable: =org-ai-skills-debug-buffer-name= (default "*org-ai-skills-debug*")
+- Command: =org-ai-skills-debug-toggle=
+- Command: =org-ai-skills-debug-show-last=
+
+Captured fields per entry:
+- timestamp
+- buffer-file/buffer-name
+- headline/path
+- selected scope metadata
+- final prompt string
+- structured request plist (pretty-printed)
+
+Format:
+- One entry per dispatch with clear delimiter.
+- Must not include secrets beyond what is already in prompt/request payload.
+
+Implementation boundary:
+- Debug capture occurs immediately before =gptel-request= call.
+- Optional helper to capture callback result preview (first N chars) if enabled.
+
+* Acceptance Scenarios
+1. Full skill context injection
+- Given a skill file with Contracts/Requirements/Function Calls,
+  rewrite request includes those fields under =:skill-context=.
+
+2. Backward compatibility
+- Given an old skill file without new sections,
+  parsing succeeds and context bundle uses empty defaults.
+
+3. Contract influence visibility
+- Debug log clearly shows language-preservation and artifact-only constraints in prompt/context.
+
+4. Debug off behavior
+- With debug disabled, no debug buffer writes occur.
+
+5. Debug on behavior
+- With debug enabled, each dispatch appends one well-formed entry including prompt + payload.
+
+6. Deterministic testability
+- ERT validates parser and request bundle structure with stable assertions.
+
+* Tasks
+- [X] Extend parser to extract optional sections: Contracts/Requirements/Function Calls.
+- [X] Define normalized data model in parser output.
+- [X] Build =:skill-context= bundle in rewrite request builder.
+- [X] Update prompt composition to include contracts/requirements + strict output constraints.
+- [X] Add debug variables and commands (=toggle=, =show-last=).
+- [X] Add pre-dispatch debug capture hook in gptel wrapper.
+- [X] Add ERT tests:
+  - [X] parsing new sections
+  - [X] backward compatibility for old skill files
+  - [X] request context bundle completeness
+  - [X] debug off/on behavior
+- [X] Run batch ERT and record status.
+- [X] Update README usage docs for full-context + debug workflow.
+- [X] Append worklog after implementation.
+
+* Worklog
+- 2026-02-18 :: Drafted PRD for full skill context injection to gptel and debug observability tooling, including spec contracts and acceptance scenarios. Test status: not run.
+- 2026-02-18 :: Implemented full skill-context parsing/injection for gptel rewrite requests (outputs/contracts/requirements/function-calls/raw-sections), enriched subtree context metadata, added debug observability controls (=org-ai-skills-debug-enabled=, debug buffer, toggle/show-last, pre-dispatch payload capture), updated first skill spec with explicit Contracts/Requirements/Function Calls, expanded ERT coverage for new parser/context/debug scenarios, and updated README usage/docs. Test status: pass (23/23, batch ERT).

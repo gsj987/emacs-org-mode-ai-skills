@@ -123,6 +123,11 @@ Parse output contract (=org-ai-skills-parse-skill-file=):
   - =:title=
   - =:skill-id=
   - =:description=
+  - =:outputs= (list)
+  - =:contracts= (list)
+  - =:requirements= (list)
+  - =:function-calls= (list of plists)
+  - =:raw-sections= (plist)
   - =:tags= with nested plist:
     - =:effect=
     - =:invocation=
@@ -196,6 +201,8 @@ Core APIs:
   - =(org-ai-skills-org-resolve-subtree 'upper-level 1)=
 - Build rewrite request payload:
   - =(org-ai-skills-build-gptel-rewrite-request skill subtree "Rewrite concisely")=
+- Build normalized skill context bundle:
+  - =(org-ai-skills-build-skill-context skill subtree)=
 - Dispatch to gptel:
   - =(org-ai-skills-gptel-dispatch-rewrite request callback)=
 - Install Embark action on Org headings:
@@ -209,6 +216,19 @@ Output handling:
 - Rewrite prompt enforces artifact-only output (no explanation/progress text).
 - Response sanitizer strips leading chatter/code fences and normalizes heading levels
   so replacement root level always matches selected target subtree level.
+- Rewrite request includes =:skill-context= with contracts/requirements/function-calls
+  and source subtree metadata.
+
+Debug observability:
+- Toggle debug capture:
+  - =M-x org-ai-skills-debug-toggle=
+- Show last debug capture:
+  - =M-x org-ai-skills-debug-show-last=
+- Variables:
+  - =org-ai-skills-debug-enabled=
+  - =org-ai-skills-debug-buffer-name=
+- Debug entry includes timestamp, buffer/file, target headline/path, final prompt,
+  and full request plist passed to =gptel-request=.
 
 Embark integration:
 - Requires Embark installed.

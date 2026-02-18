@@ -15,6 +15,7 @@
 (require 'subr-x)
 (require 'cl-lib)
 (require 'org)
+(require 'pp)
 
 (defgroup org-ai-skills nil
   "Experimental cognitive runtime for Org-based AI skills."
@@ -25,6 +26,16 @@
   (expand-file-name "../skills" (file-name-directory (or load-file-name buffer-file-name)))
   "Directory that stores Org skill specifications."
   :type 'directory
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-debug-enabled nil
+  "When non-nil, append gptel dispatch payloads to debug buffer."
+  :type 'boolean
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-debug-buffer-name "*org-ai-skills-debug*"
+  "Buffer name used for org-ai-skills debug logs."
+  :type 'string
   :group 'org-ai-skills)
 
 (defconst org-ai-skills--allowed-tags
@@ -38,6 +49,9 @@
 (define-error 'org-ai-skills-org-context-error "Invalid Org subtree context")
 (define-error 'org-ai-skills-gptel-error "gptel integration error")
 (define-error 'org-ai-skills-embark-error "Embark integration error")
+
+(defvar org-ai-skills--last-debug-entry nil
+  "Last debug entry captured for gptel dispatch.")
 
 (defun org-ai-skills--signal-parse-error (file message)
   "Signal parse error with FILE context and MESSAGE."
@@ -54,11 +68,62 @@
 
 (defun org-ai-skills--parse-description (content file)
   "Parse skill description section from CONTENT for FILE."
-  (if (string-match
-       "^\\*\\* Description[ \t]*\n\\([[:ascii:][:nonascii:]\n]*?\\)\\(?:\n\\*\\* \\|\\'\\)"
-       content)
-      (string-trim (match-string 1 content))
-    (org-ai-skills--signal-parse-error file "Missing required section: Description")))
+  (let ((description (org-ai-skills--extract-section content "Description")))
+    (if description
+        description
+      (org-ai-skills--signal-parse-error file "Missing required section: Description"))))
+
+(defun org-ai-skills--extract-section (content section-name)
+  "Extract SECTION-NAME body from CONTENT.
+Return trimmed section text, or nil if section does not exist."
+  (when (string-match
+         (format "^\\*\\* %s[ \t]*\n\\([[:ascii:][:nonascii:]\n]*?\\)\\(?:\n\\*\\* \\|\\'\\)"
+                 (regexp-quote section-name))
+         content)
+    (string-trim (match-string 1 content))))
+
+(defun org-ai-skills--parse-bullet-lines (section-text)
+  "Parse bullet list items from SECTION-TEXT."
+  (if (string-empty-p (or section-text ""))
+      nil
+    (let ((items nil))
+      (dolist (line (split-string section-text "\n"))
+        (when (string-match "^[ \t]*-\\s-+\\(.+\\)$" line)
+          (push (string-trim (match-string 1 line)) items)))
+      (nreverse items))))
+
+(defun org-ai-skills--parse-function-calls (section-text)
+  "Parse function calls from SECTION-TEXT."
+  (if (string-empty-p (or section-text ""))
+      nil
+    (let ((items nil)
+          (current nil)
+          (raw-lines nil))
+      (dolist (line (split-string section-text "\n"))
+        (cond
+         ((string-match "^[ \t]*-\\s-*name:\\s-*\\(.+\\)$" line)
+          (when current
+            (push (append current
+                          (list :raw (string-join (nreverse raw-lines) "\n")))
+                  items))
+          (setq current (list :name (string-trim (match-string 1 line))))
+          (setq raw-lines (list (string-trim line))))
+         ((and current (string-match "^[ \t]+\\([[:alnum:]-]+\\):\\s-*\\(.+\\)$" line))
+          (let* ((key-name (downcase (match-string 1 line)))
+                 (value (string-trim (match-string 2 line)))
+                 (key (pcase key-name
+                        ("when" :when)
+                        ("args" :args)
+                        (_ (intern (format ":%s" key-name))))))
+            (setq current (plist-put current key value))
+            (push (string-trim line) raw-lines)))
+         ((and current (not (string-empty-p (string-trim line))))
+          (push (string-trim line) raw-lines))))
+      (when current
+        (push (append current
+                      (list :raw (string-join (nreverse raw-lines) "\n")))
+              items))
+      (nreverse items))))
 
 (defun org-ai-skills--extract-tag (content tag-key file)
   "Extract TAG-KEY value from CONTENT for FILE."
@@ -99,7 +164,17 @@ Return a plist with normalized keys."
          (invocation (org-ai-skills--extract-tag content "INVOCATION" file))
          (context (org-ai-skills--extract-tag content "CONTEXT" file))
          (determinism (org-ai-skills--extract-tag content "DETERMINISM" file))
-         (description (org-ai-skills--parse-description content file)))
+         (description (org-ai-skills--parse-description content file))
+         (inputs-section (or (org-ai-skills--extract-section content "Inputs") ""))
+         (outputs-section (or (org-ai-skills--extract-section content "Outputs") ""))
+         (steps-section (or (org-ai-skills--extract-section content "Steps") ""))
+         (contracts-section (or (org-ai-skills--extract-section content "Contracts") ""))
+         (requirements-section (or (org-ai-skills--extract-section content "Requirements") ""))
+         (function-calls-section (or (org-ai-skills--extract-section content "Function Calls") ""))
+         (outputs (org-ai-skills--parse-bullet-lines outputs-section))
+         (contracts (org-ai-skills--parse-bullet-lines contracts-section))
+         (requirements (org-ai-skills--parse-bullet-lines requirements-section))
+         (function-calls (org-ai-skills--parse-function-calls function-calls-section)))
     (org-ai-skills--validate-tag 'effect effect file)
     (org-ai-skills--validate-tag 'invocation invocation file)
     (org-ai-skills--validate-tag 'context context file)
@@ -108,6 +183,17 @@ Return a plist with normalized keys."
           :title title
           :skill-id skill-id
           :description description
+          :outputs outputs
+          :contracts contracts
+          :requirements requirements
+          :function-calls function-calls
+          :raw-sections (list :description description
+                              :inputs inputs-section
+                              :outputs outputs-section
+                              :steps steps-section
+                              :contracts contracts-section
+                              :requirements requirements-section
+                              :function-calls function-calls-section)
           :tags (list :effect effect
                       :invocation invocation
                       :context context
@@ -129,6 +215,25 @@ Return a plist with normalized keys."
                         (plist-get skill :skill-id)
                         (plist-get skill :title)
                         goal)))
+
+(defun org-ai-skills-build-skill-context (skill subtree)
+  "Build normalized skill context bundle from SKILL and SUBTREE."
+  (list
+   :meta (list :skill-id (plist-get skill :skill-id)
+               :skill-title (plist-get skill :title)
+               :tags (plist-get skill :tags))
+   :description (plist-get skill :description)
+   :outputs (or (plist-get skill :outputs) nil)
+   :contracts (or (plist-get skill :contracts) nil)
+   :requirements (or (plist-get skill :requirements) nil)
+   :function-calls (or (plist-get skill :function-calls) nil)
+   :raw-sections (plist-get skill :raw-sections)
+   :source-subtree (list :headline (plist-get subtree :heading)
+                         :level (plist-get subtree :level)
+                         :path (plist-get subtree :path)
+                         :context-mode (plist-get subtree :context-mode)
+                         :levels-up (plist-get subtree :levels-up)
+                         :text (plist-get subtree :text))))
 
 (defun org-ai-skills-require-gptel (&optional gptel-dir)
   "Load gptel from GPTEL-DIR or default straight checkout path."
@@ -160,13 +265,15 @@ Return a plist with normalized keys."
 Caller must ensure point is at a valid Org heading."
   (let ((begin (point))
         (level (org-outline-level))
-        (heading (org-get-heading t t t t)))
+        (heading (org-get-heading t t t t))
+        (path (mapconcat #'identity (org-get-outline-path t t) "/")))
     (save-excursion
       (org-end-of-subtree t t)
       (list :begin begin
             :end (point)
             :level level
             :heading heading
+            :path path
             :text (buffer-substring-no-properties begin (point))))))
 
 (defun org-ai-skills-org-resolve-subtree (&optional context-mode levels-up)
@@ -230,12 +337,52 @@ INSTRUCTION overrides the default rewrite goal."
                    (format "Rewrite Org subtree for heading: %s" heading)
                  instruction))
          (base-payload (org-ai-skills-build-gptel-payload skill goal))
+         (skill-context (org-ai-skills-build-skill-context skill subtree))
+         (outputs (or (plist-get skill :outputs) nil))
+         (contracts (or (plist-get skill :contracts) nil))
+         (requirements (or (plist-get skill :requirements) nil))
+         (function-calls (or (plist-get skill :function-calls) nil))
+         (outputs-block
+          (if outputs
+              (concat "Outputs:\n- " (string-join outputs "\n- ") "\n\n")
+            ""))
+         (contracts-block
+          (if contracts
+              (concat "Contracts:\n- " (string-join contracts "\n- ") "\n\n")
+            ""))
+         (requirements-block
+          (if requirements
+              (concat "Requirements:\n- " (string-join requirements "\n- ") "\n\n")
+            ""))
+         (function-calls-block
+          (if function-calls
+              (concat
+               "Possible function calls:\n"
+               (mapconcat
+                (lambda (fn-spec)
+                  (format "- %s (when: %s, args: %s)"
+                          (or (plist-get fn-spec :name) "")
+                          (or (plist-get fn-spec :when) "")
+                          (or (plist-get fn-spec :args) "")))
+                function-calls
+                "\n")
+               "\n\n")
+            ""))
          (rewrite-prompt
           (concat (plist-get base-payload :prompt)
                   "\n\nContext mode: "
                   (symbol-name mode)
                   "\nLevels up: "
                   (number-to-string levels-up)
+                  "\nHeading path: "
+                  (or (plist-get subtree :path) heading)
+                  "\n\nSkill description:\n"
+                  (or (plist-get skill :description) "")
+                  "\n\n"
+                  outputs-block
+                  contracts-block
+                  requirements-block
+                  function-calls-block
                   "\n\nOutput requirements:\n"
                   "- Return only the rewritten Org subtree.\n"
                   "- Do not include explanations, analysis, or progress notes.\n"
@@ -252,7 +399,52 @@ INSTRUCTION overrides the default rewrite goal."
           :context-mode mode
           :levels-up levels-up
           :source-text (plist-get subtree :text)
+          :skill-context skill-context
           :prompt rewrite-prompt)))
+
+(defun org-ai-skills--append-debug-entry (request)
+  "Append one debug REQUEST entry when debug mode is enabled."
+  (when org-ai-skills-debug-enabled
+    (let* ((timestamp (format-time-string "%Y-%m-%d %H:%M:%S %z"))
+           (source (plist-get (plist-get request :skill-context) :source-subtree))
+           (entry
+            (concat
+             (format "=== org-ai-skills gptel dispatch @ %s ===\n" timestamp)
+             (format "Buffer: %s\n" (or (plist-get request :buffer-name) ""))
+             (format "File: %s\n" (or (plist-get request :buffer-file) ""))
+             (format "Headline: %s\n" (or (plist-get source :headline) ""))
+             (format "Path: %s\n" (or (plist-get source :path) ""))
+             (format "Context mode: %s\n" (or (plist-get request :context-mode) ""))
+             (format "Levels up: %s\n" (or (plist-get request :levels-up) ""))
+             "Prompt:\n"
+             (or (plist-get request :prompt) "")
+             "\n\nRequest plist:\n"
+             (pp-to-string request)
+             "\n")))
+      (setq org-ai-skills--last-debug-entry entry)
+      (with-current-buffer (get-buffer-create org-ai-skills-debug-buffer-name)
+        (goto-char (point-max))
+        (insert entry)))))
+
+(defun org-ai-skills-debug-toggle (&optional enabled)
+  "Toggle org-ai-skills debug logging.
+If ENABLED is non-nil, set debug mode accordingly."
+  (interactive)
+  (setq org-ai-skills-debug-enabled
+        (if (null enabled)
+            (not org-ai-skills-debug-enabled)
+          enabled))
+  (message "org-ai-skills debug %s"
+           (if org-ai-skills-debug-enabled "enabled" "disabled")))
+
+(defun org-ai-skills-debug-show-last ()
+  "Show the most recent debug entry."
+  (interactive)
+  (if (string-empty-p (or org-ai-skills--last-debug-entry ""))
+      (message "No org-ai-skills debug entries yet")
+    (with-current-buffer (get-buffer-create org-ai-skills-debug-buffer-name)
+      (goto-char (point-max))
+      (pop-to-buffer (current-buffer)))))
 
 (defun org-ai-skills--extract-gptel-response-text (&rest response)
   "Extract response text from gptel RESPONSE callback args."
@@ -386,6 +578,7 @@ Return an alist where each item is (DISPLAY . SUBTREE-PLIST)."
   (unless (fboundp 'gptel-request)
     (org-ai-skills--signal-gptel-error
      "gptel-request is not available in current gptel version"))
+  (org-ai-skills--append-debug-entry request)
   (funcall #'gptel-request
            (plist-get request :prompt)
            :callback callback))
@@ -408,6 +601,9 @@ When TARGET is nil, resolve current subtree."
          ;; Markers keep target positions stable for async callback.
          (begin (copy-marker (plist-get subtree :begin)))
          (end (copy-marker (plist-get subtree :end))))
+    (setq request (append request
+                          (list :buffer-name (buffer-name buffer)
+                                :buffer-file (buffer-file-name buffer))))
     (org-ai-skills-gptel-dispatch-rewrite
      request
      (lambda (&rest response)

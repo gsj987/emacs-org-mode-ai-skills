@@ -43,7 +43,41 @@
   (let ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--first-skill-file)))
     (should (string= (plist-get skill :skill-id) "gen-notes"))
     (should (string= (plist-get skill :title) "Generate Structured Notes"))
-    (should (string= (plist-get (plist-get skill :tags) :invocation) "suggest"))))
+    (should (string= (plist-get (plist-get skill :tags) :invocation) "suggest"))
+    (should (plist-get skill :outputs))
+    (should (listp (plist-get skill :contracts)))
+    (should (listp (plist-get skill :requirements)))
+    (should (listp (plist-get skill :function-calls)))
+    (should (plist-get skill :raw-sections))))
+
+(ert-deftest org-ai-skills-parse-new-sections-for-context-bundle ()
+  "Parser should extract contracts, requirements, and function calls."
+  (let ((file (org-ai-skills-test--write-temp-skill
+               "* Skill: Extended Skill\n:PROPERTIES:\n:SKILL_ID: ext-skill\n:END:\n#+EFFECT: pure\n#+INVOCATION: manual\n#+CONTEXT: project\n#+DETERMINISM: deterministic\n\n** Description\nExtended skill.\n\n** Contracts\n- Output must be concise.\n- Preserve source language.\n\n** Requirements\n- Keep Org structure valid.\n\n** Function Calls\n- name: normalize-headings\n  when: before-return\n  args: (target-level)\n")))
+    (unwind-protect
+        (let* ((skill (org-ai-skills-parse-skill-file file))
+               (functions (plist-get skill :function-calls)))
+          (should (equal (plist-get skill :contracts)
+                         '("Output must be concise." "Preserve source language.")))
+          (should (equal (plist-get skill :requirements)
+                         '("Keep Org structure valid.")))
+          (should (= (length functions) 1))
+          (should (equal (plist-get (car functions) :name) "normalize-headings"))
+          (should (equal (plist-get (car functions) :when) "before-return"))
+          (should (equal (plist-get (car functions) :args) "(target-level)")))
+      (delete-file file))))
+
+(ert-deftest org-ai-skills-parse-old-spec-backward-compatible ()
+  "Missing optional sections should default to empty structures."
+  (let ((file (org-ai-skills-test--write-temp-skill
+               "* Skill: Legacy Skill\n:PROPERTIES:\n:SKILL_ID: legacy\n:END:\n#+EFFECT: pure\n#+INVOCATION: suggest\n#+CONTEXT: project\n#+DETERMINISM: deterministic\n\n** Description\nLegacy only.\n")))
+    (unwind-protect
+        (let ((skill (org-ai-skills-parse-skill-file file)))
+          (should-not (plist-get skill :contracts))
+          (should-not (plist-get skill :requirements))
+          (should-not (plist-get skill :function-calls))
+          (should (plist-get skill :raw-sections)))
+      (delete-file file))))
 
 (ert-deftest org-ai-skills-parse-missing-skill-id-fails ()
   "Missing SKILL_ID should raise a parse error."
@@ -141,6 +175,8 @@
   "Rewrite payload should include subtree content and context metadata."
   (let* ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--first-skill-file))
          (subtree '(:heading "Leaf"
+                    :level 3
+                    :path "Top/Child/Leaf"
                     :text "*** Leaf\nBody\n"
                     :context-mode current
                     :levels-up 0))
@@ -149,6 +185,10 @@
     (should (equal (plist-get request :skill-id) "gen-notes"))
     (should (equal (plist-get request :headline) "Leaf"))
     (should (eq (plist-get request :context-mode) 'current))
+    (should (plist-get request :skill-context))
+    (should (equal (plist-get (plist-get (plist-get request :skill-context) :meta)
+                              :skill-id)
+                   "gen-notes"))
     (should (string-match-p "Rewrite with concise style"
                             (plist-get request :prompt)))
     (should (string-match-p "\\*\\*\\* Leaf"
@@ -168,6 +208,61 @@
                      '(:prompt "rewrite")
                      #'ignore)
                     :type 'org-ai-skills-gptel-error))))
+
+(ert-deftest org-ai-skills-debug-disabled-does-not-write-buffer ()
+  "Dispatch should not write debug entries when disabled."
+  (let ((org-ai-skills-debug-enabled nil)
+        (org-ai-skills-debug-buffer-name "*org-ai-skills-debug-test*")
+        (org-ai-skills--last-debug-entry nil)
+        (orig-featurep (symbol-function 'featurep))
+        (orig-fboundp (symbol-function 'fboundp)))
+    (when (get-buffer org-ai-skills-debug-buffer-name)
+      (kill-buffer org-ai-skills-debug-buffer-name))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (if (eq feature 'gptel) t (funcall orig-featurep feature))))
+              ((symbol-function 'fboundp)
+               (lambda (symbol)
+                 (if (eq symbol 'gptel-request) t (funcall orig-fboundp symbol))))
+              ((symbol-function 'gptel-request)
+               (lambda (&rest _args) t)))
+      (org-ai-skills-gptel-dispatch-rewrite
+       '(:prompt "hello" :skill-context (:source-subtree (:headline "H")))
+       #'ignore))
+    (should-not org-ai-skills--last-debug-entry)
+    (should-not (get-buffer org-ai-skills-debug-buffer-name))))
+
+(ert-deftest org-ai-skills-debug-enabled-writes-dispatch-entry ()
+  "Dispatch should append debug entry when enabled."
+  (let ((org-ai-skills-debug-enabled t)
+        (org-ai-skills-debug-buffer-name "*org-ai-skills-debug-test*")
+        (org-ai-skills--last-debug-entry nil)
+        (orig-featurep (symbol-function 'featurep))
+        (orig-fboundp (symbol-function 'fboundp)))
+    (when (get-buffer org-ai-skills-debug-buffer-name)
+      (kill-buffer org-ai-skills-debug-buffer-name))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (if (eq feature 'gptel) t (funcall orig-featurep feature))))
+              ((symbol-function 'fboundp)
+               (lambda (symbol)
+                 (if (eq symbol 'gptel-request) t (funcall orig-fboundp symbol))))
+              ((symbol-function 'gptel-request)
+               (lambda (&rest _args) t)))
+      (org-ai-skills-gptel-dispatch-rewrite
+       '(:prompt "hello"
+         :context-mode current
+         :levels-up 0
+         :buffer-name "buf"
+         :buffer-file "/tmp/file.org"
+         :skill-context (:source-subtree (:headline "Leaf" :path "Top/Leaf")))
+       #'ignore))
+    (should (stringp org-ai-skills--last-debug-entry))
+    (should (string-match-p "Prompt:" org-ai-skills--last-debug-entry))
+    (should (string-match-p "Leaf" org-ai-skills--last-debug-entry))
+    (with-current-buffer org-ai-skills-debug-buffer-name
+      (should (string-match-p "Request plist" (buffer-string))))
+    (kill-buffer org-ai-skills-debug-buffer-name)))
 
 (ert-deftest org-ai-skills-org-context-candidates-show-path-preview ()
   "Rewrite target candidates should include current and ancestor path previews."

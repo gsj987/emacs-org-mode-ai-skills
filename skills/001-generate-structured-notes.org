@@ -9,17 +9,28 @@
 #+DETERMINISM: deterministic
 
 ** Description
-Transform selected Org content into a concise, structured outline.
+Rewrite selected Org content into a clear, detailed subtree with substantial paragraph content.
 
 ** Inputs
 - org-selection
 
 ** Outputs
-- structured-org-outline
+- detailed-org-subtree
 - output must be the final Org artifact only (no explanations, no thinking trace, no progress narration)
 - rewritten content must preserve the original language of the selected section
+- do not return headings-only output; each section must include substantive content
+
+** Contracts
+- output must be final Org artifact only
+- preserve the original language of the selected section
+- do not return headings-only output
+
+** Requirements
+- keep heading hierarchy valid and consistent with selected target level
+- avoid adding content unrelated to source subtree intent
+- preserve and expand the core points from source text with concrete detail
 
 ** Steps
-1. Analyze heading and paragraph structure.
-2. Propose concise section headers.
-3. Return an Org subtree with TODO markers where useful.
+1. Analyze source intent, key points, and preferred tone from the selected subtree.
+2. Produce a rewritten subtree with complete paragraphs under appropriate headings.
+3. Ensure each heading has meaningful detail, and return only valid Org subtree content.
