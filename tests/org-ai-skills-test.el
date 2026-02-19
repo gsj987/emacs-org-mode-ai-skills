@@ -517,6 +517,167 @@
     (should (string-prefix-p "** Child Revised" cleaned))
     (should (string-match-p "^\\*\\*\\* Sub$" cleaned))))
 
+(ert-deftest org-ai-skills-ensure-subtree-slot-id-writes-id-property ()
+  "Slot identity helper should auto-generate and write back :ID:."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Slot\nBody\n")
+    (goto-char (point-min))
+    (let* ((subtree (org-ai-skills-org-resolve-subtree 'current))
+           (slot (org-ai-skills--ensure-subtree-slot-id subtree)))
+      (should (stringp (plist-get slot :slot-id)))
+      (goto-char (point-min))
+      (should (string= (org-entry-get (point) "ID")
+                       (plist-get slot :slot-id))))))
+
+(ert-deftest org-ai-skills-candidate-persistence-roundtrip-and-status-update ()
+  "Candidate store should persist and allow applied-status updates."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t)))
+    (unwind-protect
+        (let* ((org-ai-skills-version-store-dir store-dir)
+               (slot '(:slot-id "slot-1"
+                       :slot-key "file|slot-1"
+                       :slot-file "/tmp/demo.org"
+                       :heading "Demo"))
+               (c1 (org-ai-skills--record-generated-candidate
+                    slot "task-a" "rewrite" "prompt-a" "*** Demo\nA\n"))
+               (_c2 (org-ai-skills--record-generated-candidate
+                     slot "task-a" "rewrite" "prompt-a" "*** Demo\nB\n"))
+               (items (org-ai-skills--load-slot-candidates "file|slot-1")))
+          (should (= (length items) 2))
+          (org-ai-skills--update-candidate-status
+           "file|slot-1"
+           (plist-get c1 :candidate-id)
+           "applied")
+          (let ((updated (seq-find
+                          (lambda (it)
+                            (equal (plist-get it :candidate-id)
+                                   (plist-get c1 :candidate-id)))
+                          (org-ai-skills--load-slot-candidates "file|slot-1"))))
+            (should (string= (plist-get updated :status) "applied"))))
+      (delete-directory store-dir t))))
+
+(ert-deftest org-ai-skills-candidate-persistence-keeps-utf8-content ()
+  "Candidate store should persist UTF-8 content without coding prompts/loss."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t)))
+    (unwind-protect
+        (let* ((org-ai-skills-version-store-dir store-dir)
+               (slot '(:slot-id "slot-utf8"
+                       :slot-key "file|slot-utf8"
+                       :slot-file "/tmp/demo.org"
+                       :heading "Demo"))
+               (text "* 标题\n中文内容：市场上涨。\n"))
+          (org-ai-skills--record-generated-candidate
+           slot "task-utf8" "rewrite" "prompt-utf8" text)
+          (let* ((items (org-ai-skills--load-slot-candidates "file|slot-utf8"))
+                 (loaded (plist-get (car items) :output-text)))
+            (should (= (length items) 1))
+            (should (string= loaded text))
+            (should (multibyte-string-p loaded))))
+      (delete-directory store-dir t))))
+
+(ert-deftest org-ai-skills-rewrite-noninteractive-saves-candidate-without-auto-apply ()
+  "Non-interactive rewrite should persist candidate and not mutate subtree text."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t))
+        (skill (org-ai-skills-parse-skill-file org-ai-skills-test--first-skill-file)))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir))
+          (with-temp-buffer
+            (org-mode)
+            (insert "* Leaf\nOriginal body.\n")
+            (goto-char (point-min))
+            (let* ((subtree (org-ai-skills-org-resolve-subtree 'current))
+                   (slot (org-ai-skills--ensure-subtree-slot-id subtree)))
+              (cl-letf (((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+                         (lambda (_request callback)
+                           (funcall callback "*** Leaf\nRewritten body.\n"))))
+                (org-ai-skills-org-rewrite-subtree subtree skill "Rewrite now"))
+              (goto-char (point-min))
+              (should (re-search-forward "Original body\\." nil t))
+              (let ((items (org-ai-skills--load-slot-candidates
+                            (plist-get slot :slot-key))))
+                (should (= (length items) 1))
+                (should (string-match-p "Rewritten body"
+                                        (plist-get (car items) :output-text)))))))
+      (delete-directory store-dir t))))
+
+(ert-deftest org-ai-skills-rewrite-interactive-auto-applies-generated-candidate ()
+  "Interactive rewrite should auto-apply latest generated candidate by default."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t))
+        (skill (org-ai-skills-parse-skill-file org-ai-skills-test--first-skill-file)))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir)
+              (org-ai-skills-auto-apply-generated-candidate t))
+          (with-temp-buffer
+            (org-mode)
+            (insert "* Leaf\nOriginal body.\n")
+            (goto-char (point-min))
+            (let ((subtree (org-ai-skills-org-resolve-subtree 'current)))
+              (cl-letf (((symbol-function 'called-interactively-p)
+                         (lambda (&rest _args) t))
+                        ((symbol-function 'completing-read)
+                         (lambda (&rest _args)
+                           (ert-fail "interactive auto-apply should not ask candidate selection")))
+                        ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+                         (lambda (_request callback)
+                           (funcall callback "*** Leaf\nAuto-applied body.\n"))))
+                (org-ai-skills-org-rewrite-subtree subtree skill "Rewrite now"))
+              (goto-char (point-min))
+              (should (re-search-forward "Auto-applied body\\." nil t)))))
+      (delete-directory store-dir t))))
+
+(ert-deftest org-ai-skills-apply-slot-candidate-replaces-subtree-and-updates-status ()
+  "Apply command should replace subtree from selected candidate."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t)))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir))
+          (with-temp-buffer
+            (org-mode)
+            (insert "* Leaf\nOriginal body.\n")
+            (goto-char (point-min))
+            (let* ((subtree (org-ai-skills-org-resolve-subtree 'current))
+                   (slot (org-ai-skills--ensure-subtree-slot-id subtree))
+                   (candidate (org-ai-skills--record-generated-candidate
+                               slot "rewrite" "rewrite" "prompt"
+                               "* Leaf\nApplied body.\n"))
+                   (display (org-ai-skills--candidate-display candidate)))
+              (cl-letf (((symbol-function 'completing-read)
+                         (lambda (&rest _args) display)))
+                (org-ai-skills-org-apply-slot-candidate subtree))
+              (goto-char (point-min))
+              (should (re-search-forward "Applied body\\." nil t))
+              (let ((updated (seq-find
+                              (lambda (it)
+                                (equal (plist-get it :candidate-id)
+                                       (plist-get candidate :candidate-id)))
+                              (org-ai-skills--load-slot-candidates
+                               (plist-get slot :slot-key)))))
+                (should (string= (plist-get updated :status) "applied"))))))
+      (delete-directory store-dir t))))
+
+(ert-deftest org-ai-skills-apply-slot-candidate-preserves-property-drawer ()
+  "Applying a candidate should preserve existing subtree properties."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t)))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir))
+          (with-temp-buffer
+            (org-mode)
+            (insert "* Leaf\n:PROPERTIES:\n:ID: keep-id\n:END:\nOriginal body.\n")
+            (goto-char (point-min))
+            (let* ((subtree (org-ai-skills-org-resolve-subtree 'current))
+                   (slot (org-ai-skills--ensure-subtree-slot-id subtree))
+                   (candidate (org-ai-skills--record-generated-candidate
+                               slot "rewrite" "rewrite" "prompt"
+                               "* Leaf\nReplaced body.\n"))
+                   (display (org-ai-skills--candidate-display candidate)))
+              (cl-letf (((symbol-function 'completing-read)
+                         (lambda (&rest _args) display)))
+                (org-ai-skills-org-apply-slot-candidate subtree))
+              (goto-char (point-min))
+              (should (re-search-forward ":ID: keep-id" nil t))
+              (should (re-search-forward "Replaced body\\." nil t)))))
+      (delete-directory store-dir t))))
+
 (ert-deftest org-ai-skills-embark-action-delegates-to-rewrite-command ()
   "Embark adapter should dispatch to the interactive rewrite command."
   (let (called)
@@ -590,14 +751,17 @@
   "Planner repeat helper should forward cached task."
   (let ((org-ai-skills--last-planner-task "Refine notes")
         called-target
-        called-task)
+        called-task
+        called-origin)
     (cl-letf (((symbol-function 'org-ai-skills-org-plan-and-run-subtree)
-               (lambda (target task)
+               (lambda (target task &optional interactive-origin)
                  (setq called-target target)
-                 (setq called-task task))))
+                 (setq called-task task)
+                 (setq called-origin interactive-origin))))
       (org-ai-skills-org-plan-and-run-subtree-repeat-task '(:heading "Leaf")))
     (should (equal called-target '(:heading "Leaf")))
-    (should (string= called-task "Refine notes"))))
+    (should (string= called-task "Refine notes"))
+    (should called-origin)))
 
 (ert-deftest org-ai-skills-read-planner-task-preset-errors-when-missing ()
   "Reading preset should fail when no presets configured."
@@ -610,30 +774,35 @@
   (let ((org-ai-skills-planner-task-presets
          '(("notes" . "Convert to concise notes"))))
     (cl-letf (((symbol-function 'org-ai-skills-org-plan-and-run-subtree)
-               (lambda (target task)
+               (lambda (target task &optional interactive-origin)
                  (setq org-ai-skills-test--captured-target target)
-                 (setq org-ai-skills-test--captured-task task))))
+                 (setq org-ai-skills-test--captured-task task)
+                 (setq org-ai-skills-test--captured-origin interactive-origin))))
       (org-ai-skills-org-plan-and-run-subtree-preset '(:heading "Leaf") "notes")
       (should (equal org-ai-skills-test--captured-target '(:heading "Leaf")))
-      (should (string= org-ai-skills-test--captured-task "Convert to concise notes")))))
+      (should (string= org-ai-skills-test--captured-task "Convert to concise notes"))
+      (should org-ai-skills-test--captured-origin))))
 
 (ert-deftest org-ai-skills-define-plan-run-preset-command-uses-fixed-task ()
   "Generated preset command should invoke planner with fixed task."
   (let ((command 'org-ai-skills-test--fixed-task-command)
         captured-target
-        captured-task)
+        captured-task
+        captured-origin)
     (fmakunbound command)
     (org-ai-skills-define-plan-run-preset-command
      org-ai-skills-test--fixed-task-command
      "Turn subtree into action items")
     (unwind-protect
         (cl-letf (((symbol-function 'org-ai-skills-org-plan-and-run-subtree)
-                   (lambda (target task)
+                   (lambda (target task &optional interactive-origin)
                      (setq captured-target target)
-                     (setq captured-task task))))
+                     (setq captured-task task)
+                     (setq captured-origin interactive-origin))))
           (funcall command '(:heading "Leaf"))
           (should (equal captured-target '(:heading "Leaf")))
-          (should (string= captured-task "Turn subtree into action items")))
+          (should (string= captured-task "Turn subtree into action items"))
+          (should captured-origin))
       (fmakunbound command))))
 
 (ert-deftest org-ai-skills-load-skill-metadata-returns-meta-only-shape ()

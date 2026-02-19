@@ -204,6 +204,15 @@ Interactive flow:
   - = [up:2] Top=
 - Choose a skill from =skills/=.
 - Optional: add a custom rewrite instruction.
+- One command run generates one candidate output and stores it.
+- Interactive runs auto-apply the newly generated candidate by default.
+- Disable auto-apply if needed:
+  - =(setq org-ai-skills-auto-apply-generated-candidate nil)=
+  - Then select/apply manually from candidate list.
+
+Candidate apply command:
+- =M-x org-ai-skills-org-apply-slot-candidate=
+- Select target scope, then pick one saved candidate from minibuffer.
 
 Core APIs:
 - Resolve target subtree:
@@ -229,6 +238,10 @@ Output handling:
   so replacement root level always matches selected target subtree level.
 - Rewrite request includes =:skill-context= with contracts/requirements/function-calls
   and source subtree metadata.
+- Each run persists one candidate version under:
+  - =~/.emacs.d/skills/versions/=
+- Candidate store read/write uses UTF-8 by default.
+- If headline =:ID:= is missing, runtime auto-generates and writes it back before candidate persistence.
 - Function calls are skill-scoped runtime state:
   - Declared calls are available only while a skill is actively applied.
   - Excluding or finishing a skill unloads its function calls from request context.
@@ -314,6 +327,13 @@ Behavior notes:
 - If planner returns too many skills in one step:
   - =reject=: signal planner validation error.
   - =split=: auto-split one oversized step into bounded step parts.
+- Planner apply behavior:
+  - Interactive planner commands (=org-ai-skills-org-plan-and-run-subtree=,
+    =...-repeat-task=, =...-preset=, and fixed-task commands from
+    =org-ai-skills-define-plan-run-preset-command=) auto-apply the newly
+    generated candidate by default.
+  - Set =(setq org-ai-skills-auto-apply-generated-candidate nil)= to require
+    manual candidate selection/apply.
 - Debug logging includes planner events, step composition reason, and per-step skill ids.
 - Planner task reuse:
   - Last task is cached in =org-ai-skills--last-planner-task=.

@@ -1,0 +1,146 @@
+#+TITLE: PRD 008 - Headline Slot Targeting and LLM Re-run Candidate Selection
+#+STARTUP: overview
+
+* Problem
+Current rewrite/planner flows treat selected Org subtree as target context, but there is no explicit "headline slot" contract for controlled content apply. This can cause ambiguity when generated content should be applied to a specific logical target.
+
+Current generation flow also favors single-pass output. Users cannot reliably re-run the same task and compare multiple candidates before apply.
+
+* Scope
+- In scope:
+  - Introduce a headline-as-slot contract on top of current Org subtree targeting.
+  - Add deterministic target-slot resolution before apply.
+  - Add bounded re-run generation for the same task/context to produce multiple candidates.
+  - Add candidate selection before apply (no silent overwrite).
+  - Keep compatibility with existing subtree rewrite and planner entry points.
+- Out of scope:
+  - Full redesign of skill spec schema.
+  - Model/provider-specific ranking optimization.
+  - Automatic quality scoring in MVP.
+  - Cross-session synchronization of candidate history beyond local runtime/store.
+
+* Constraints
+- Technical constraints:
+  - Preserve spec vs run separation; no runtime mutation of skill spec files.
+  - Target resolution must be deterministic and testable.
+  - Re-run count must be bounded by configurable limits.
+  - Apply behavior must remain explicit user action.
+  - Existing commands must keep working for non-slot flows.
+- Process constraints:
+  - Define contracts and failure behavior before implementation.
+  - Add ERT coverage for success and failure paths.
+  - Update README usage when behavior changes.
+
+* Spec Design
+** 1) Slot Contract (MVP)
+- Slot unit:
+  - One Org headline subtree is one slot target in runtime.
+- Slot identity:
+  - Primary identity uses subtree metadata already available in runtime (=heading/path/level/file=).
+  - If =:ID:= exists, it is preferred as stable identity key.
+  - If =:ID:= is missing, runtime must generate one and write it back before candidate generation.
+- Optional slot guidance properties:
+  - =:PURPOSE:= natural-language intent.
+  - =:REPLACE:= natural-language replacement preference for prompt shaping.
+- Design note:
+  - These properties guide prompt behavior only; they do not change deterministic apply mechanics.
+
+** 2) Runtime Candidate Model
+- A run on (slot + task/preset + context) produces one candidate output.
+- Candidates are accumulated per run session and are not auto-applied.
+- Candidate record (MVP fields):
+  - candidate-id
+  - created-at
+  - slot-identity
+  - task/preset id
+  - prompt/context digest
+  - model/provider info (if available)
+  - output text
+  - status (generated/applied/discarded/failed)
+  - error info (if failed)
+- Storage:
+  - Runtime-managed store outside skill spec files.
+  - Org content keeps only currently applied text.
+  - Candidate history is persisted in =~/.emacs.d/skills/versions/= for cross-session review.
+
+** 3) Slot Resolution and Apply Semantics
+- Resolution pipeline:
+  - Resolve active target subtree first (current behavior baseline).
+  - Bind resolved subtree to slot identity.
+  - Validate slot exists and target range is writable.
+- Apply pipeline:
+  - User selects a candidate explicitly.
+  - System applies selected candidate to resolved target using one replace mode.
+- MVP replace modes:
+  - replace-subtree-body (default)
+  - replace-region (when run target is region)
+- Non-goal for MVP:
+  - Partial structural merge/diff-based auto-merge.
+
+** 4) Re-run Flow
+- Re-run means: execute generation again with same slot target and task intent, producing a new candidate.
+- Each user-triggered command invocation performs exactly one generation run and produces one candidate.
+- Re-run happens only when the user explicitly executes the generation command again on the same target/task context.
+- Each re-run must preserve prior candidates for comparison.
+
+** 5) Integration with Existing Commands
+- Extend existing entry points rather than replacing them:
+  - =org-ai-skills-org-rewrite-subtree=
+  - =org-ai-skills-org-plan-and-run-subtree=
+  - =org-ai-skills-org-plan-and-run-subtree-preset=
+- Candidate review/apply may be introduced as new interactive commands, but must consume the same resolved subtree context contract.
+- MVP candidate selection UX is a minibuffer list and should remain consult-extensible.
+
+** 6) Failure Behavior
+- Unresolved slot/target:
+  - Signal explicit error and do not apply any content.
+- Generation failure on one re-run:
+  - Keep prior successful candidates; mark failed attempt with diagnostics.
+- Apply failure:
+  - Keep candidate state, signal error, and avoid partial write.
+
+* Expected Behavior
+- Behavior 1:
+  - User can treat the selected headline subtree as an explicit slot target for generation/apply.
+- Behavior 2:
+  - Multiple re-runs create multiple candidates for the same task/context.
+- Behavior 3:
+  - User can inspect and select one candidate to apply.
+- Behavior 4:
+  - No candidate is auto-applied unless user explicitly confirms apply.
+- Behavior 5:
+  - Slot resolution/apply failures are explicit and do not silently mutate Org content.
+
+* Decisions
+- Should missing =:ID:= trigger auto-generation/write-back, or remain runtime-only identity in MVP?
+  - Resolved: auto-generate and write back =:ID:=.
+- What is the default/max re-run count for UX and cost control?
+  - Resolved: one candidate per user-triggered run; explicit user re-run adds one more candidate.
+- What is the minimal candidate review UX for MVP (buffer list vs minibuffer selection)?
+  - Resolved: minibuffer list, consult-extensible.
+- Should candidate history persist across Emacs restarts in MVP or phase 2?
+  - Resolved: persist in MVP under =~/.emacs.d/skills/versions/=.
+- Do we need =replace-src-body= in phase 1, or defer until headline slot flow is stable?
+  - Resolved: defer to next phase.
+
+* Tasks
+- [X] Define runtime slot identity contract for headline targets, including mandatory =:ID:= auto-generate + write-back.
+- [X] Define candidate data model and persistence format under =~/.emacs.d/skills/versions/=.
+- [X] Implement one-run-per-command generation semantics on existing rewrite/planner command flow.
+- [X] Implement candidate review + explicit apply flow.
+- [X] Implement minibuffer-based candidate selector (consult-extensible interface contract).
+- [X] Implement deterministic slot resolution and apply validations.
+- [X] Implement candidate persistence load/save and applied-status update behavior.
+- [X] Add ERT tests for slot resolution, re-run accumulation, selection apply, and failure scenarios.
+- [X] Add ERT tests for =:ID:= auto-writeback and cross-session candidate persistence.
+- [X] Update README usage/docs for slot-targeted flow and re-run candidate selection.
+- [X] Explicitly document =replace-src-body= as deferred (not in MVP implementation scope).
+
+* Worklog
+- 2026-02-19 :: Drafted initial PRD outline only (no implementation changes). Test status: not run.
+- 2026-02-19 :: Rewrote spec design section to align with current org-ai-skills runtime patterns (subtree targeting, explicit apply, runtime-managed state) and normalized PRD format for implementation review. Test status: not run.
+- 2026-02-19 :: Incorporated user decisions from Open Questions into concrete MVP requirements and expanded task list for ID write-back, persistent candidate store, and minibuffer selection UX. Test status: not run.
+- 2026-02-19 :: Implemented headline-slot candidate workflow: auto =:ID:= writeback, per-run candidate persistence in =~/.emacs.d/skills/versions/=, explicit minibuffer candidate selection/apply, and status updates; updated README and added ERT coverage for slot identity, persistence, and apply behavior. Test status: pass (61/61, batch ERT).
+- 2026-02-19 :: Follow-up fixes from manual validation: candidate picker now defaults to real candidates instead of skip-first ordering, and apply now preserves headline/property drawer (including =:ID:=) by replacing subtree body only. Added regression test for property preservation. Test status: pass (62/62, batch ERT).
+- 2026-02-19 :: Follow-up UX/encoding update: interactive generation now auto-applies newly generated candidate by default (configurable), and candidate store I/O is forced to UTF-8 to avoid raw-coding selection prompts. Added regression tests for interactive auto-apply and UTF-8 persistence. Test status: pass (64/64, batch ERT).
+- 2026-02-19 :: Investigation fix for user report where auto-apply stayed inactive in preset/repeat planner commands: propagate interactive origin through wrapper commands so auto-apply executes in those paths as well; added regression assertions for forwarding behavior. Test status: pass (64/64, batch ERT).
