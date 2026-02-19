@@ -1,0 +1,136 @@
+#+TITLE: PRD 007 - Skill-Scoped Function Call Availability and Financial Report Example
+#+STARTUP: overview
+
+* Problem
+Current skill specs can declare function calls in metadata, but there is no runtime
+guarantee that callable functions are available only when a skill is actively applied.
+This can blur spec-vs-run boundaries and expose functions outside intended scope.
+
+We need a mechanism where functions declared by a skill are loaded/available only
+for gptel requests while that skill is fully applied, and unloaded/unavailable when
+the skill is excluded.
+
+We also need one concrete example skill that demonstrates this flow end-to-end:
+fetch financial news via Search1API and produce a daily Org report.
+
+* Scope
+- In scope:
+  - Define and implement skill-scoped function registration lifecycle:
+    - On skill apply: declared functions become available for gptel request context.
+    - On skill exclude/unapply: those functions are removed from active availability.
+  - Add an explicit runtime contract for "fully applied" skill state before functions
+    are exposed.
+  - Add one example skill spec file under =skills/= that declares a financial-news
+    reporting function.
+  - Implement one corresponding Elisp function in =elisp/= that calls Search1API and
+    returns/produces Org-ready daily financial report content.
+  - Ensure gptel request construction reflects only currently available function calls.
+  - Add tests for apply/exclude lifecycle and failure scenarios.
+  - Update README usage/docs for skill-scoped function availability and the new example.
+  - Revise architecture so skill-specific Elisp functions are defined in skill org files
+    (code blocks) instead of core =elisp/org-ai-skills.el=.
+  - Load skill-defined functions as read-only spec-derived runtime state only when a skill
+    is applied, and unload them when excluded.
+- Out of scope:
+  - Building a generic plugin/package manager for arbitrary external tools.
+  - Persisting long-term function registry state across Emacs restarts.
+  - Expanding to non-financial data sources beyond the Search1API example.
+
+* Constraints
+- Technical constraints:
+  - Preserve spec vs run separation:
+    - Skill spec files remain static.
+    - Runtime function availability is derived state, not spec mutation.
+  - No global side effects beyond explicit runtime registry changes.
+  - Skill exclusion must reliably remove function availability for subsequent requests.
+  - Search1API integration must have clear error handling for missing credentials,
+    HTTP failures, and malformed responses.
+  - Credentials must be loaded via auth-source using:
+    =(auth-source-pick-first-password :host "search1api")=
+    with no hardcoded API keys.
+  - Org report output should be deterministic in structure (even if news content varies).
+  - Skill-specific function implementation must be co-located in the skill file as code blocks.
+  - Core runtime should not contain Search1API business functions for example skill behavior.
+- Process constraints:
+  - Follow AGENTS workflow: PRD -> implementation -> tests -> test run -> README -> worklog.
+  - Do not implement code before PRD review/approval.
+
+* Expected Behavior
+- Behavior 1:
+  - Parsing a skill with =Function Calls= declarations does not by itself expose
+    executable functions globally.
+- Behavior 2:
+  - When a skill is fully applied in runtime flow, only that skill's declared
+    functions become available to gptel request/tool context.
+- Behavior 3:
+  - If a skill is excluded/unapplied, its functions are no longer available in
+    subsequent gptel requests.
+- Behavior 4:
+  - Example financial-news skill can invoke a Search1API-backed Elisp function and
+    produce an Org-mode daily report structure.
+- Behavior 5:
+  - Missing Search1API configuration or API failure returns explicit, testable error
+    behavior without silent fallback.
+  - API key lookup must come from auth-source host =search1api=.
+- Behavior 6:
+  - Example skill remains a single packaged artifact: function declarations and Elisp
+    function definitions are both inside one skill org file.
+
+* Tasks
+- [X] Define runtime data model for active skill function registry.
+- [X] Implement apply/exclude hooks or APIs that update function availability.
+- [X] Update gptel request build path to include only active function calls.
+- [X] Implement Search1API-backed Elisp function for daily financial news report.
+- [X] Add example skill file in =skills/= declaring this function call.
+- [X] Add ERT tests:
+  - function availability when applied
+  - function removal when excluded
+  - no exposure when skill not fully applied
+  - Search1API error paths
+  - Org report structure contract
+- [X] Run test suite and fix regressions.
+- [X] Update README documentation and usage examples.
+- [X] Append implementation/test results to worklog.
+- [X] Refactor: remove Search1API helper functions from core runtime file.
+- [X] Add parsing support for skill-local Elisp code blocks (function definitions).
+- [X] Load/eval skill-local function definitions during apply lifecycle, then validate
+  declared function calls.
+- [X] Ensure exclude lifecycle unloads skill-local functions introduced by that skill.
+- [X] Move financial Search1API function definitions into the skill file code block.
+- [X] Update tests for skill-local function definition flow and remove obsolete core-function tests.
+- [X] Re-run batch ERT and fix regressions.
+- [X] Update README and worklog for revised architecture.
+- [X] Fix gptel tool-result JSON type error for non-ASCII raw function output.
+- [X] Add regression test ensuring raw tool output is multibyte JSON text.
+- [X] Simplify financial skill Elisp implementation to minimal raw-fetch path and delegate formatting decisions to LLM.
+- [X] Fix tool-call argument coercion for raw fetch function (keyword args + string limit) to avoid no-response failures.
+- [X] Add regression test for string limit input from gptel tool call.
+- [X] Add transport fallback when Emacs URL sync call returns no response buffer in tool-callback context.
+- [X] Add regression test for url-retrieve=nil fallback path.
+- [X] Re-simplify financial skill Elisp to happy-path only (remove extra fallback transport paths).
+- [X] Improve function-call parameter hints in skill spec and propagate them to gptel tool argument descriptions.
+- [X] Improve financial skill prompt constraints to reduce duplicate-source outputs (query guidance + LLM-side dedup requirement).
+- [X] Enforce strict Org link syntax in financial report output (forbid Markdown links).
+- [X] Enforce strict Org list syntax in financial report output (forbid Markdown-style bullets).
+- [X] Review and simplify recently added Search1API-related tests to reduce brittleness while preserving behavior coverage.
+
+* Worklog
+- 2026-02-18 :: Drafted PRD for skill-scoped function lifecycle and Search1API financial report example skill. Test status: not run.
+- 2026-02-18 :: Implemented skill-scoped function call registry with apply/exclude lifecycle across rewrite and planner step execution, added Search1API financial news fetch/report functions using auth-source host search1api, added example skill file =skills/003-daily-financial-news-report.org=, expanded ERT coverage, and updated README. Test status: pass (50/50, batch ERT).
+- 2026-02-18 :: Revised PRD scope to move skill-specific Elisp implementation from core runtime into skill org code blocks as single-skill packaged artifacts with apply-time load and exclude-time unload lifecycle. Test status: not run.
+- 2026-02-18 :: Refactored skill function architecture to load function definitions from skill org code blocks (=Function Definitions=), removed core Search1API helper functions from =elisp/org-ai-skills.el=, updated financial example skill to be self-contained, revised tests, and updated README. Test status: pass (49/49, batch ERT).
+- 2026-02-18 :: Added strict planner step function-execution path (=org-ai-skills-step-prefer-function-execution=) so skill function output can bypass gptel generation, including debug entry for function execution and ERT coverage verifying gptel is skipped when function output is present. Test status: pass (50/50, batch ERT).
+- 2026-02-19 :: Reverted pre-execution shortcut and switched to request-scoped gptel tool registration from active skill function calls so planner/LLM retains tool-use decisions; added debug logging for tool names, gptel request payload callback info, and tool-call/tool-result events; updated tests and README. Test status: pass (51/51, batch ERT).
+- 2026-02-19 :: Refined financial report skill output contracts and implementation to include brief introduction section, preserve prompt language (Chinese/English), and emit origin source links from fetched result URL/link fields without placeholder fabrication. Test status: pass (52/52, batch ERT).
+- 2026-02-19 :: Switched financial news fetch implementation from generic Search1API search endpoint to dedicated news endpoint for better result quality, and added regression assertion for endpoint selection. Test status: pass (52/52, batch ERT).
+- 2026-02-19 :: Corrected Search1API news request shape to avoid backend errors: use =/news= endpoint with news-specific payload fields (=search_service=google=, =time_range=day=, =crawl_results=0=, language hint), kept UTF-8 unibyte request body, and fixed JSON serialization incompatibility by removing invalid false sentinel field. Test status: pass (52/52, batch ERT).
+- 2026-02-19 :: Updated financial skill to expose raw-data tool call (=org-ai-skills-search1api-fetch-financial-news-raw=) so LLM performs final report polishing/structuring from Search1API payload; kept fetch helpers in skill file and aligned tests with raw JSON tool output contract. Test status: pass (52/52, batch ERT).
+- 2026-02-19 :: Fixed gptel tool-call JSON type failure for non-ASCII raw tool output by forcing skill raw JSON return value to UTF-8 multibyte text; added regression test for Chinese output path. Test status: pass (53/53, batch ERT).
+- 2026-02-19 :: Simplified =skills/003-daily-financial-news-report.org= function definitions by removing report rendering/dedup/normalization edge-case logic; kept only Search1API raw fetch + transport/JSON essentials so LLM handles formatting per skill contracts. Test status: pass (53/53, batch ERT).
+- 2026-02-19 :: Investigate intermittent =no response buffer= in gptel tool mode; root cause was tool-style argument shape (=keywords=) and oversized/string =limit=. Fixed by normalizing keyword/positional args and coercing/clamping =limit= to a safe range (1..20); added regression test mirroring logged call (= :limit \"100\" :date ... :language_hint ... =). Test status: pass (54/54, batch ERT).
+- 2026-02-19 :: Further investigation showed =no response buffer= can still occur in gptel tool callback path when =url-retrieve-synchronously= yields nil; added minimal curl fallback transport for this case plus regression test (=url-retrieve-synchronously => nil=). Test status: pass (55/55, batch ERT).
+- 2026-02-19 :: User requested leaner happy-path implementation and richer function-parameter guidance for LLM tool use; removed extra fallback transport logic from financial skill function definitions, expanded =Function Calls= parameter hints, and updated tool schema generation to use per-argument hints from skill spec. Also added underscore-key parsing for function-call metadata and related tests. Test status: pass (57/57, batch ERT).
+- 2026-02-19 :: Investigate low-diversity output where tool returns repeated items for broad query (e.g., =金融新闻=); updated skill-level query guidance, default query text, and LLM-side dedup/diversity contracts to improve final report diversity without adding extra Elisp post-processing. Test status: pass (57/57, batch ERT).
+- 2026-02-19 :: User reported final output still using Markdown link syntax; added strict spec rule to require Org links =[[url][title]]= and forbid Markdown links, plus explicit final self-check step. Test status: pass (57/57, batch ERT).
+- 2026-02-19 :: User reported mixed Markdown-style list output; added strict Org list formatting rules and final self-check guidance in financial skill spec so headings/lists remain valid Org syntax. Test status: pass (57/57, batch ERT).
+- 2026-02-19 :: Reviewed and simplified Search1API test cases by removing over-specified request payload field assertions while preserving coverage of endpoint usage, unibyte encoding, keyword-arg parsing, load/unload lifecycle, multibyte raw output, and error signaling. Test status: pass (57/57, batch ERT).

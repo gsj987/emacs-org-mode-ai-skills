@@ -93,6 +93,7 @@ Each ID is a short key, and TASK is the full planner intent text."
 (define-error 'org-ai-skills-gptel-error "gptel integration error")
 (define-error 'org-ai-skills-embark-error "Embark integration error")
 (define-error 'org-ai-skills-planner-error "Planner integration error")
+(define-error 'org-ai-skills-function-call-error "Skill function call error")
 
 (defvar org-ai-skills--last-debug-entry nil
   "Last debug entry captured for gptel dispatch.")
@@ -102,6 +103,12 @@ Each ID is a short key, and TASK is the full planner intent text."
 
 (defvar org-ai-skills--planner-task-history nil
   "Minibuffer history for planner task prompts.")
+
+(defvar org-ai-skills--active-skill-function-calls nil
+  "Alist mapping active skill-id to function call specs.")
+
+(defvar org-ai-skills--skill-defined-function-symbols nil
+  "Alist mapping skill-id to function symbols defined from skill code blocks.")
 
 (defun org-ai-skills--signal-parse-error (file message)
   "Signal parse error with FILE context and MESSAGE."
@@ -158,7 +165,7 @@ Return trimmed section text, or nil if section does not exist."
                   items))
           (setq current (list :name (string-trim (match-string 1 line))))
           (setq raw-lines (list (string-trim line))))
-         ((and current (string-match "^[ \t]+\\([[:alnum:]-]+\\):\\s-*\\(.+\\)$" line))
+         ((and current (string-match "^[ \t]+\\([[:alnum:]_-]+\\):\\s-*\\(.+\\)$" line))
           (let* ((key-name (downcase (match-string 1 line)))
                  (value (string-trim (match-string 2 line)))
                  (key (pcase key-name
@@ -173,6 +180,21 @@ Return trimmed section text, or nil if section does not exist."
         (push (append current
                       (list :raw (string-join (nreverse raw-lines) "\n")))
               items))
+      (nreverse items))))
+
+(defun org-ai-skills--parse-elisp-source-blocks (section-text)
+  "Parse emacs-lisp source blocks from SECTION-TEXT."
+  (if (string-empty-p (or section-text ""))
+      nil
+    (let ((items nil)
+          (start 0)
+          (case-fold-search t))
+      (while (string-match
+              "#\\+begin_src\\s-+emacs-lisp\\b[^\n]*\n\\([[:ascii:][:nonascii:]\n]*?\\)#\\+end_src"
+              section-text
+              start)
+        (push (string-trim (match-string 1 section-text)) items)
+        (setq start (match-end 0)))
       (nreverse items))))
 
 (defun org-ai-skills--extract-tag (content tag-key file)
@@ -221,10 +243,12 @@ Return a plist with normalized keys."
          (contracts-section (or (org-ai-skills--extract-section content "Contracts") ""))
          (requirements-section (or (org-ai-skills--extract-section content "Requirements") ""))
          (function-calls-section (or (org-ai-skills--extract-section content "Function Calls") ""))
+         (function-definitions-section (or (org-ai-skills--extract-section content "Function Definitions") ""))
          (outputs (org-ai-skills--parse-bullet-lines outputs-section))
          (contracts (org-ai-skills--parse-bullet-lines contracts-section))
          (requirements (org-ai-skills--parse-bullet-lines requirements-section))
-         (function-calls (org-ai-skills--parse-function-calls function-calls-section)))
+         (function-calls (org-ai-skills--parse-function-calls function-calls-section))
+         (function-definitions (org-ai-skills--parse-elisp-source-blocks function-definitions-section)))
     (org-ai-skills--validate-tag 'effect effect file)
     (org-ai-skills--validate-tag 'invocation invocation file)
     (org-ai-skills--validate-tag 'context context file)
@@ -237,13 +261,15 @@ Return a plist with normalized keys."
           :contracts contracts
           :requirements requirements
           :function-calls function-calls
+          :function-definitions function-definitions
           :raw-sections (list :description description
                               :inputs inputs-section
                               :outputs outputs-section
                               :steps steps-section
                               :contracts contracts-section
                               :requirements requirements-section
-                              :function-calls function-calls-section)
+                              :function-calls function-calls-section
+                              :function-definitions function-definitions-section)
           :tags (list :effect effect
                       :invocation invocation
                       :context context
@@ -258,6 +284,95 @@ Return a plist with normalized keys."
   "Return one-line summary derived from DESCRIPTION."
   (let ((first-line (car (split-string (or description "") "\n" t "[ \t]+"))))
     (string-trim (or first-line ""))))
+
+(defun org-ai-skills--signal-function-call-error (message)
+  "Signal function call error with MESSAGE."
+  (signal 'org-ai-skills-function-call-error (list message)))
+
+(defun org-ai-skills-clear-active-skill-functions ()
+  "Clear all active skill function calls."
+  (setq org-ai-skills--active-skill-function-calls nil)
+  (setq org-ai-skills--skill-defined-function-symbols nil))
+
+(defun org-ai-skills--function-call-spec-valid-p (fn-spec)
+  "Return non-nil when FN-SPEC references a callable Elisp function."
+  (let* ((name (plist-get fn-spec :name))
+         (symbol (and (stringp name) (intern-soft name))))
+    (and symbol (fboundp symbol))))
+
+(defun org-ai-skills--eval-skill-elisp-string (source skill-id)
+  "Evaluate one SOURCE elisp string for SKILL-ID."
+  (with-temp-buffer
+    (insert source)
+    (goto-char (point-min))
+    (condition-case err
+        (while (< (point) (point-max))
+          (let ((form (read (current-buffer))))
+            (eval form t)))
+      (error
+       (org-ai-skills--signal-function-call-error
+        (format "Failed to evaluate function definition for skill %s: %s"
+                skill-id
+                (error-message-string err)))))))
+
+(defun org-ai-skills--load-skill-function-definitions (skill)
+  "Load function definitions declared by SKILL."
+  (let ((blocks (or (plist-get skill :function-definitions) nil))
+        (skill-id (plist-get skill :skill-id)))
+    (dolist (source blocks)
+      (org-ai-skills--eval-skill-elisp-string source skill-id))))
+
+(defun org-ai-skills-apply-skill-function-calls (skill)
+  "Activate function calls declared by SKILL and load its function definitions."
+  (let* ((skill-id (plist-get skill :skill-id))
+         (function-calls (or (plist-get skill :function-calls) nil))
+         (previously-unbound nil)
+         (newly-defined nil))
+    (dolist (fn-spec function-calls)
+      (let* ((name (plist-get fn-spec :name))
+             (symbol (and (stringp name) (intern-soft name))))
+        (when (and symbol (not (fboundp symbol)))
+          (push symbol previously-unbound))))
+    (org-ai-skills--load-skill-function-definitions skill)
+    (dolist (fn-spec function-calls)
+      (unless (org-ai-skills--function-call-spec-valid-p fn-spec)
+        (org-ai-skills--signal-function-call-error
+         (format "Skill %s declares unavailable function call: %s"
+                 skill-id
+                 (or (plist-get fn-spec :name) "")))))
+    (dolist (symbol previously-unbound)
+      (when (fboundp symbol)
+        (push symbol newly-defined)))
+    (setq org-ai-skills--active-skill-function-calls
+          (assq-delete-all skill-id org-ai-skills--active-skill-function-calls))
+    (when function-calls
+      (push (cons skill-id function-calls) org-ai-skills--active-skill-function-calls))
+    (setq org-ai-skills--skill-defined-function-symbols
+          (assq-delete-all skill-id org-ai-skills--skill-defined-function-symbols))
+    (when newly-defined
+      (push (cons skill-id newly-defined) org-ai-skills--skill-defined-function-symbols))
+    function-calls))
+
+(defun org-ai-skills-exclude-skill-function-calls (skill-or-id)
+  "Deactivate function calls for SKILL-OR-ID."
+  (let ((skill-id (if (stringp skill-or-id)
+                      skill-or-id
+                    (plist-get skill-or-id :skill-id))))
+    (setq org-ai-skills--active-skill-function-calls
+          (assq-delete-all skill-id org-ai-skills--active-skill-function-calls))
+    (let ((defined-symbols (cdr (assoc skill-id org-ai-skills--skill-defined-function-symbols))))
+      (dolist (symbol defined-symbols)
+        (when (fboundp symbol)
+          (fmakunbound symbol))))
+    (setq org-ai-skills--skill-defined-function-symbols
+          (assq-delete-all skill-id org-ai-skills--skill-defined-function-symbols))))
+
+(defun org-ai-skills-active-skill-function-calls (skill-or-id)
+  "Return active function call specs for SKILL-OR-ID."
+  (let ((skill-id (if (stringp skill-or-id)
+                      skill-or-id
+                    (plist-get skill-or-id :skill-id))))
+    (cdr (assoc skill-id org-ai-skills--active-skill-function-calls))))
 
 (defun org-ai-skills-parse-skill-metadata-file (file)
   "Parse planner metadata from skill FILE.
@@ -554,7 +669,7 @@ When ALLOW-EMPTY-PLAN is non-nil, an empty plan is accepted."
    :outputs (or (plist-get skill :outputs) nil)
    :contracts (or (plist-get skill :contracts) nil)
    :requirements (or (plist-get skill :requirements) nil)
-   :function-calls (or (plist-get skill :function-calls) nil)
+   :function-calls (or (org-ai-skills-active-skill-function-calls skill) nil)
    :raw-sections (plist-get skill :raw-sections)
    :source-subtree (list :headline (plist-get subtree :heading)
                          :level (plist-get subtree :level)
@@ -669,7 +784,7 @@ INSTRUCTION overrides the default rewrite goal."
          (outputs (or (plist-get skill :outputs) nil))
          (contracts (or (plist-get skill :contracts) nil))
          (requirements (or (plist-get skill :requirements) nil))
-         (function-calls (or (plist-get skill :function-calls) nil))
+         (function-calls (or (org-ai-skills-active-skill-function-calls skill) nil))
          (outputs-block
           (if outputs
               (concat "Outputs:\n- " (string-join outputs "\n- ") "\n\n")
@@ -749,7 +864,8 @@ INSTRUCTION overrides the default rewrite goal."
            (lambda (skill)
              (let ((outputs (plist-get skill :outputs))
                    (contracts (plist-get skill :contracts))
-                   (requirements (plist-get skill :requirements)))
+                   (requirements (plist-get skill :requirements))
+                   (function-calls (org-ai-skills-active-skill-function-calls skill)))
                (concat
                 (format "- Skill: %s (%s)\n"
                         (plist-get skill :skill-id)
@@ -763,6 +879,14 @@ INSTRUCTION overrides the default rewrite goal."
                   "")
                 (if requirements
                     (format "  Requirements: %s\n" (string-join requirements "; "))
+                  "")
+                (if function-calls
+                    (format "  Function Calls: %s\n"
+                            (mapconcat
+                             (lambda (fn-spec)
+                               (or (plist-get fn-spec :name) ""))
+                             function-calls
+                             ", "))
                   ""))))
            loaded-skills
            ""))
@@ -810,14 +934,28 @@ Only skills referenced by STEP are loaded from DIRECTORY."
          (loaded-skills (mapcar (lambda (skill-id)
                                   (org-ai-skills-load-skill-by-id skill-id directory))
                                 skill-ids))
-         (request (org-ai-skills-build-step-request step run-state loaded-skills)))
-    (org-ai-skills-gptel-dispatch-rewrite
-     request
-     (lambda (&rest response)
-       (let* ((raw (apply #'org-ai-skills--extract-gptel-response-text response))
-              (output (org-ai-skills--extract-subtree-body raw))
-              (updated-run-state (org-ai-skills--record-run-step run-state step output)))
-         (funcall callback updated-run-state output))))))
+         (request nil)
+         (dispatched nil))
+    (unwind-protect
+        (progn
+          (dolist (skill loaded-skills)
+            (org-ai-skills-apply-skill-function-calls skill))
+          (setq request (org-ai-skills-build-step-request step run-state loaded-skills))
+          (org-ai-skills-gptel-dispatch-rewrite
+           request
+           (lambda (&rest response)
+             (unwind-protect
+                 (let ((raw (apply #'org-ai-skills--extract-gptel-response-text-if-ready response)))
+                   (when raw
+                     (let* ((output (org-ai-skills--extract-subtree-body raw))
+                            (updated-run-state (org-ai-skills--record-run-step run-state step output)))
+                       (funcall callback updated-run-state output))))
+               (dolist (skill loaded-skills)
+                 (org-ai-skills-exclude-skill-function-calls skill)))))
+          (setq dispatched t))
+      (unless dispatched
+        (dolist (skill loaded-skills)
+          (org-ai-skills-exclude-skill-function-calls skill))))))
 
 (defun org-ai-skills-maybe-replan (run-state planner-response)
   "Return revised plan from PLANNER-RESPONSE when RUN-STATE should replan."
@@ -981,6 +1119,17 @@ If ENABLED is non-nil, set debug mode accordingly."
      (t (org-ai-skills--signal-gptel-error
          "gptel callback did not return text response")))))
 
+(defun org-ai-skills--extract-gptel-response-text-if-ready (&rest response)
+  "Return text when RESPONSE is a final text callback, else nil.
+Interim callback events such as tool-call, tool-result, reasoning chunks,
+or stream completion markers are ignored and return nil."
+  (let ((first (car response)))
+    (if (or (eq first t)
+            (and (consp first)
+                 (memq (car first) '(tool-call tool-result reasoning))))
+        nil
+      (apply #'org-ai-skills--extract-gptel-response-text response))))
+
 (defun org-ai-skills--strip-markdown-fences (text)
   "Return TEXT without surrounding markdown code fences."
   (let ((trimmed (string-trim text)))
@@ -1093,6 +1242,68 @@ Return an alist where each item is (DISPLAY . SUBTREE-PLIST)."
         (org-ai-skills--signal-org-context-error
          "Unable to resolve selected rewrite target"))))
 
+(defun org-ai-skills--parse-function-arg-names (arg-spec)
+  "Parse ARG-SPEC string like \"(query date)\" into argument names."
+  (let* ((raw (or arg-spec ""))
+         (clean (replace-regexp-in-string "[()]" "" raw)))
+    (split-string clean "[ \t\n,]+" t)))
+
+(defun org-ai-skills--request-function-calls (request)
+  "Collect function call specs from REQUEST contexts."
+  (let ((calls nil)
+        (skill-context (plist-get request :skill-context))
+        (skill-contexts (plist-get request :skill-contexts)))
+    (when skill-context
+      (setq calls (append calls (or (plist-get skill-context :function-calls) nil))))
+    (dolist (ctx skill-contexts)
+      (setq calls (append calls (or (plist-get ctx :function-calls) nil))))
+    (cl-remove-duplicates
+     calls
+     :test (lambda (a b)
+             (equal (plist-get a :name) (plist-get b :name))))))
+
+(defun org-ai-skills--function-call-to-gptel-tool (fn-spec)
+  "Convert FN-SPEC into a gptel tool struct."
+  (unless (fboundp 'gptel-make-tool)
+    (org-ai-skills--signal-gptel-error
+     "gptel-make-tool is unavailable in current gptel version"))
+  (let* ((name (or (plist-get fn-spec :name) ""))
+         (symbol (intern-soft name))
+         (args (org-ai-skills--parse-function-arg-names (plist-get fn-spec :args)))
+         (arg-description
+          (lambda (arg-name)
+            (let* ((key (intern (format ":%s" arg-name)))
+                   (hint (plist-get fn-spec key)))
+              (if (stringp hint)
+                  hint
+                (format "Argument %s for %s" arg-name name)))))
+         (description
+          (format "Skill function call: %s. When: %s"
+                  name
+                  (or (plist-get fn-spec :when) ""))))
+    (unless (and symbol (fboundp symbol))
+      (org-ai-skills--signal-function-call-error
+       (format "Function call is not bound at dispatch time: %s" name)))
+    (apply #'gptel-make-tool
+           (list
+            :name name
+            :function symbol
+            :description description
+            :category "org-ai-skills"
+            :confirm nil
+            :include t
+            :args (mapcar (lambda (arg-name)
+                            (list :name arg-name
+                                  :type 'string
+                                  :description (funcall arg-description arg-name)
+                                  :optional t))
+                          args)))))
+
+(defun org-ai-skills--request-gptel-tools (request)
+  "Build gptel tool list from REQUEST."
+  (mapcar #'org-ai-skills--function-call-to-gptel-tool
+          (org-ai-skills--request-function-calls request)))
+
 (defun org-ai-skills-gptel-dispatch-rewrite (request callback)
   "Send rewrite REQUEST to gptel and run CALLBACK with response."
   (unless (or (featurep 'gptel) (org-ai-skills-require-gptel))
@@ -1101,10 +1312,40 @@ Return an alist where each item is (DISPLAY . SUBTREE-PLIST)."
   (unless (fboundp 'gptel-request)
     (org-ai-skills--signal-gptel-error
      "gptel-request is not available in current gptel version"))
-  (org-ai-skills--append-debug-entry request)
-  (funcall #'gptel-request
-           (plist-get request :prompt)
-           :callback callback))
+  (let* ((tools (org-ai-skills--request-gptel-tools request))
+         (tool-names (mapcar (lambda (fn-spec) (plist-get fn-spec :name))
+                             (org-ai-skills--request-function-calls request)))
+         (logged-request (append request
+                                 (list :gptel-tool-names tool-names
+                                       :gptel-use-tools (and tools t))))
+         (logged-metadata nil)
+         (wrapped-callback
+          (lambda (&rest response)
+            (let ((first (car response))
+                  (info (cadr response)))
+              (unless logged-metadata
+                (when (and (listp info) (plist-member info :data))
+                  (setq logged-metadata t)
+                  (org-ai-skills--append-debug-entry
+                   (list :event-type 'gptel-request-data
+                         :step-id (plist-get request :step-id)
+                         :skill-ids (plist-get request :skill-ids)
+                         :prompt "gptel request data payload"
+                         :gptel-data (plist-get info :data)
+                         :gptel-tool-names tool-names))))
+              (when (and (consp first) (memq (car first) '(tool-call tool-result)))
+                (org-ai-skills--append-debug-entry
+                 (list :event-type (car first)
+                       :step-id (plist-get request :step-id)
+                       :skill-ids (plist-get request :skill-ids)
+                       :prompt (format "gptel callback event: %S" first))))
+              (apply callback response)))))
+    (org-ai-skills--append-debug-entry logged-request)
+    (let ((gptel-tools tools)
+          (gptel-use-tools (and tools t)))
+      (funcall #'gptel-request
+               (plist-get request :prompt)
+               :callback wrapped-callback))))
 
 (defun org-ai-skills--interactive-rewrite-args ()
   "Read interactive arguments for `org-ai-skills-org-rewrite-subtree'."
@@ -1151,28 +1392,39 @@ Return an alist where each item is (DISPLAY . SUBTREE-PLIST)."
 When TARGET is nil, resolve current subtree."
   (interactive (org-ai-skills--interactive-rewrite-args))
   (let* ((subtree (or target (org-ai-skills-org-resolve-subtree 'current)))
-         (request (org-ai-skills-build-gptel-rewrite-request
-                   skill subtree instruction))
+         (request nil)
          (buffer (current-buffer))
+         (dispatched nil)
          ;; Markers keep target positions stable for async callback.
          (begin (copy-marker (plist-get subtree :begin)))
          (end (copy-marker (plist-get subtree :end))))
-    (setq request (append request
-                          (list :buffer-name (buffer-name buffer)
-                                :buffer-file (buffer-file-name buffer))))
-    (org-ai-skills-gptel-dispatch-rewrite
-     request
-     (lambda (&rest response)
-       (let* ((raw (apply #'org-ai-skills--extract-gptel-response-text response))
-              (rewritten (org-ai-skills--sanitize-rewrite-output
-                          raw
-                          subtree)))
-         (with-current-buffer buffer
-           (org-ai-skills-org-apply-rewrite-result
-            (list :begin begin :end end)
-            rewritten)
-           (message "org-ai-skills rewrite applied for: %s"
-                    (plist-get subtree :heading))))))))
+    (unwind-protect
+        (progn
+          (org-ai-skills-apply-skill-function-calls skill)
+          (setq request (org-ai-skills-build-gptel-rewrite-request
+                         skill subtree instruction))
+          (setq request (append request
+                                (list :buffer-name (buffer-name buffer)
+                                      :buffer-file (buffer-file-name buffer))))
+          (org-ai-skills-gptel-dispatch-rewrite
+           request
+           (lambda (&rest response)
+             (unwind-protect
+                 (let ((raw (apply #'org-ai-skills--extract-gptel-response-text-if-ready response)))
+                   (when raw
+                     (let ((rewritten (org-ai-skills--sanitize-rewrite-output
+                                       raw
+                                       subtree)))
+                       (with-current-buffer buffer
+                         (org-ai-skills-org-apply-rewrite-result
+                          (list :begin begin :end end)
+                          rewritten)
+                         (message "org-ai-skills rewrite applied for: %s"
+                                  (plist-get subtree :heading))))))
+               (org-ai-skills-exclude-skill-function-calls skill))))
+          (setq dispatched t))
+      (unless dispatched
+        (org-ai-skills-exclude-skill-function-calls skill)))))
 
 (defun org-ai-skills-org-plan-and-run-subtree (target task)
   "Run planner-driven rewrite on TARGET subtree using TASK."

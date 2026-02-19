@@ -19,6 +19,9 @@
 (defconst org-ai-skills-test--twitter-skill-file
   (expand-file-name "skills/002-simplify-for-twitter-post.org" org-ai-skills-test--project-root))
 
+(defconst org-ai-skills-test--financial-skill-file
+  (expand-file-name "skills/003-daily-financial-news-report.org" org-ai-skills-test--project-root))
+
 (defconst org-ai-skills-test--gptel-dir
   (expand-file-name "~/.emacs.d/straight/repos/gptel/"))
 
@@ -65,6 +68,17 @@
                     (plist-get skill :requirements)))
     (should (plist-get skill :raw-sections))))
 
+(ert-deftest org-ai-skills-parse-financial-report-skill-success ()
+  "Financial news example skill should parse to a structured object."
+  (let ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--financial-skill-file)))
+    (should (string= (plist-get skill :skill-id) "fin-news-daily-report"))
+    (should (string= (plist-get skill :title) "Generate Daily Financial News Report"))
+    (should (equal (plist-get (plist-get skill :tags) :effect) "external"))
+    (should (= (length (plist-get skill :function-calls)) 1))
+    (should (= (length (plist-get skill :function-definitions)) 1))
+    (should (equal (plist-get (car (plist-get skill :function-calls)) :name)
+                   "org-ai-skills-search1api-fetch-financial-news-raw"))))
+
 (ert-deftest org-ai-skills-parse-new-sections-for-context-bundle ()
   "Parser should extract contracts, requirements, and function calls."
   (let ((file (org-ai-skills-test--write-temp-skill
@@ -81,6 +95,14 @@
           (should (equal (plist-get (car functions) :when) "before-return"))
           (should (equal (plist-get (car functions) :args) "(target-level)")))
       (delete-file file))))
+
+(ert-deftest org-ai-skills-parse-function-calls-supports-underscore-keys ()
+  "Function call parser should preserve custom keys with underscores."
+  (let* ((items (org-ai-skills--parse-function-calls
+                 "- name: fn\n  args: (language_hint)\n  language_hint: zh or en"))
+         (item (car items)))
+    (should (equal (plist-get item :name) "fn"))
+    (should (equal (plist-get item :language_hint) "zh or en"))))
 
 (ert-deftest org-ai-skills-parse-old-spec-backward-compatible ()
   "Missing optional sections should default to empty structures."
@@ -208,6 +230,184 @@
                             (plist-get request :prompt)))
     (should (string-match-p "\\*\\*\\* Leaf"
                             (plist-get request :prompt)))))
+
+(ert-deftest org-ai-skills-function-calls-available-only-when-skill-applied ()
+  "Function calls should be available only while skill is active."
+  (let* ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--financial-skill-file))
+         (subtree '(:heading "Leaf"
+                    :level 3
+                    :path "Top/Child/Leaf"
+                    :text "*** Leaf\nBody\n"
+                    :context-mode current
+                    :levels-up 0)))
+    (unwind-protect
+        (progn
+          (org-ai-skills-clear-active-skill-functions)
+          (let ((request (org-ai-skills-build-gptel-rewrite-request skill subtree)))
+            (should-not (string-match-p "Possible function calls"
+                                        (plist-get request :prompt))))
+          (org-ai-skills-apply-skill-function-calls skill)
+          (let ((request (org-ai-skills-build-gptel-rewrite-request skill subtree)))
+            (should (string-match-p
+                     "org-ai-skills-search1api-fetch-financial-news-raw"
+                     (plist-get request :prompt))))
+          (org-ai-skills-exclude-skill-function-calls skill)
+          (let ((request (org-ai-skills-build-gptel-rewrite-request skill subtree)))
+            (should-not (string-match-p "Possible function calls"
+                                        (plist-get request :prompt)))))
+      (org-ai-skills-clear-active-skill-functions))))
+
+(ert-deftest org-ai-skills-apply-skill-functions-fails-for-missing-elisp-function ()
+  "Applying a skill should fail when declared function is not defined."
+  (let ((skill '(:skill-id "bad-fn-skill"
+                :function-calls ((:name "org-ai-skills-missing-function")))))
+    (org-ai-skills-clear-active-skill-functions)
+    (should-error (org-ai-skills-apply-skill-function-calls skill)
+                  :type 'org-ai-skills-function-call-error)
+    (should-not (org-ai-skills-active-skill-function-calls "bad-fn-skill"))))
+
+(ert-deftest org-ai-skills-skill-local-search1api-function-definitions-load-and-unload ()
+  "Skill-local function definitions should load on apply and unload on exclude."
+  (let ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--financial-skill-file)))
+    (unwind-protect
+        (progn
+          (org-ai-skills-clear-active-skill-functions)
+          (cl-letf (((symbol-function 'auth-source-pick-first-password)
+                     (lambda (&rest _args) "test-key"))
+                    ((symbol-function 'url-retrieve-synchronously)
+                     (lambda (&rest _args)
+                       (with-current-buffer (generate-new-buffer " *org-ai-skills-search1api*")
+                         (insert "HTTP/1.1 200 OK\r\n")
+                         (insert "Content-Type: application/json\r\n\r\n")
+                         (insert "{\"results\":[{\"title\":\"Stocks Rally\",\"url\":\"https://example.com/a\",\"snippet\":\"Equities advanced today.\"}]}")
+                         (current-buffer)))))
+            (org-ai-skills-apply-skill-function-calls skill)
+            (should (fboundp 'org-ai-skills-search1api-fetch-financial-news-raw))
+            (let* ((raw (org-ai-skills-search1api-fetch-financial-news-raw
+                         "market" 5 "en" "2026-02-18"))
+                   (payload (json-parse-string raw
+                                               :object-type 'plist
+                                               :array-type 'list
+                                               :null-object nil
+                                               :false-object nil)))
+              (should (string= (plist-get payload :date) "2026-02-18"))
+              (should (string= (plist-get payload :query) "market"))
+              (should (equal (plist-get payload :count) 1))))
+          (org-ai-skills-exclude-skill-function-calls skill)
+          (should-not (fboundp 'org-ai-skills-search1api-fetch-financial-news-raw)))
+      (org-ai-skills-clear-active-skill-functions))))
+
+(ert-deftest org-ai-skills-skill-local-search1api-raw-output-is-multibyte-json ()
+  "Raw Search1API tool output should be multibyte JSON text for gptel tool flow."
+  (let ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--financial-skill-file)))
+    (unwind-protect
+        (progn
+          (org-ai-skills-clear-active-skill-functions)
+          (cl-letf (((symbol-function 'auth-source-pick-first-password)
+                     (lambda (&rest _args) "test-key"))
+                    ((symbol-function 'url-retrieve-synchronously)
+                     (lambda (&rest _args)
+                       (with-current-buffer (generate-new-buffer " *org-ai-skills-search1api*")
+                         (insert "HTTP/1.1 200 OK\r\n")
+                         (insert "Content-Type: application/json\r\n\r\n")
+                         (insert "{\"results\":[{\"title\":\"标题\",\"url\":\"https://example.com/a\",\"snippet\":\"摘要\"}]}")
+                         (current-buffer)))))
+            (org-ai-skills-apply-skill-function-calls skill)
+            (let ((raw (org-ai-skills-search1api-fetch-financial-news-raw
+                        "今天的金融新闻日报" 5 "zh" "2026-02-19")))
+              (should (multibyte-string-p raw))
+              (let ((payload (json-parse-string raw
+                                                :object-type 'plist
+                                                :array-type 'list
+                                                :null-object nil
+                                                :false-object nil)))
+                (should (equal (plist-get payload :language_hint) "zh"))
+                (should (equal (plist-get payload :count) 1))))))
+      (org-ai-skills-exclude-skill-function-calls skill)
+      (org-ai-skills-clear-active-skill-functions))))
+
+(ert-deftest org-ai-skills-skill-local-search1api-request-data-is-unibyte ()
+  "Skill-local Search1API request body should be UTF-8 encoded unibyte string."
+  (let ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--financial-skill-file)))
+    (unwind-protect
+        (progn
+          (org-ai-skills-clear-active-skill-functions)
+          (cl-letf (((symbol-function 'auth-source-pick-first-password)
+                     (lambda (&rest _args) "test-key"))
+                    ((symbol-function 'url-retrieve-synchronously)
+                     (lambda (url &rest _args)
+                       (unless (string= url "https://api.search1api.com/news")
+                         (error "unexpected endpoint: %s" url))
+                       (when (multibyte-string-p url-request-data)
+                         (error "request-data must be unibyte"))
+                       (with-current-buffer (generate-new-buffer " *org-ai-skills-search1api*")
+                         (insert "HTTP/1.1 200 OK\r\n")
+                         (insert "Content-Type: application/json\r\n\r\n")
+                         (insert "{\"results\":[]}")
+                         (current-buffer)))))
+            (org-ai-skills-apply-skill-function-calls skill)
+            (should (equal (org-ai-skills-search1api-fetch-financial-news
+                            "生成今天的金融新闻日报"
+                            5)
+                           nil))))
+      (org-ai-skills-exclude-skill-function-calls skill)
+      (org-ai-skills-clear-active-skill-functions))))
+
+(ert-deftest org-ai-skills-skill-local-search1api-raw-keyword-args-parse-limit ()
+  "Raw tool function should accept keyword args and parse string limit."
+  (let ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--financial-skill-file)))
+    (unwind-protect
+        (progn
+          (org-ai-skills-clear-active-skill-functions)
+          (cl-letf (((symbol-function 'auth-source-pick-first-password)
+                     (lambda (&rest _args) "test-key"))
+                    ((symbol-function 'url-retrieve-synchronously)
+                     (lambda (_url &rest _args)
+                       (let ((payload (json-parse-string
+                                       (decode-coding-string url-request-data 'utf-8)
+                                       :object-type 'plist
+                                       :array-type 'list
+                                       :null-object nil
+                                       :false-object nil)))
+                         (should (= (plist-get payload :max_results) 100)))
+                       (with-current-buffer (generate-new-buffer " *org-ai-skills-search1api*")
+                         (insert "HTTP/1.1 200 OK\r\n")
+                         (insert "Content-Type: application/json\r\n\r\n")
+                         (insert "{\"results\":[{\"title\":\"A\",\"url\":\"https://example.com/a\",\"snippet\":\"S\"}]}")
+                         (current-buffer)))))
+            (org-ai-skills-apply-skill-function-calls skill)
+            (let* ((raw (org-ai-skills-search1api-fetch-financial-news-raw
+                         :limit "100"
+                         :date "2026-02-19"
+                         :language_hint "zh"))
+                   (result (json-parse-string raw
+                                              :object-type 'plist
+                                              :array-type 'list
+                                              :null-object nil
+                                              :false-object nil)))
+              (should (string= (plist-get result :date) "2026-02-19"))
+              (should (string= (plist-get result :language_hint) "zh"))
+              (should (= (plist-get result :count) 1)))))
+      (org-ai-skills-exclude-skill-function-calls skill)
+      (org-ai-skills-clear-active-skill-functions))))
+
+(ert-deftest org-ai-skills-skill-local-search1api-errors-when-url-returns-nil ()
+  "Search1API fetch should signal explicit error when URL backend returns nil."
+  (let ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--financial-skill-file)))
+    (unwind-protect
+        (progn
+          (org-ai-skills-clear-active-skill-functions)
+          (cl-letf (((symbol-function 'auth-source-pick-first-password)
+                     (lambda (&rest _args) "test-key"))
+                    ((symbol-function 'url-retrieve-synchronously)
+                     (lambda (&rest _args) nil)))
+            (org-ai-skills-apply-skill-function-calls skill)
+            (should-error
+             (org-ai-skills-search1api-fetch-financial-news-raw
+              :date "2026-02-19")
+             :type 'org-ai-skills-function-call-error)))
+      (org-ai-skills-exclude-skill-function-calls skill)
+      (org-ai-skills-clear-active-skill-functions))))
 
 (ert-deftest org-ai-skills-gptel-dispatch-errors-when-gptel-missing ()
   "Dispatch should fail with explicit error when gptel is unavailable."
@@ -580,6 +780,105 @@
     (should (equal (sort loaded-ids #'string<) '("alpha" "beta")))
     (should (equal (plist-get (car (plist-get callback-run-state :steps)) :skills)
                    '("alpha" "beta")))))
+
+(ert-deftest org-ai-skills-execute-plan-step-unloads-function-calls-after-callback ()
+  "Step execution should unload skill function calls after callback."
+  (let ((skill '(:skill-id "fin-news-daily-report"
+                :title "Finance"
+                :description "desc"
+                :function-definitions ("(defun org-ai-skills-search1api-fetch-financial-news-raw (&optional _query _limit _language_hint _date) \"Test fn.\" \"{}\")")
+                :function-calls ((:name "org-ai-skills-search1api-fetch-financial-news-raw")))))
+    (org-ai-skills-clear-active-skill-functions)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (_skill-id &optional _directory) skill))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (should (org-ai-skills-active-skill-function-calls "fin-news-daily-report"))
+                 (funcall callback "*** Result\nBody\n"))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :goal "g" :skills ("fin-news-daily-report") :expected-output "o")
+       '(:task "task" :subtree (:text "*** Input\n"))
+       (lambda (_run-state _output) nil)))
+    (should-not (org-ai-skills-active-skill-function-calls "fin-news-daily-report"))))
+
+(ert-deftest org-ai-skills-execute-plan-step-ignores-tool-events-until-text-response ()
+  "Step execution should ignore interim tool callback events and wait for text."
+  (let ((skill '(:skill-id "fin-news-daily-report"
+                :title "Finance"
+                :description "desc"
+                :function-definitions ("(defun org-ai-skills-search1api-fetch-financial-news-raw (&optional _query _limit _language_hint _date) \"Test fn.\" \"{}\")")
+                :function-calls ((:name "org-ai-skills-search1api-fetch-financial-news-raw"))))
+        callback-output
+        callback-count)
+    (org-ai-skills-clear-active-skill-functions)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (_skill-id &optional _directory) skill))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback '(tool-result ((dummy . t))) '(:data (:dummy t)))
+                 (funcall callback "*** Final\nBody\n" '(:data (:dummy t))))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :goal "g" :skills ("fin-news-daily-report") :expected-output "o")
+       '(:task "task" :subtree (:text "*** Input\n"))
+       (lambda (_run-state output)
+         (setq callback-output output)
+         (setq callback-count (1+ (or callback-count 0))))))
+    (should (= callback-count 1))
+    (should (string-match-p "^\\*\\*\\* Final" callback-output))))
+
+(ert-deftest org-ai-skills-gptel-dispatch-registers-request-tools ()
+  "Dispatch should register request-scoped function calls as gptel tools."
+  (let ((org-ai-skills-debug-enabled nil)
+        (gptel-use-tools nil)
+        (gptel-tools nil)
+        (captured-use-tools nil)
+        (captured-tools nil)
+        (orig-featurep (symbol-function 'featurep))
+        (orig-fboundp (symbol-function 'fboundp)))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (if (eq feature 'gptel) t (funcall orig-featurep feature))))
+              ((symbol-function 'fboundp)
+               (lambda (symbol)
+                 (if (memq symbol '(gptel-request gptel-make-tool))
+                     t
+                   (funcall orig-fboundp symbol))))
+              ((symbol-function 'org-ai-skills-sample-tool)
+               (lambda (&optional _query) "ok"))
+              ((symbol-function 'gptel-make-tool)
+               (lambda (&rest slots) slots))
+              ((symbol-function 'gptel-request)
+               (lambda (&rest args)
+                 (setq captured-use-tools gptel-use-tools)
+                 (setq captured-tools gptel-tools)
+                 (let ((callback (plist-get (cdr args) :callback)))
+                   (funcall callback "*** Result\nBody\n" (list :data '(:payload t))))
+                 t)))
+      (org-ai-skills-gptel-dispatch-rewrite
+       '(:prompt "hello"
+         :skill-context (:function-calls ((:name "org-ai-skills-sample-tool"
+                                           :args "(query)"
+                                           :when "when needed"))))
+       #'ignore))
+    (should captured-use-tools)
+    (should (= (length captured-tools) 1))))
+
+(ert-deftest org-ai-skills-function-call-to-gptel-tool-prefers-skill-arg-hints ()
+  "Tool arg descriptions should use per-argument hints from skill spec."
+  (cl-letf (((symbol-function 'org-ai-skills-sample-tool)
+             (lambda (&optional _query _limit) "ok"))
+            ((symbol-function 'gptel-make-tool)
+             (lambda (&rest slots) slots)))
+    (let* ((tool (org-ai-skills--function-call-to-gptel-tool
+                  '(:name "org-ai-skills-sample-tool"
+                    :args "(query limit)"
+                    :query "Topic query text"
+                    :limit "Result count limit")))
+           (args (plist-get tool :args))
+           (query-arg (seq-find (lambda (a) (equal (plist-get a :name) "query")) args))
+           (limit-arg (seq-find (lambda (a) (equal (plist-get a :name) "limit")) args)))
+      (should (string= (plist-get query-arg :description) "Topic query text"))
+      (should (string= (plist-get limit-arg :description) "Result count limit")))))
 
 (ert-deftest org-ai-skills-maybe-replan-enforces-max-replans ()
   "Replan helper should stop when max replan count is reached."

@@ -1,0 +1,210 @@
+* Skill: Generate Daily Financial News Report
+:PROPERTIES:
+:SKILL_ID: fin-news-daily-report
+:END:
+
+#+EFFECT: external
+#+INVOCATION: manual
+#+CONTEXT: project
+#+DETERMINISM: heuristic
+
+** Description
+Fetch raw financial news data using Search1API, then let the LLM produce the final polished daily Org report.
+
+** Inputs
+- report-date
+- optional-topic-focus
+
+** Outputs
+- raw-financial-news-data
+- polished-org-daily-financial-report
+- output must be valid Org subtree text only
+
+** Contracts
+- include a clear report date in heading
+- include market headlines with origin source links when available
+- include a brief introduction section before detailed headlines
+- include concise analysis notes based on fetched news
+- keep output language consistent with the original user query language
+- call raw Search1API fetch function before producing final report
+- when tool results contain duplicate links/titles, deduplicate before writing final report
+- prioritize diversified market coverage (equities, rates, FX, commodities, policy/macro) when available
+- all links in final output must use Org format =[[url][title]]=
+- markdown link format =[title](url)= is not allowed in final output
+- lists in final output must use Org plain-list marker =- = (dash + space)
+- markdown list markers (for example =* =, =+ =, =1.=) are not allowed for list items
+- =*= is reserved for Org headings only
+
+** Requirements
+- use Search1API-backed function call when external news retrieval is required
+- keep output concise and structured for daily review workflow
+- avoid non-financial topics unless explicitly requested
+- do not fabricate placeholder links; keep links only from fetched results
+- final report structure and wording should be decided by the LLM using raw fetched data
+- avoid overly broad queries (for example "金融新闻") when richer market-focused query can improve diversity
+- before returning, convert any markdown-style links to Org-style links
+- before returning, convert any markdown-style list items to Org list items with =- =
+
+** Function Calls
+- name: org-ai-skills-search1api-fetch-financial-news-raw
+  when: before generating final report, fetch raw financial news data
+  args: (query limit language_hint date)
+  query: topic string for news retrieval; use user request language; prefer explicit market facets (equities, rates, FX, commodities, macro/policy) instead of overly broad terms; default to market-facet daily headlines when omitted
+  limit: integer string between 3 and 10; default 8
+  language_hint: "zh" for Chinese or "en" for English; align with user prompt language
+  date: report date in YYYY-MM-DD; use today when omitted
+
+** Function Definitions
+#+begin_src emacs-lisp
+(require 'url)
+(require 'url-http)
+(require 'auth-source)
+
+(defun org-ai-skills--fin-report-search1api-key ()
+  "Return Search1API key from auth-source."
+  (let ((api-key (auth-source-pick-first-password :host "search1api")))
+    (unless (stringp api-key)
+      (signal 'org-ai-skills-function-call-error
+              (list "Missing Search1API API key in auth-source for host: search1api")))
+    api-key))
+
+(defun org-ai-skills--fin-report-utf8-bytes (text)
+  "Return TEXT encoded as unibyte UTF-8 bytes."
+  (string-as-unibyte (encode-coding-string (or text "") 'utf-8)))
+
+(defun org-ai-skills--fin-report-ensure-utf8-text (text)
+  "Return TEXT as multibyte UTF-8 string."
+  (if (multibyte-string-p text)
+      text
+    (decode-coding-string text 'utf-8 t)))
+
+(defun org-ai-skills--fin-report-http-status-code ()
+  "Read HTTP status code in current URL buffer."
+  (or (bound-and-true-p url-http-response-status)
+      (save-excursion
+        (goto-char (point-min))
+        (if (re-search-forward "^HTTP/[0-9.]+ \\([0-9][0-9][0-9]\\)" nil t)
+            (string-to-number (match-string 1))
+          0))))
+
+(defun org-ai-skills--fin-report-response-json ()
+  "Parse JSON body from current URL buffer."
+  (goto-char (point-min))
+  (unless (re-search-forward "\r?\n\r?\n" nil t)
+    (signal 'org-ai-skills-function-call-error
+            (list "Malformed HTTP response from Search1API")))
+  (json-parse-string
+   (buffer-substring-no-properties (point) (point-max))
+   :object-type 'plist
+   :array-type 'list
+   :null-object nil
+   :false-object nil))
+
+(defun org-ai-skills--fin-report-results-from-json (json-data)
+  "Extract results list from JSON-DATA."
+  (let ((results (or (plist-get json-data :results) nil)))
+    (if (listp results) results nil)))
+
+(defun org-ai-skills--fin-report-default-query (language-hint)
+  "Return default query for LANGUAGE-HINT."
+  (if (string= language-hint "zh")
+      "今日金融市场要闻 股市 债券 汇率 大宗商品 央行 政策"
+    "today financial market headlines equities rates fx commodities central bank policy"))
+
+(defun org-ai-skills--fin-report-coerce-limit (limit)
+  "Coerce LIMIT into an integer."
+  (let* ((n (cond
+             ((integerp limit) limit)
+             ((and (stringp limit) (string-match-p "^[0-9]+$" limit))
+              (string-to-number limit))
+             (t 8))))
+    (max 1 n)))
+
+(defun org-ai-skills--fin-report-normalize-raw-args (args)
+  "Normalize ARGS for raw tool calls into plist keys.
+Supports positional args and keyword plist style."
+  (if (and args (keywordp (car args)))
+      args
+    (list :query (nth 0 args)
+          :limit (nth 1 args)
+          :language_hint (nth 2 args)
+          :date (nth 3 args))))
+
+(defun org-ai-skills-search1api-fetch-financial-news
+    (&optional query limit language-hint)
+  "Fetch raw financial news items from Search1API."
+  (let* ((api-key (org-ai-skills--fin-report-search1api-key))
+         (lang (if (and (stringp language-hint)
+                        (member language-hint '("zh" "en")))
+                   language-hint
+                 "en"))
+         (q (if (and (stringp query) (not (string-empty-p query)))
+                query
+              (org-ai-skills--fin-report-default-query lang)))
+         (n (org-ai-skills--fin-report-coerce-limit limit))
+         (news-endpoint "https://api.search1api.com/news")
+         (url-request-method "POST")
+         (url-request-extra-headers
+          `(("Content-Type" . "application/json; charset=utf-8")
+            ("Authorization" . ,(org-ai-skills--fin-report-utf8-bytes
+                                 (format "Bearer %s" api-key)))))
+         (payload-json
+          (json-serialize
+           (list :query q
+                 :search_service "google"
+                 :max_results n
+                 :crawl_results 0
+                 :language lang
+                 :time_range "day")))
+         (url-request-data
+          (org-ai-skills--fin-report-utf8-bytes
+           payload-json))
+         (buffer (url-retrieve-synchronously news-endpoint t t 30)))
+    (unless (bufferp buffer)
+      (signal 'org-ai-skills-function-call-error
+              (list "Search1API request failed: no response buffer")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (let ((status-code (org-ai-skills--fin-report-http-status-code)))
+            (unless (<= 200 status-code 299)
+              (signal 'org-ai-skills-function-call-error
+                      (list (format "Search1API request failed with status: %s" status-code)))))
+          (org-ai-skills--fin-report-results-from-json
+           (org-ai-skills--fin-report-response-json)))
+      (kill-buffer buffer))))
+
+(defun org-ai-skills-search1api-fetch-financial-news-raw
+    (&rest args)
+  "Fetch raw financial news payload for LLM-side report rendering."
+  (let* ((norm (org-ai-skills--fin-report-normalize-raw-args args))
+         (query (plist-get norm :query))
+         (limit (plist-get norm :limit))
+         (language-hint (plist-get norm :language_hint))
+         (date (plist-get norm :date))
+         (lang-hint (if (and (stringp language-hint)
+                             (member language-hint '("zh" "en")))
+                        language-hint
+                      "en"))
+         (effective-query (if (and (stringp query) (not (string-empty-p query)))
+                              query
+                            (org-ai-skills--fin-report-default-query lang-hint)))
+         (items (org-ai-skills-search1api-fetch-financial-news effective-query limit lang-hint))
+         (payload (list :query effective-query
+                        :date (or date (format-time-string "%Y-%m-%d"))
+                        :language_hint lang-hint
+                        :count (length items)
+                        :items (vconcat items))))
+    (org-ai-skills--fin-report-ensure-utf8-text
+     (json-serialize payload
+                     :null-object nil
+                     :false-object nil))))
+#+end_src
+
+** Steps
+1. Determine financial topic focus and reporting date.
+2. Call =org-ai-skills-search1api-fetch-financial-news-raw= to fetch raw financial news payload.
+3. Generate and polish final daily Org report from raw payload in the same language as user prompt, with article links and concise analysis.
+4. Final self-check:
+   - every link is =[[url][title]]= and no =[title](url)= remains
+   - every list item starts with =- =
+   - =*= appears only for headings, not list items

@@ -127,6 +127,7 @@ Parse output contract (=org-ai-skills-parse-skill-file=):
   - =:contracts= (list)
   - =:requirements= (list)
   - =:function-calls= (list of plists)
+  - =:function-definitions= (list of emacs-lisp source block strings)
   - =:raw-sections= (plist)
   - =:tags= with nested plist:
     - =:effect=
@@ -179,6 +180,8 @@ Example skill set for composition testing:
 - =skills/002-simplify-for-twitter-post.org=
   - Compresses subtree content into concise, tweet-ready wording
     (including <= 280 character tweet sentence constraint in contracts).
+- =skills/003-daily-financial-news-report.org=
+  - Uses Search1API-backed raw data function call; LLM formats final Org report.
 
 Load gptel from straight checkout path if needed:
 
@@ -218,6 +221,7 @@ Core APIs:
 Failure behavior:
 - Signals =org-ai-skills-org-context-error= for invalid Org context/ranges.
 - Signals =org-ai-skills-gptel-error= if gptel is unavailable.
+- Signals =org-ai-skills-function-call-error= for invalid/missing skill function calls.
 
 Output handling:
 - Rewrite prompt enforces artifact-only output (no explanation/progress text).
@@ -225,6 +229,37 @@ Output handling:
   so replacement root level always matches selected target subtree level.
 - Rewrite request includes =:skill-context= with contracts/requirements/function-calls
   and source subtree metadata.
+- Function calls are skill-scoped runtime state:
+  - Declared calls are available only while a skill is actively applied.
+  - Excluding or finishing a skill unloads its function calls from request context.
+  - Function implementations are loaded from skill-local Org code blocks
+    (section =** Function Definitions=, =#+begin_src emacs-lisp ...=).
+
+Function call lifecycle APIs:
+- =(org-ai-skills-apply-skill-function-calls skill)=
+- =(org-ai-skills-exclude-skill-function-calls skill-or-id)=
+- =(org-ai-skills-active-skill-function-calls skill-or-id)=
+- =(org-ai-skills-clear-active-skill-functions)=
+
+gptel tool registration behavior:
+- Active skill =Function Calls= are converted to request-scoped gptel tools.
+- Per-argument hints can be declared in =Function Calls= (for example =query:=,
+  =limit:=, =language_hint:=, =date:=) and are propagated to gptel tool arg
+  descriptions.
+- Planner still decides skill selection and step execution order.
+- Runtime passes registered tools via =gptel-tools= and =gptel-use-tools= during
+  each =gptel-request= dispatch.
+
+Search1API credential lookup:
+- API key is read from auth-source:
+  - =(auth-source-pick-first-password :host "search1api")=
+- Example =~/.authinfo= entry:
+#+begin_example
+machine search1api login apikey password YOUR_SEARCH1API_KEY
+#+end_example
+
+For the financial news example, Search1API functions are defined inside:
+- =skills/003-daily-financial-news-report.org=
 
 Debug observability:
 - Toggle debug capture:
@@ -236,6 +271,9 @@ Debug observability:
   - =org-ai-skills-debug-buffer-name=
 - Debug entry includes timestamp, buffer/file, target headline/path, final prompt,
   and full request plist passed to =gptel-request=.
+- Additional debug events:
+  - =gptel-request-data= includes request payload data captured from gptel callback info.
+  - =tool-call= and =tool-result= events are logged when gptel emits tool-calling callbacks.
 
 Embark integration:
 - Requires Embark installed.
