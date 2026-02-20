@@ -1,0 +1,145 @@
+#+TITLE: PRD 009 - Two-Column Execution UX (Control / Source + Minibuffer Candidate Flow)
+#+STARTUP: overview
+
+* Problem
+Current runtime interaction is fragmented across minibuffer prompts and ad-hoc command invocations. Users cannot continuously observe execution progress, quickly operate common controls, and compare multiple result candidates in a stable workspace.
+
+This reduces confidence during long-running LLM runs and makes candidate selection/discard/re-run workflows harder than necessary.
+
+* Scope
+- In scope:
+  - Define a 2-column runtime UX in Emacs windows:
+    - Control buffer (left): execution progress + operation shortcuts.
+    - Source document buffer (right): original Org content with in-place overlay on active region.
+  - Reuse existing minibuffer candidate selection/preview flow and expose trigger commands from control buffer.
+  - Define overlay lifecycle for "in-progress" and "pending replacement" states in source buffer.
+  - Define window/buffer lifecycle, key actions, and failure states.
+- Out of scope:
+  - Building a dedicated diff/result preview buffer in MVP.
+  - Replacing existing minibuffer candidate selector internals.
+  - New model ranking algorithms.
+  - Cross-file multi-target batch editing in one run.
+
+* Constraints
+- Technical constraints:
+  - Preserve spec vs run separation; no runtime mutation of skill spec files.
+  - Control buffer is runtime state visualization and command surface only.
+  - Candidate selection/preview should use existing minibuffer mechanisms.
+  - Overlay must be deterministic and removed on cancel/failure/apply completion.
+  - Must not silently apply changes; explicit user selection/apply remains mandatory.
+- Process constraints:
+  - Land UX behavior spec before implementation.
+  - Add ERT coverage for window lifecycle, overlay lifecycle, and command wiring.
+  - Update README usage for new interaction model.
+
+* Spec Design
+** 1) Two-Column Layout Contract (MVP)
+- Default layout (left-to-right):
+  - Column 1: =*org-ai-skills-control*= (control buffer)
+  - Column 2: original Org source buffer
+- Layout activation:
+  - Activated by dedicated command (tentative: =org-ai-skills-ui-open-workspace=) or integrated entry command.
+- Layout restoration:
+  - Preserve user's prior window configuration and restore on explicit close (tentative: =org-ai-skills-ui-close-workspace=).
+
+** 2) Control Buffer Responsibilities
+- Display current run context:
+  - active task/preset
+  - target slot/region identity
+  - run status (idle/running/succeeded/failed/canceled)
+  - progress checkpoints (planning, generation, candidate ready, applied)
+- Provide explicit operations (key/button commands):
+  - stop current run
+  - rerun with same context
+  - adjust preset/task parameters
+  - open/select candidate from existing result set
+  - apply selected candidate
+  - discard candidate
+- Candidate UX note:
+  - Existing minibuffer-based candidate selection remains valid.
+  - Control buffer can invoke it and reflect the selected candidate state.
+  - Candidate preview continues through minibuffer-driven flow in MVP.
+
+** 3) Source Buffer Overlay Semantics
+- Overlay target:
+  - selected run region/subtree in original Org buffer.
+- Overlay states (MVP):
+  - running: visually indicate "processing"
+  - ready: indicate "candidate ready, pending apply"
+- Overlay lifecycle:
+  - created when run starts on resolved target
+  - updated when run transitions status
+  - removed on apply success / cancel / failure / workspace close
+- Overlay safety:
+  - overlay is visual-only, does not mutate underlying text until explicit apply.
+
+** 4) Command and State Wiring
+- Runtime state remains single source of truth for:
+  - current run id
+  - current candidate selection
+  - buffer identities
+  - UI status for control + overlay
+- Commands in control buffer must dispatch to existing generation/candidate/apply primitives where possible.
+- If a run fails:
+  - keep prior successful candidates accessible
+  - show explicit error in control buffer
+  - clear or downgrade overlay state appropriately
+
+** 5) Failure Behavior
+- Missing/invalid target region:
+  - block run start with explicit error; no overlay created.
+- Source buffer killed during run:
+  - stop run or detach with explicit message; avoid orphan overlay state.
+- Workspace close during running task:
+  - closing workspace does not stop the running task; task continues in background.
+  - task stops only when user explicitly executes stop.
+
+* Expected Behavior
+- Behavior 1:
+  - User can start a run and immediately see stable 2-column workspace.
+- Behavior 2:
+  - Control buffer continuously reflects current execution progress and available actions.
+- Behavior 3:
+  - User can trigger candidate selection from control buffer while reusing existing selection flow.
+- Behavior 4:
+  - Source buffer shows overlay on active region to indicate processing/pending replacement.
+- Behavior 5:
+  - No content is applied without explicit candidate selection/apply action.
+
+* Decisions
+- Should closing workspace automatically stop a running job, or keep it running in background?
+  A: Keep running in background when workspace is closed; stop only on explicit user stop action.
+- Should control buffer actions be read-only text buttons, transient keymap, or both in MVP?
+  A: Use transient keymap only in MVP; no text buttons.
+- Should overlay "ready" state persist until next run, or clear immediately after candidate switch?
+  A: Clear immediately.
+- Should default layout auto-open on every rewrite command, or remain opt-in initially?
+  A: Auto-open on every rewrite command.
+
+* Tasks
+- [X] Define runtime UI state schema for control/source synchronization.
+- [X] Implement workspace open/close commands with window configuration restore.
+- [X] Implement control buffer renderer for run status, progress, and action surface.
+- [X] Wire control actions to existing stop/rerun/preset/candidate/apply flows.
+- [X] Integrate minibuffer candidate selection trigger into control buffer action flow.
+- [X] Implement source-region overlay creation/update/cleanup hooks.
+- [X] Add ERT tests for layout lifecycle and command wiring.
+- [X] Add ERT tests for overlay lifecycle across success/failure/cancel/close.
+- [X] Add ERT tests for candidate selection trigger from control buffer.
+- [X] Update README usage docs for two-column workflow.
+- [X] Refine control panel ergonomics: fixed/narrow width + initial focus behavior.
+- [X] Refine control action semantics: explicit availability/disabled states and rerun feedback.
+- [X] Add candidate history list rendering in control panel for long review flows.
+- [X] Add/update ERT tests for control focus/availability rendering and history display.
+- [X] Refine candidate list formatting for compact control width (minimal metadata + truncated preview).
+- [X] Enforce control panel width upper bound at half frame.
+
+* Worklog
+- 2026-02-20 :: Drafted PRD for 3-column execution UX (control/diff/source), including scope boundaries and MVP decisions pending user review. Test status: not run.
+- 2026-02-20 :: Revised PRD after review to 2-column workspace (control/source) with minibuffer-only candidate selection/preview flow in MVP. Test status: not run.
+- 2026-02-20 :: Finalized decision section and failure behavior wording after user review; workspace-close behavior, keymap interaction mode, overlay clearing, and auto-open policy are now explicit. Test status: not run.
+- 2026-02-20 :: Implemented two-column control/source workspace with transient keymap operations (stop/rerun/adjust/select/apply/discard), source-region overlay lifecycle, auto-open on interactive rewrite/planner commands, and planner preset forwarding in UI state. Added ERT coverage for workspace lifecycle, overlay lifecycle, rerun wiring, candidate-selection trigger wiring, and interactive auto-open behavior. Updated README usage docs for control workspace flow and keybindings. Test status: pass (69/69, batch ERT).
+- 2026-02-20 :: Follow-up UX refinement requested after manual trial: tighten control-panel width, focus control on first workspace activation, improve rerun/status/action feedback, and render full candidate history in control panel. Test status: not run.
+- 2026-02-20 :: Completed follow-up UX refinement: added control width setting, first-open focus to control panel, status-aware action gating/highlighting, explicit rerun dispatch feedback, and full candidate history rendering in control panel. Updated tests and README accordingly. Test status: pass (70/70, batch ERT).
+- 2026-02-20 :: Follow-up compactness refinement requested: reduce control panel visual width pressure by simplifying candidate-row metadata and hard-capping control width to half-frame. Test status: not run.
+- 2026-02-20 :: Completed compactness refinement: control width default reduced and runtime-capped to half-frame, candidate rows switched to compact index/status/preview format with aggressive truncation, and workspace sizing logic adjusted to enforce cap. Test status: pass (70/70, batch ERT).

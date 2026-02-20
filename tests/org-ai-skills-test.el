@@ -612,7 +612,8 @@
             (org-mode)
             (insert "* Leaf\nOriginal body.\n")
             (goto-char (point-min))
-            (let ((subtree (org-ai-skills-org-resolve-subtree 'current)))
+            (let ((source (current-buffer))
+                  (subtree (org-ai-skills-org-resolve-subtree 'current)))
               (cl-letf (((symbol-function 'called-interactively-p)
                          (lambda (&rest _args) t))
                         ((symbol-function 'completing-read)
@@ -622,8 +623,9 @@
                          (lambda (_request callback)
                            (funcall callback "*** Leaf\nAuto-applied body.\n"))))
                 (org-ai-skills-org-rewrite-subtree subtree skill "Rewrite now"))
-              (goto-char (point-min))
-              (should (re-search-forward "Auto-applied body\\." nil t)))))
+              (with-current-buffer source
+                (goto-char (point-min))
+                (should (re-search-forward "Auto-applied body\\." nil t))))))
       (delete-directory store-dir t))))
 
 (ert-deftest org-ai-skills-apply-slot-candidate-replaces-subtree-and-updates-status ()
@@ -676,6 +678,162 @@
               (goto-char (point-min))
               (should (re-search-forward ":ID: keep-id" nil t))
               (should (re-search-forward "Replaced body\\." nil t)))))
+      (delete-directory store-dir t))))
+
+(ert-deftest org-ai-skills-ui-workspace-open-close-lifecycle ()
+  "Workspace command should open control/source columns and restore layout on close."
+  (save-window-excursion
+    (delete-other-windows)
+    (with-temp-buffer
+      (org-mode)
+      (insert "* Leaf\nBody\n")
+      (let ((source (current-buffer))
+            (org-ai-skills--ui-run-state (list :source-buffer (current-buffer))))
+        (org-ai-skills-ui-open-workspace (current-buffer))
+        (should (= (length (window-list)) 2))
+        (should (window-live-p (get-buffer-window org-ai-skills-control-buffer-name)))
+        (should (eq (window-buffer (selected-window))
+                    (get-buffer org-ai-skills-control-buffer-name)))
+        (let ((total-width (window-total-width (frame-root-window))))
+          (should (<= (window-total-width (selected-window))
+                      (max 24 (/ total-width 2)))))
+        (should (<= (window-total-width (selected-window))
+                    org-ai-skills-ui-control-window-width))
+        (should (window-live-p (get-buffer-window source)))
+        (org-ai-skills-ui-close-workspace)
+        (should (= (length (window-list)) 1))))))
+
+(ert-deftest org-ai-skills-ui-overlay-lifecycle-running-ready-stop ()
+  "Overlay should support running/ready states and clear on stop."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Leaf\nBody\n")
+    (goto-char (point-min))
+    (let* ((subtree (org-ai-skills-org-resolve-subtree 'current))
+           (begin (copy-marker (plist-get subtree :begin)))
+           (end (copy-marker (plist-get subtree :end)))
+           (org-ai-skills--ui-run-state
+           (list :source-buffer (current-buffer)
+                  :begin begin
+                  :end end
+                  :run-id "run-1"
+                  :status 'running
+                  :stop-requested nil)))
+      (org-ai-skills--ui-set-overlay 'running)
+      (should (overlayp (plist-get org-ai-skills--ui-run-state :overlay)))
+      (should (eq (overlay-get (plist-get org-ai-skills--ui-run-state :overlay) 'face)
+                  'org-ai-skills-ui-overlay-running-face))
+      (org-ai-skills--ui-set-overlay 'ready)
+      (should (overlayp (plist-get org-ai-skills--ui-run-state :overlay)))
+      (should (eq (overlay-get (plist-get org-ai-skills--ui-run-state :overlay) 'face)
+                  'org-ai-skills-ui-overlay-ready-face))
+      (org-ai-skills-ui-stop-run)
+      (should-not (plist-get org-ai-skills--ui-run-state :overlay))
+      (should (eq (plist-get org-ai-skills--ui-run-state :status) 'canceled)))))
+
+(ert-deftest org-ai-skills-ui-rerun-dispatches-rerun-function ()
+  "Control rerun should dispatch stored rerun function."
+  (let ((called nil)
+        (org-ai-skills--ui-run-state nil))
+    (setq org-ai-skills--ui-run-state
+          (list :rerun-fn (lambda () (setq called t))))
+    (org-ai-skills-ui-rerun)
+    (should called)))
+
+(ert-deftest org-ai-skills-ui-select-candidate-wires-minibuffer-flow ()
+  "Control candidate selector should reuse minibuffer and store selected candidate."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t)))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir))
+          (with-temp-buffer
+            (org-mode)
+            (insert "* Leaf\nOriginal body.\n")
+            (goto-char (point-min))
+            (let* ((subtree (org-ai-skills-org-resolve-subtree 'current))
+                   (slot (org-ai-skills--ensure-subtree-slot-id subtree))
+                   (candidate (org-ai-skills--record-generated-candidate
+                               slot "rewrite" "rewrite" "prompt"
+                               "* Leaf\nApplied body.\n"))
+                   (display (org-ai-skills--candidate-display candidate))
+                   (begin (copy-marker (plist-get subtree :begin)))
+                   (end (copy-marker (plist-get subtree :end)))
+                   (org-ai-skills--ui-run-state
+                    (list :run-id "run-2"
+                          :source-buffer (current-buffer)
+                          :begin begin
+                          :end end
+                          :slot-key (plist-get slot :slot-key)
+                          :status 'running
+                          :progress "candidate-ready")))
+              (org-ai-skills--ui-set-overlay 'ready)
+              (cl-letf (((symbol-function 'completing-read)
+                         (lambda (&rest _args) display)))
+                (org-ai-skills-ui-select-candidate))
+              (should (equal (plist-get (plist-get org-ai-skills--ui-run-state :selected-candidate)
+                                        :candidate-id)
+                             (plist-get candidate :candidate-id)))
+              (should-not (plist-get org-ai-skills--ui-run-state :overlay)))))
+      (delete-directory store-dir t))))
+
+(ert-deftest org-ai-skills-ui-control-buffer-renders-candidate-history ()
+  "Control buffer should render candidate history list for the current slot."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t)))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir))
+          (with-temp-buffer
+            (org-mode)
+            (insert "* Leaf\nBody\n")
+            (goto-char (point-min))
+            (let* ((subtree (org-ai-skills-org-resolve-subtree 'current))
+                   (slot (org-ai-skills--ensure-subtree-slot-id subtree))
+                   (candidate-a (org-ai-skills--record-generated-candidate
+                                 slot "rewrite" "rewrite" "prompt-a" "* Leaf\nA\n"))
+                   (_candidate-b (org-ai-skills--record-generated-candidate
+                                  slot "rewrite" "rewrite" "prompt-b" "* Leaf\nB\n"))
+                   (org-ai-skills--ui-run-state
+                    (list :run-id "run-history"
+                          :status 'ready
+                          :progress "candidate-ready"
+                          :run-type 'rewrite
+                          :slot-key (plist-get slot :slot-key)
+                          :heading "Leaf"
+                          :task "rewrite"
+                          :selected-candidate candidate-a)))
+              (org-ai-skills-ui-refresh-control-buffer)
+              (with-current-buffer (get-buffer org-ai-skills-control-buffer-name)
+                (goto-char (point-min))
+                (should (re-search-forward "Candidates (2):" nil t))
+                (should-not (re-search-forward
+                             (regexp-quote (plist-get candidate-a :candidate-id))
+                             nil t))
+                (goto-char (point-min))
+                (should (re-search-forward " \\*01 \\[G\\] " nil t))))))
+      (delete-directory store-dir t))))
+
+(ert-deftest org-ai-skills-rewrite-interactive-auto-opens-control-workspace ()
+  "Interactive rewrite should auto-open control workspace when enabled."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t))
+        (skill (org-ai-skills-parse-skill-file org-ai-skills-test--first-skill-file))
+        (opened nil))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir)
+              (org-ai-skills-auto-apply-generated-candidate t)
+              (org-ai-skills-ui-auto-open t))
+          (with-temp-buffer
+            (org-mode)
+            (insert "* Leaf\nOriginal body.\n")
+            (goto-char (point-min))
+            (let ((subtree (org-ai-skills-org-resolve-subtree 'current)))
+              (cl-letf (((symbol-function 'called-interactively-p)
+                         (lambda (&rest _args) t))
+                        ((symbol-function 'org-ai-skills-ui-open-workspace)
+                         (lambda (&optional _source-buffer)
+                           (setq opened t)))
+                        ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+                         (lambda (_request callback)
+                           (funcall callback "*** Leaf\nAuto-applied body.\n"))))
+                (org-ai-skills-org-rewrite-subtree subtree skill "Rewrite now"))
+              (should opened))))
       (delete-directory store-dir t))))
 
 (ert-deftest org-ai-skills-embark-action-delegates-to-rewrite-command ()
@@ -754,10 +912,11 @@
         called-task
         called-origin)
     (cl-letf (((symbol-function 'org-ai-skills-org-plan-and-run-subtree)
-               (lambda (target task &optional interactive-origin)
+               (lambda (target task &optional interactive-origin preset-id)
                  (setq called-target target)
                  (setq called-task task)
-                 (setq called-origin interactive-origin))))
+                 (setq called-origin interactive-origin)
+                 (setq org-ai-skills-test--captured-preset preset-id))))
       (org-ai-skills-org-plan-and-run-subtree-repeat-task '(:heading "Leaf")))
     (should (equal called-target '(:heading "Leaf")))
     (should (string= called-task "Refine notes"))
@@ -774,14 +933,16 @@
   (let ((org-ai-skills-planner-task-presets
          '(("notes" . "Convert to concise notes"))))
     (cl-letf (((symbol-function 'org-ai-skills-org-plan-and-run-subtree)
-               (lambda (target task &optional interactive-origin)
+               (lambda (target task &optional interactive-origin preset-id)
                  (setq org-ai-skills-test--captured-target target)
                  (setq org-ai-skills-test--captured-task task)
-                 (setq org-ai-skills-test--captured-origin interactive-origin))))
+                 (setq org-ai-skills-test--captured-origin interactive-origin)
+                 (setq org-ai-skills-test--captured-preset preset-id))))
       (org-ai-skills-org-plan-and-run-subtree-preset '(:heading "Leaf") "notes")
       (should (equal org-ai-skills-test--captured-target '(:heading "Leaf")))
       (should (string= org-ai-skills-test--captured-task "Convert to concise notes"))
-      (should org-ai-skills-test--captured-origin))))
+      (should org-ai-skills-test--captured-origin)
+      (should (string= org-ai-skills-test--captured-preset "notes")))))
 
 (ert-deftest org-ai-skills-define-plan-run-preset-command-uses-fixed-task ()
   "Generated preset command should invoke planner with fixed task."
@@ -795,14 +956,16 @@
      "Turn subtree into action items")
     (unwind-protect
         (cl-letf (((symbol-function 'org-ai-skills-org-plan-and-run-subtree)
-                   (lambda (target task &optional interactive-origin)
+                   (lambda (target task &optional interactive-origin preset-id)
                      (setq captured-target target)
                      (setq captured-task task)
-                     (setq captured-origin interactive-origin))))
+                     (setq captured-origin interactive-origin)
+                     (setq org-ai-skills-test--captured-preset preset-id))))
           (funcall command '(:heading "Leaf"))
           (should (equal captured-target '(:heading "Leaf")))
           (should (string= captured-task "Turn subtree into action items"))
-          (should captured-origin))
+          (should captured-origin)
+          (should-not org-ai-skills-test--captured-preset))
       (fmakunbound command))))
 
 (ert-deftest org-ai-skills-load-skill-metadata-returns-meta-only-shape ()

@@ -205,10 +205,34 @@ Interactive flow:
 - Choose a skill from =skills/=.
 - Optional: add a custom rewrite instruction.
 - One command run generates one candidate output and stores it.
+- Interactive runs auto-open a 2-column workspace:
+  - left: =*org-ai-skills-control*= (run status + operation keys)
+  - right: source Org buffer (target region overlay)
 - Interactive runs auto-apply the newly generated candidate by default.
 - Disable auto-apply if needed:
   - =(setq org-ai-skills-auto-apply-generated-candidate nil)=
   - Then select/apply manually from candidate list.
+- Disable auto-open workspace if needed:
+  - =(setq org-ai-skills-ui-auto-open nil)=
+- Tune control-panel width (columns):
+  - =(setq org-ai-skills-ui-control-window-width 34)=
+  - Runtime also caps control width at half of current frame.
+
+Control workspace keys (in =*org-ai-skills-control*=):
+- =s=: stop current run (enabled only while status is =running=)
+- =g=: rerun with same context (dispatches a new run; unavailable while running)
+- =t=: adjust planner task / rewrite instruction, then rerun (unavailable while running)
+- =c=: open minibuffer candidate selector
+- =a=: apply currently selected candidate (unavailable while running)
+- =d=: mark selected candidate as discarded (unavailable while running)
+- =q=: close workspace (run continues in background; use =s= to stop)
+- =r=: refresh control buffer
+
+Control panel details:
+- On first workspace activation, focus moves to control panel for key-driven operation.
+- Key rows are highlighted when available and dimmed when unavailable.
+- Candidate history list is rendered directly in control panel for long review flows.
+  - Compact format: index + status + short preview (IDs/timestamps hidden in panel).
 
 Candidate apply command:
 - =M-x org-ai-skills-org-apply-slot-candidate=
@@ -242,6 +266,10 @@ Output handling:
   - =~/.emacs.d/skills/versions/=
 - Candidate store read/write uses UTF-8 by default.
 - If headline =:ID:= is missing, runtime auto-generates and writes it back before candidate persistence.
+- Overlay behavior:
+  - running: highlight target region as processing
+  - ready: mark pending replacement candidate
+  - cleared on stop/apply/workspace close and immediately after candidate switch
 - Function calls are skill-scoped runtime state:
   - Declared calls are available only while a skill is actively applied.
   - Excluding or finishing a skill unloads its function calls from request context.

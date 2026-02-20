@@ -94,6 +94,16 @@ When nil, interactive flow asks user to select a candidate explicitly."
   :type 'boolean
   :group 'org-ai-skills)
 
+(defcustom org-ai-skills-ui-auto-open t
+  "When non-nil, interactive rewrite/planner runs auto-open the control workspace."
+  :type 'boolean
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-ui-control-window-width 34
+  "Preferred width (columns) for the control window."
+  :type 'integer
+  :group 'org-ai-skills)
+
 (defconst org-ai-skills--allowed-tags
   '((effect . ("pure" "local" "external" "irreversible"))
     (invocation . ("auto" "suggest" "manual"))
@@ -127,6 +137,38 @@ When nil, interactive flow asks user to select a candidate explicitly."
 
 (defvar org-ai-skills--candidate-selection-history nil
   "Minibuffer history for candidate selection prompts.")
+
+(defconst org-ai-skills-control-buffer-name "*org-ai-skills-control*"
+  "Buffer name for runtime control panel.")
+
+(defvar org-ai-skills--ui-window-configuration nil
+  "Window configuration captured before opening control workspace.")
+
+(defvar org-ai-skills--ui-run-state nil
+  "Runtime UI state for current run and control workspace.")
+
+(defvar org-ai-skills-control-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "s") #'org-ai-skills-ui-stop-run)
+    (define-key map (kbd "g") #'org-ai-skills-ui-rerun)
+    (define-key map (kbd "t") #'org-ai-skills-ui-adjust-task-or-instruction)
+    (define-key map (kbd "c") #'org-ai-skills-ui-select-candidate)
+    (define-key map (kbd "a") #'org-ai-skills-ui-apply-selected-candidate)
+    (define-key map (kbd "d") #'org-ai-skills-ui-discard-selected-candidate)
+    (define-key map (kbd "q") #'org-ai-skills-ui-close-workspace)
+    (define-key map (kbd "r") #'org-ai-skills-ui-refresh-control-buffer)
+    map)
+  "Keymap for `org-ai-skills-control-mode'.")
+
+(defface org-ai-skills-ui-overlay-running-face
+  '((t :inherit highlight))
+  "Face for source-region overlay while generation is running."
+  :group 'org-ai-skills)
+
+(defface org-ai-skills-ui-overlay-ready-face
+  '((t :inherit secondary-selection))
+  "Face for source-region overlay when candidate is ready."
+  :group 'org-ai-skills)
 
 (defun org-ai-skills--signal-parse-error (file message)
   "Signal parse error with FILE context and MESSAGE."
@@ -1300,6 +1342,305 @@ Return an alist where each item is (DISPLAY . SUBTREE-PLIST)."
         (org-ai-skills--signal-org-context-error
          "Unable to resolve selected rewrite target"))))
 
+(define-derived-mode org-ai-skills-control-mode special-mode "Org-AI-Control"
+  "Major mode for org-ai-skills control workspace."
+  (setq-local truncate-lines t))
+
+(defun org-ai-skills--ui-control-buffer ()
+  "Return control buffer."
+  (get-buffer-create org-ai-skills-control-buffer-name))
+
+(defun org-ai-skills--ui-run-get (key)
+  "Return KEY from current UI run state."
+  (plist-get org-ai-skills--ui-run-state key))
+
+(defun org-ai-skills--ui-run-set (key value)
+  "Set KEY in current UI run state to VALUE."
+  (setq org-ai-skills--ui-run-state
+        (plist-put org-ai-skills--ui-run-state key value)))
+
+(defun org-ai-skills--ui-clear-overlay ()
+  "Remove source overlay from current UI run state."
+  (let ((ov (org-ai-skills--ui-run-get :overlay)))
+    (when (overlayp ov)
+      (delete-overlay ov)))
+  (org-ai-skills--ui-run-set :overlay nil))
+
+(defun org-ai-skills--ui-set-overlay (state)
+  "Set source overlay STATE for current UI run."
+  (let* ((source-buffer (org-ai-skills--ui-run-get :source-buffer))
+         (begin (org-ai-skills--ui-run-get :begin))
+         (end (org-ai-skills--ui-run-get :end)))
+    (org-ai-skills--ui-clear-overlay)
+    (when (and (buffer-live-p source-buffer)
+               (markerp begin)
+               (marker-buffer begin)
+               (markerp end)
+               (marker-buffer end))
+      (with-current-buffer source-buffer
+        (let ((ov (make-overlay begin end source-buffer t t)))
+          (overlay-put ov 'evaporate t)
+          (overlay-put ov 'priority 1000)
+          (overlay-put ov 'face
+                       (pcase state
+                         ('ready 'org-ai-skills-ui-overlay-ready-face)
+                         (_ 'org-ai-skills-ui-overlay-running-face)))
+          (overlay-put ov 'help-echo
+                       (pcase state
+                         ('ready "org-ai-skills: candidate ready")
+                         (_ "org-ai-skills: processing")))
+          (org-ai-skills--ui-run-set :overlay ov))))))
+
+(defun org-ai-skills--ui-candidate-list-display (candidate index preview-width selected-id)
+  "Return compact one-line display for CANDIDATE at INDEX.
+PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
+  (let* ((candidate-id (or (plist-get candidate :candidate-id) ""))
+         (c-status (or (plist-get candidate :status) "generated"))
+         (status-mark (pcase c-status
+                        ("applied" "A")
+                        ("discarded" "D")
+                        (_ "G")))
+         (selected-mark (if (equal candidate-id selected-id) "*" " "))
+         (text (or (plist-get candidate :output-text) ""))
+         (preview (replace-regexp-in-string "[\n\r\t ]+" " " text)))
+    (format " %s%02d [%s] %s"
+            selected-mark
+            (1+ index)
+            status-mark
+            (truncate-string-to-width preview (max 16 preview-width) nil nil t))))
+
+(defun org-ai-skills-ui-refresh-control-buffer ()
+  "Re-render control buffer content from current runtime state."
+  (interactive)
+  (let* ((buffer (org-ai-skills--ui-control-buffer))
+         (status (or (org-ai-skills--ui-run-get :status) 'idle))
+         (progress (or (org-ai-skills--ui-run-get :progress) "idle"))
+         (running (eq status 'running))
+         (run-type (org-ai-skills--ui-run-get :run-type))
+         (task (or (org-ai-skills--ui-run-get :task) ""))
+         (preset (or (org-ai-skills--ui-run-get :preset-id) ""))
+         (slot-key (org-ai-skills--ui-run-get :slot-key))
+         (candidates (if (stringp slot-key)
+                         (org-ai-skills--load-slot-candidates slot-key)
+                       nil))
+         (heading (or (org-ai-skills--ui-run-get :heading) ""))
+         (selected (org-ai-skills--ui-run-get :selected-candidate))
+         (selected-id (or (and selected (plist-get selected :candidate-id)) "none"))
+         (rerun-enabled (and (functionp (org-ai-skills--ui-run-get :rerun-fn))
+                             (not running)))
+         (adjust-enabled (and (memq run-type '(planner rewrite))
+                              (not running)))
+         (candidate-enabled (and (listp candidates) (> (length candidates) 0)))
+         (apply-enabled (and candidate-enabled (not running)))
+         (discard-enabled (and candidate-enabled (not running)))
+         (stop-enabled running)
+         (key-face (lambda (enabled)
+                     (if enabled
+                         'font-lock-keyword-face
+                       'shadow))))
+    (with-current-buffer buffer
+      (org-ai-skills-control-mode)
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert "org-ai-skills control\n\n")
+        (insert (format "Status: %s\n" status))
+        (insert (format "Progress: %s\n" progress))
+        (insert (format "Heading: %s\n" heading))
+        (insert (format "Task/Preset: %s%s%s\n"
+                        task
+                        (if (and (not (string-empty-p task))
+                                 (not (string-empty-p preset)))
+                            " / "
+                          "")
+                        preset))
+        (insert (format "Selected candidate: %s\n\n" selected-id))
+        (insert "Keys:\n")
+        (insert (propertize "  s stop run" 'face (funcall key-face stop-enabled)) "\n")
+        (insert (propertize "  g rerun" 'face (funcall key-face rerun-enabled)) "\n")
+        (insert (propertize "  t adjust task/instruction" 'face (funcall key-face adjust-enabled)) "\n")
+        (insert (propertize "  c select candidate (minibuffer)" 'face (funcall key-face candidate-enabled)) "\n")
+        (insert (propertize "  a apply selected candidate" 'face (funcall key-face apply-enabled)) "\n")
+        (insert (propertize "  d discard selected candidate" 'face (funcall key-face discard-enabled)) "\n")
+        (insert (propertize "  r refresh" 'face (funcall key-face t)) "\n")
+        (insert (propertize "  q close workspace" 'face (funcall key-face t)) "\n")
+        (insert "\n")
+        (insert (format "Candidates (%d):\n" (length candidates)))
+        (if (null candidates)
+            (insert "  (none)\n")
+          (let* ((panel-width (max 24 (window-total-width (selected-window))))
+                 (preview-width (- panel-width 12))
+                 (idx 0))
+            (dolist (candidate candidates)
+              (insert (org-ai-skills--ui-candidate-list-display
+                       candidate idx preview-width selected-id)
+                      "\n")
+              (setq idx (1+ idx)))))
+        (goto-char (point-min))))))
+
+(defun org-ai-skills--ui-set-status (status progress)
+  "Update STATUS and PROGRESS in UI state."
+  (org-ai-skills--ui-run-set :status status)
+  (org-ai-skills--ui-run-set :progress progress)
+  (org-ai-skills-ui-refresh-control-buffer))
+
+(defun org-ai-skills-ui-open-workspace (&optional source-buffer)
+  "Open two-column workspace for SOURCE-BUFFER and control panel."
+  (interactive)
+  (let* ((source (or source-buffer (current-buffer)))
+         (control (org-ai-skills--ui-control-buffer))
+         (already-open (get-buffer-window control)))
+    (unless already-open
+      (setq org-ai-skills--ui-window-configuration (current-window-configuration))
+      (delete-other-windows)
+      (let* ((left (selected-window))
+             (total (window-total-width left))
+             (half-width (max 24 (/ total 2)))
+             (control-width (max 24
+                                 (min org-ai-skills-ui-control-window-width
+                                      half-width
+                                      (max 24 (- total 20)))))
+             (source-width (max 20 (- total control-width)))
+             (right (selected-window))
+             (left (split-window right source-width 'left)))
+        (set-window-buffer left control)
+        (set-window-buffer right source)
+        (let ((current-left (window-total-width left)))
+          (when (> current-left control-width)
+            (ignore-errors
+              (window-resize left (- control-width current-left) t t))))
+        ;; On first activation, focus control panel for quick key-driven actions.
+        (select-window left)))
+    (org-ai-skills-ui-refresh-control-buffer)))
+
+(defun org-ai-skills-ui-close-workspace ()
+  "Close control workspace and restore previous windows."
+  (interactive)
+  (org-ai-skills--ui-clear-overlay)
+  (let ((control (org-ai-skills--ui-control-buffer)))
+    (when (buffer-live-p control)
+      (when-let ((win (get-buffer-window control t)))
+        (delete-window win))))
+  (when (window-configuration-p org-ai-skills--ui-window-configuration)
+    (set-window-configuration org-ai-skills--ui-window-configuration)
+    (setq org-ai-skills--ui-window-configuration nil)))
+
+(defun org-ai-skills--ui-start-run (run-state)
+  "Start new UI RUN-STATE and render workspace."
+  (org-ai-skills--ui-clear-overlay)
+  (setq org-ai-skills--ui-run-state run-state)
+  (when (and org-ai-skills-ui-auto-open
+             (org-ai-skills--ui-run-get :interactive-run))
+    (org-ai-skills-ui-open-workspace (org-ai-skills--ui-run-get :source-buffer)))
+  (org-ai-skills--ui-set-overlay 'running)
+  (org-ai-skills--ui-set-status 'running (or (org-ai-skills--ui-run-get :progress) "running"))
+  org-ai-skills--ui-run-state)
+
+(defun org-ai-skills--ui-stop-requested-p (run-id)
+  "Return non-nil when RUN-ID has a stop request."
+  (and (equal (org-ai-skills--ui-run-get :run-id) run-id)
+       (org-ai-skills--ui-run-get :stop-requested)))
+
+(defun org-ai-skills-ui-stop-run ()
+  "Stop current run from control workspace."
+  (interactive)
+  (if (not (eq (org-ai-skills--ui-run-get :status) 'running))
+      (message "org-ai-skills: stop unavailable (status: %s)"
+               (or (org-ai-skills--ui-run-get :status) 'idle))
+    (org-ai-skills--ui-run-set :stop-requested t)
+    (org-ai-skills--ui-clear-overlay)
+    (org-ai-skills--ui-set-status 'canceled "canceled")
+    (message "org-ai-skills: stop requested")))
+
+(defun org-ai-skills-ui-rerun ()
+  "Re-run current task context."
+  (interactive)
+  (if (eq (org-ai-skills--ui-run-get :status) 'running)
+      (message "org-ai-skills: rerun unavailable while running")
+    (let ((rerun-fn (org-ai-skills--ui-run-get :rerun-fn)))
+      (unless (functionp rerun-fn)
+        (org-ai-skills--signal-org-context-error "No rerun action available"))
+      (org-ai-skills--ui-set-status 'running "rerun-dispatched")
+      (org-ai-skills--ui-set-overlay 'running)
+      (message "org-ai-skills: rerun dispatched")
+      (funcall rerun-fn))))
+
+(defun org-ai-skills-ui-adjust-task-or-instruction ()
+  "Adjust planner task or rewrite instruction, then rerun."
+  (interactive)
+  (if (eq (org-ai-skills--ui-run-get :status) 'running)
+      (message "org-ai-skills: adjust unavailable while running")
+    (let ((run-type (org-ai-skills--ui-run-get :run-type)))
+    (pcase run-type
+      ('planner
+       (let* ((target (org-ai-skills--ui-run-get :target))
+              (current-task (or (org-ai-skills--ui-run-get :task) ""))
+              (task (read-string "Planner task: " current-task)))
+         (org-ai-skills--ui-run-set
+          :rerun-fn
+          (lambda ()
+            (interactive)
+            (org-ai-skills-org-plan-and-run-subtree target task t)))
+         (org-ai-skills-org-plan-and-run-subtree target task t)))
+      ('rewrite
+       (let* ((target (org-ai-skills--ui-run-get :target))
+              (skill (org-ai-skills--ui-run-get :skill))
+              (current-instruction (or (org-ai-skills--ui-run-get :instruction) ""))
+              (instruction (read-string "Rewrite instruction: " current-instruction)))
+         (org-ai-skills--ui-run-set :instruction instruction)
+         (org-ai-skills--ui-run-set
+          :rerun-fn
+          (lambda ()
+            (interactive)
+            (org-ai-skills-org-rewrite-subtree target skill instruction t)))
+         (org-ai-skills-org-rewrite-subtree target skill instruction t)))
+      (_
+       (org-ai-skills--signal-org-context-error "Unsupported run type"))))))
+
+(defun org-ai-skills-ui-select-candidate ()
+  "Select one candidate in minibuffer and cache it in UI state."
+  (interactive)
+  (let* ((slot-key (org-ai-skills--ui-run-get :slot-key))
+         (candidate (org-ai-skills--read-slot-candidate slot-key nil)))
+    (org-ai-skills--ui-run-set :selected-candidate candidate)
+    ;; Decision: ready overlay clears immediately after candidate switch.
+    (org-ai-skills--ui-clear-overlay)
+    (org-ai-skills--ui-set-status 'ready "candidate-selected")
+    candidate))
+
+(defun org-ai-skills-ui-apply-selected-candidate ()
+  "Apply selected candidate from UI state."
+  (interactive)
+  (if (eq (org-ai-skills--ui-run-get :status) 'running)
+      (message "org-ai-skills: apply unavailable while running")
+    (let* ((candidate (or (org-ai-skills--ui-run-get :selected-candidate)
+                          (org-ai-skills-ui-select-candidate)))
+           (begin (org-ai-skills--ui-run-get :begin))
+           (end (org-ai-skills--ui-run-get :end)))
+      (unless candidate
+        (org-ai-skills--signal-version-store-error "No selected candidate"))
+      (org-ai-skills-org-apply-candidate-to-subtree
+       (list :begin begin :end end)
+       candidate)
+      (org-ai-skills--ui-clear-overlay)
+      (org-ai-skills--ui-set-status 'applied "applied"))))
+
+(defun org-ai-skills-ui-discard-selected-candidate ()
+  "Discard selected candidate from UI state."
+  (interactive)
+  (if (eq (org-ai-skills--ui-run-get :status) 'running)
+      (message "org-ai-skills: discard unavailable while running")
+    (let* ((candidate (or (org-ai-skills--ui-run-get :selected-candidate)
+                          (org-ai-skills-ui-select-candidate)))
+           (slot-key (and candidate (plist-get candidate :slot-key)))
+           (candidate-id (and candidate (plist-get candidate :candidate-id))))
+      (unless candidate
+        (org-ai-skills--signal-version-store-error "No selected candidate"))
+      (org-ai-skills--update-candidate-status slot-key candidate-id "discarded")
+      (org-ai-skills--ui-run-set :selected-candidate nil)
+      (org-ai-skills--ui-clear-overlay)
+      (org-ai-skills--ui-set-status 'ready "candidate-discarded")
+      (message "org-ai-skills candidate discarded: %s" candidate-id))))
+
 (defun org-ai-skills--signal-version-store-error (message)
   "Signal version store error with MESSAGE."
   (signal 'org-ai-skills-version-store-error (list message)))
@@ -1645,19 +1986,43 @@ Return an alist where each item is (DISPLAY . SUBTREE-PLIST)."
          (preset (org-ai-skills-read-planner-task-preset)))
     (list target (car preset))))
 
-(defun org-ai-skills-org-rewrite-subtree (target skill &optional instruction)
+(defun org-ai-skills-org-rewrite-subtree (target skill &optional instruction interactive-origin)
   "Rewrite Org TARGET subtree at point via gptel using SKILL.
 When TARGET is nil, resolve current subtree."
   (interactive (org-ai-skills--interactive-rewrite-args))
-  (let* ((interactive-run (called-interactively-p 'interactive))
+  (let* ((interactive-run (or interactive-origin
+                              (called-interactively-p 'interactive)))
          (subtree (or target (org-ai-skills-org-resolve-subtree 'current)))
          (slot (org-ai-skills--ensure-subtree-slot-id subtree))
          (request nil)
          (buffer (current-buffer))
          (dispatched nil)
+         (run-id (org-ai-skills--candidate-id))
          ;; Markers keep target positions stable for async callback.
          (begin (copy-marker (plist-get slot :begin)))
          (end (copy-marker (plist-get slot :end))))
+    (org-ai-skills--ui-start-run
+     (list :run-id run-id
+           :run-type 'rewrite
+           :interactive-run interactive-run
+           :status 'running
+           :progress "generation"
+           :target target
+           :source-buffer buffer
+           :begin begin
+           :end end
+           :heading (plist-get slot :heading)
+           :slot-key (plist-get slot :slot-key)
+           :slot-id (plist-get slot :slot-id)
+           :skill skill
+           :instruction instruction
+           :task (or instruction "rewrite")
+           :preset-id nil
+           :selected-candidate nil
+           :stop-requested nil
+           :rerun-fn (lambda ()
+                       (interactive)
+                       (org-ai-skills-org-rewrite-subtree target skill instruction t))))
     (unwind-protect
         (progn
           (org-ai-skills-apply-skill-function-calls skill)
@@ -1672,6 +2037,8 @@ When TARGET is nil, resolve current subtree."
              (unwind-protect
                  (let ((raw (apply #'org-ai-skills--extract-gptel-response-text-if-ready response)))
                    (when raw
+                     (if (org-ai-skills--ui-stop-requested-p run-id)
+                         (org-ai-skills--ui-set-status 'canceled "canceled")
                      (let ((rewritten (org-ai-skills--sanitize-rewrite-output
                                        raw
                                        slot))
@@ -1683,6 +2050,8 @@ When TARGET is nil, resolve current subtree."
                               "rewrite"
                               (plist-get request :prompt)
                               rewritten))
+                       (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                         (org-ai-skills--ui-run-set :selected-candidate candidate))
                        (with-current-buffer buffer
                          (if (and interactive-run
                                   (markerp begin)
@@ -1690,23 +2059,36 @@ When TARGET is nil, resolve current subtree."
                                   (markerp end)
                                   (marker-buffer end))
                              (if org-ai-skills-auto-apply-generated-candidate
-                                 (org-ai-skills-org-apply-candidate-to-subtree
-                                  (list :begin begin :end end)
-                                  candidate)
+                                 (progn
+                                   (org-ai-skills-org-apply-candidate-to-subtree
+                                    (list :begin begin :end end)
+                                    candidate)
+                                   (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                                     (org-ai-skills--ui-clear-overlay)
+                                     (org-ai-skills--ui-set-status 'applied "applied")))
                                (let ((selected (org-ai-skills--read-slot-candidate
                                                 (plist-get slot :slot-key) t)))
                                  (when selected
                                    (org-ai-skills-org-apply-candidate-to-subtree
                                     (list :begin begin :end end)
-                                    selected))))
+                                    selected))
+                                 (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                                   (org-ai-skills--ui-set-overlay 'ready)
+                                   (org-ai-skills--ui-set-status 'ready "candidate-ready"))))
                            (message "org-ai-skills candidate saved for: %s"
-                                    (plist-get slot :heading))))))
+                                    (plist-get slot :heading))
+                           (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                             (org-ai-skills--ui-set-overlay 'ready)
+                             (org-ai-skills--ui-set-status 'ready "candidate-ready")))))))
                (org-ai-skills-exclude-skill-function-calls skill)))))
           (setq dispatched t))
       (unless dispatched
+        (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+          (org-ai-skills--ui-clear-overlay)
+          (org-ai-skills--ui-set-status 'failed "dispatch-failed"))
         (org-ai-skills-exclude-skill-function-calls skill)))))
 
-(defun org-ai-skills-org-plan-and-run-subtree (target task &optional interactive-origin)
+(defun org-ai-skills-org-plan-and-run-subtree (target task &optional interactive-origin preset-id)
   "Run planner-driven rewrite on TARGET subtree using TASK.
 When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-apply flow."
   (interactive (org-ai-skills--interactive-plan-run-args))
@@ -1719,41 +2101,79 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
          (subtree (or target (org-ai-skills-org-resolve-subtree 'current)))
          (slot (org-ai-skills--ensure-subtree-slot-id subtree))
          (buffer (current-buffer))
+         (run-id (org-ai-skills--candidate-id))
          ;; Markers keep target positions stable for async callback.
          (begin (copy-marker (plist-get slot :begin)))
          (end (copy-marker (plist-get slot :end))))
+    (org-ai-skills--ui-start-run
+     (list :run-id run-id
+           :run-type 'planner
+           :interactive-run interactive-run
+           :status 'running
+           :progress "planning"
+           :target target
+           :source-buffer buffer
+           :begin begin
+           :end end
+           :heading (plist-get slot :heading)
+           :slot-key (plist-get slot :slot-key)
+           :slot-id (plist-get slot :slot-id)
+           :skill nil
+           :instruction nil
+           :task task
+           :preset-id preset-id
+           :selected-candidate nil
+           :stop-requested nil
+           :rerun-fn (lambda ()
+                       (interactive)
+                       (org-ai-skills-org-plan-and-run-subtree target task t preset-id))))
     (org-ai-skills-run-task-with-planner
      task
      slot
      nil
      (lambda (run-state)
-       (let* ((raw (or (plist-get run-state :final-output) ""))
-              (rewritten (org-ai-skills--sanitize-rewrite-output raw slot))
-              (candidate (org-ai-skills--record-generated-candidate
-                          slot
-                          task
-                          "planner"
-                          task
-                          rewritten)))
-         (with-current-buffer buffer
-           (if (and interactive-run
-                    (markerp begin)
-                    (marker-buffer begin)
-                    (markerp end)
-                    (marker-buffer end))
-               (if org-ai-skills-auto-apply-generated-candidate
-                   (org-ai-skills-org-apply-candidate-to-subtree
-                    (list :begin begin :end end)
-                    candidate)
-                 (let ((selected (org-ai-skills--read-slot-candidate
-                                  (plist-get slot :slot-key) t)))
-                   (when selected
-                     (org-ai-skills-org-apply-candidate-to-subtree
-                      (list :begin begin :end end)
-                      selected))))
-             (message "org-ai-skills planner candidate saved for: %s (%s)"
-                      (plist-get slot :heading)
-                      (plist-get candidate :candidate-id)))))))))
+       (if (org-ai-skills--ui-stop-requested-p run-id)
+           (org-ai-skills--ui-set-status 'canceled "canceled")
+         (let* ((raw (or (plist-get run-state :final-output) ""))
+                (rewritten (org-ai-skills--sanitize-rewrite-output raw slot))
+                (candidate (org-ai-skills--record-generated-candidate
+                            slot
+                            task
+                            "planner"
+                            task
+                            rewritten)))
+           (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+             (org-ai-skills--ui-run-set :selected-candidate candidate)
+             (org-ai-skills--ui-set-status 'ready "candidate-ready"))
+           (with-current-buffer buffer
+             (if (and interactive-run
+                      (markerp begin)
+                      (marker-buffer begin)
+                      (markerp end)
+                      (marker-buffer end))
+                 (if org-ai-skills-auto-apply-generated-candidate
+                     (progn
+                       (org-ai-skills-org-apply-candidate-to-subtree
+                        (list :begin begin :end end)
+                        candidate)
+                       (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                         (org-ai-skills--ui-clear-overlay)
+                         (org-ai-skills--ui-set-status 'applied "applied")))
+                   (let ((selected (org-ai-skills--read-slot-candidate
+                                    (plist-get slot :slot-key) t)))
+                     (when selected
+                       (org-ai-skills-org-apply-candidate-to-subtree
+                        (list :begin begin :end end)
+                        selected))
+                     (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                       (org-ai-skills--ui-set-overlay 'ready)
+                       (org-ai-skills--ui-set-status 'ready "candidate-ready"))))
+               (message "org-ai-skills planner candidate saved for: %s (%s)"
+                        (plist-get slot :heading)
+                        (plist-get candidate :candidate-id))
+               (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                 (org-ai-skills--ui-set-overlay 'ready)
+                 (org-ai-skills--ui-set-status 'ready "candidate-ready"))))))))))
 
 (defun org-ai-skills-org-plan-and-run-subtree-repeat-task (target)
   "Run planner-driven rewrite on TARGET using last planner task."
@@ -1761,7 +2181,7 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
   (when (string-empty-p (or org-ai-skills--last-planner-task ""))
     (signal 'org-ai-skills-planner-error
             (list "No previous planner task; run org-ai-skills-org-plan-and-run-subtree first")))
-  (org-ai-skills-org-plan-and-run-subtree target org-ai-skills--last-planner-task t))
+  (org-ai-skills-org-plan-and-run-subtree target org-ai-skills--last-planner-task t nil))
 
 (defun org-ai-skills-org-plan-and-run-subtree-preset (target preset-id)
   "Run planner-driven rewrite on TARGET using planner task PRESET-ID."
@@ -1770,7 +2190,7 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
     (unless (stringp task)
       (signal 'org-ai-skills-planner-error
               (list (format "Unknown planner preset: %s" preset-id))))
-    (org-ai-skills-org-plan-and-run-subtree target task t)))
+    (org-ai-skills-org-plan-and-run-subtree target task t preset-id)))
 
 (defmacro org-ai-skills-define-plan-run-preset-command (command-name task &optional docstring)
   "Define COMMAND-NAME to run planner with fixed TASK.
@@ -1778,7 +2198,7 @@ Optional DOCSTRING overrides the generated command documentation."
   `(defun ,command-name (target)
      ,(or docstring (format "Run planner-driven rewrite with fixed task: %s" task))
      (interactive (list (org-ai-skills-org-read-rewrite-target)))
-     (org-ai-skills-org-plan-and-run-subtree target ,task t)))
+     (org-ai-skills-org-plan-and-run-subtree target ,task t nil)))
 
 (defvar org-ai-skills-embark-org-heading-map
   (let ((map (make-sparse-keymap)))
