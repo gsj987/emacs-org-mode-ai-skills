@@ -291,6 +291,25 @@ gptel tool registration behavior:
 - Runtime passes registered tools via =gptel-tools= and =gptel-use-tools= during
   each =gptel-request= dispatch.
 
+Role-scoped model and system prompt routing:
+- Planner requests use role =planner=.
+- Rewrite and step-execution requests use role =execution=.
+- Model overrides:
+  - =org-ai-skills-model-planner=
+  - =org-ai-skills-model-execution=
+  - Set either to =nil= to use gptel default model selection.
+- Planner generation stability controls:
+  - =org-ai-skills-planner-temperature= (default =0.0=)
+  - =org-ai-skills-planner-max-tokens= (default =2048=, or =nil= for backend default)
+  - Planner requests also use gptel structured output schema (= :schema =)
+    to enforce JSON shape at provider/backend level.
+- System prompt overrides:
+  - =org-ai-skills-system-prompt-planner=
+  - =org-ai-skills-system-prompt-execution=
+  - If set to empty string, runtime falls back to built-in default prompt for that role.
+- Dispatch attaches role-specific =:system= prompt to each =gptel-request= call.
+- Model routing is applied via dynamic =gptel-model= binding per request role.
+
 Search1API credential lookup:
 - API key is read from auth-source:
   - =(auth-source-pick-first-password :host "search1api")=
@@ -310,8 +329,9 @@ Debug observability:
 - Variables:
   - =org-ai-skills-debug-enabled=
   - =org-ai-skills-debug-buffer-name=
-- Debug entry includes timestamp, buffer/file, target headline/path, final prompt,
-  and full request plist passed to =gptel-request=.
+- Debug entry includes timestamp, request role, effective model, system prompt
+  fingerprint, buffer/file, target headline/path, final prompt, and full request
+  plist passed to =gptel-request=.
 - Additional debug events:
   - =gptel-request-data= includes request payload data captured from gptel callback info.
   - =tool-call= and =tool-result= events are logged when gptel emits tool-calling callbacks.

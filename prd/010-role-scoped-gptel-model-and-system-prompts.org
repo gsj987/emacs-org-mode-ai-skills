@@ -1,0 +1,173 @@
+#+TITLE: PRD 010 - Role-Scoped gptel Model and System Prompt Configuration
+#+STARTUP: overview
+
+* Problem
+Current `org-ai-skills` dispatch uses the active/default gptel configuration for all requests.
+That means planner and execution calls share the same model and do not enforce a stable system instruction contract.
+
+This causes two concrete issues:
+- Planner output quality/format can drift because no dedicated planner role prompt is fixed.
+- Skill execution can ignore scope/format constraints (especially strict Org output shape) when system-level guardrails are not fixed.
+
+We need explicit, role-scoped controls so:
+- Planner requests use planner-specific model + system prompt.
+- Skill execution requests use execution-specific model + system prompt.
+
+* Scope
+- In scope:
+  - Add user-configurable role-scoped model selection for:
+    - planner requests
+    - execution/rewrite requests
+  - Add fixed default system prompts for:
+    - planner role
+    - execution role
+  - Ensure dispatch applies role-scoped model/system values per request.
+  - Keep prompt composition explicit and testable.
+  - Add ERT tests for role routing, fallback behavior, and prompt contract attachment.
+  - Update README usage/configuration docs.
+- Out of scope:
+  - Per-skill model overrides in MVP.
+  - Dynamic runtime prompt editing UI in MVP.
+  - Provider-specific advanced routing policies (latency/cost aware) in MVP.
+
+* Constraints
+- Technical constraints:
+  - Preserve backward compatibility for users who do not set custom model/system values.
+  - Planner must still return strict machine-parseable JSON contract.
+  - Execution must still return artifact-only Org content, no prose chatter.
+  - No mutation of skill spec files; runtime config only.
+  - Integrate through existing `gptel-request` path with minimal coupling to provider internals.
+- Process constraints:
+  - Follow AGENTS workflow: PRD -> implementation -> tests -> test run -> README -> worklog.
+
+* Expected Behavior
+- Behavior 1:
+  - Planner dispatch uses planner model setting (or fallback) and planner system prompt.
+- Behavior 2:
+  - Step execution/rewrite dispatch uses execution model setting (or fallback) and execution system prompt.
+- Behavior 3:
+  - Manual single-skill rewrite flow and autonomous planner flow both honor role-scoped config.
+- Behavior 4:
+  - Debug logs include effective role/model/system routing metadata per request.
+- Behavior 5:
+  - If role-specific model is nil/unset, dispatch cleanly falls back to gptel default model.
+
+* Spec Design
+** 1) Role Definition
+Introduce explicit request roles in runtime payload:
+- `planner`
+- `execution` (covers manual rewrite and planner step execution dispatches)
+
+Each outbound request carries `:request-role` for deterministic routing and observability.
+
+** 2) New User Configuration (proposed)
+Add defcustoms:
+- `org-ai-skills-model-planner`
+  - Type: nullable symbol/string (aligned with gptel model conventions)
+  - Default: nil (fallback to gptel default model)
+- `org-ai-skills-model-execution`
+  - Type: nullable symbol/string
+  - Default: nil
+- `org-ai-skills-system-prompt-planner`
+  - Type: string
+  - Default: stable planner system prompt template (see section 3)
+- `org-ai-skills-system-prompt-execution`
+  - Type: string
+  - Default: stable execution system prompt template (see section 4)
+
+Optional future extension (not MVP):
+- generic alist-based router: role -> model/prompt tuple.
+
+** 3) Planner System Prompt (Default Template)
+Goal: constrain planner to planning only, strict JSON, no hidden reasoning output.
+
+Proposed baseline semantics:
+- You are the planner for `org-ai-skills`.
+- Task: select skill candidates and produce an executable plan only.
+- Use only supplied metadata and run-state context.
+- Output must be strict JSON object with required keys.
+- No markdown, no explanations, no chain-of-thought, no extra keys.
+- Respect runtime limits (`max_steps`, `max_skills_per_step`, batching mode context).
+
+Prompt-quality guardrails:
+- Explicitly reject narrative output.
+- Explicitly forbid unsupported skill ids.
+- Encourage short deterministic `why` fields (concise, auditable).
+
+** 4) Execution System Prompt (Default Template)
+Goal: enforce scope fidelity + Org artifact output contract.
+
+Proposed baseline semantics:
+- You are executing an `org-ai-skills` plan step in bounded scope.
+- Operate only on provided target content and supplied skill context.
+- Preserve/produce valid Org structure.
+- Return artifact-only Org output; no commentary, no markdown fences.
+- Respect skill contracts/requirements when present.
+- Do not invent missing context outside provided input.
+
+Prompt-quality guardrails:
+- Explicitly require heading-consistent Org output.
+- Explicitly disallow meta-text such as “Here is the rewrite...”.
+- Emphasize deterministic transformation over creative expansion.
+
+** 5) Dispatch Integration
+Route per role at one central dispatch point:
+- Derive effective model from request role + role-specific defcustom.
+- Derive effective system prompt from request role + role-specific defcustom.
+- Call `gptel-request` with both prompt body and role-scoped system/model options.
+
+Compatibility rule:
+- If model is nil, omit explicit model argument and let gptel default apply.
+- If system prompt is empty string, fallback to default role template to avoid unguarded dispatch.
+
+** 6) Validation and Errors
+- Unknown role should signal explicit `org-ai-skills-gptel-error`.
+- Non-string system prompt values should be rejected by defcustom type.
+- Planner parser remains strict even if model/system are customized.
+
+** 7) Observability
+Extend debug entry fields with:
+- `request-role`
+- `effective-model`
+- `effective-system-prompt-fingerprint` (or truncated preview; avoid full log spam)
+
+This keeps routing auditable without leaking very large prompt text repeatedly.
+
+* Acceptance Scenarios
+1. Planner role uses planner model
+- Given `org-ai-skills-model-planner` is set and execution model differs,
+  planner dispatch uses planner model.
+
+2. Execution role uses execution model
+- Given planner and execution models differ,
+  rewrite/step dispatch uses execution model.
+
+3. Nil model fallback
+- Given role model is nil,
+  dispatch falls back to gptel default model without error.
+
+4. System prompt routing
+- Planner and execution requests carry different system prompts as configured.
+
+5. Contract stability
+- Planner still rejects non-JSON or invalid-skill plans regardless of model/prompt overrides.
+
+* Tasks
+- [X] Add role-scoped model/system prompt defcustoms.
+- [X] Add helper(s) to resolve effective model/system per request role.
+- [X] Annotate planner and execution request payloads with explicit request role.
+- [X] Apply role-scoped model/system in `org-ai-skills-gptel-dispatch-rewrite`.
+- [X] Extend debug metadata with role/model/system routing info.
+- [X] Add ERT tests for planner vs execution model/system routing and nil fallback.
+- [X] Add/update ERT tests to ensure planner strict parsing behavior remains intact.
+- [X] Update README configuration and usage examples.
+
+* Worklog
+- 2026-02-20 :: Drafted PRD for role-scoped planner/execution model + system prompt configuration, including default prompt semantics and acceptance criteria. Test status: not run.
+- 2026-02-20 :: Implemented role-scoped model/system prompt routing with new defcustoms for planner and execution roles, request-role tagging on planner/rewrite/step payloads, dispatch-time routing + fallback logic, and debug metadata for role/model/system prompt fingerprint. Added ERT coverage for routing, nil-model omission, empty-system fallback, invalid-role errors, and request-role tagging. Updated README with configuration and behavior docs. Test status: pass (75/75, batch ERT).
+- 2026-02-20 :: Follow-up reliability fix for callback-time planner parse failures: malformed planner JSON now signals explicit `org-ai-skills-planner-error` with actionable cause text, and dispatch callback wrapper now logs `callback-error` debug events with role/model/system fingerprint and response preview before re-signaling. Added malformed-planner-json regression test. Test status: pass (76/76, batch ERT).
+- 2026-02-20 :: Resolved planner truncation instability from runtime logs: planner request now auto-retries parse-failure responses up to `org-ai-skills-planner-max-parse-retries` (default 1) when response is malformed JSON or contains no parseable JSON object; retry adds stricter JSON-only reminder to prompt. Added ERT coverage for retry success and retry exhaustion paths. Test status: pass (78/78, batch ERT).
+- 2026-02-20 :: Additional planner stability hardening based on live debug logs: planner dispatch now uses role-specific generation settings (`org-ai-skills-planner-temperature` default 0.0, `org-ai-skills-planner-max-tokens` default 2048) to reduce fenced/truncated JSON responses. Added ERT coverage to verify planner generation override and execution-role default-preserving behavior. Updated README config section. Test status: pass (80/80, batch ERT).
+- 2026-02-20 :: Added deterministic planner fallback for persistent backend JSON truncation: when planner parse retries are exhausted and failure remains parse-related, runtime now emits `planner-fallback` debug event and constructs a local heuristic single-step plan from task/metadata instead of aborting. Added config `org-ai-skills-planner-fallback-on-parse-failure` and ERT coverage for fallback-on vs fallback-off behavior. Updated README accordingly. Test status: pass (81/81, batch ERT).
+- 2026-02-20 :: Root-cause correction after review: removed fallback-based masking path and switched planner dispatch to provider-level structured output (`gptel-request :schema`) with strict planner JSON schema. Retained parse-retry behavior for transient transport/provider issues only. Added ERT coverage ensuring planner dispatch includes schema and updated docs/worklog accordingly. Test status: pass (81/81, batch ERT).
+- 2026-02-20 :: Follow-up per user preference: removed planner parse-retry behavior entirely to keep planner failures explicit and deterministic. Planner now performs a single structured-output request (schema enforced) and fails fast on malformed planner output. Updated tests and README configuration examples accordingly. Test status: pass (80/80, batch ERT).

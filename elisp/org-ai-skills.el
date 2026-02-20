@@ -104,6 +104,94 @@ When nil, interactive flow asks user to select a candidate explicitly."
   :type 'integer
   :group 'org-ai-skills)
 
+(defcustom org-ai-skills-model-planner nil
+  "Model override for planner requests.
+When nil, planner requests use gptel default model selection."
+  :type '(choice (const :tag "Use gptel default model" nil)
+                 (string :tag "Model id")
+                 (symbol :tag "Model symbol"))
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-model-execution nil
+  "Model override for execution/rewrite requests.
+When nil, execution requests use gptel default model selection."
+  :type '(choice (const :tag "Use gptel default model" nil)
+                 (string :tag "Model id")
+                 (symbol :tag "Model symbol"))
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-planner-temperature 0.0
+  "Sampling temperature used for planner requests."
+  :type 'number
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-planner-max-tokens 2048
+  "Maximum token budget for planner responses.
+Set to nil to use gptel/backend default."
+  :type '(choice (const :tag "Use backend default" nil)
+                 (integer :tag "Max tokens"))
+  :group 'org-ai-skills)
+
+(defconst org-ai-skills--default-system-prompt-planner
+  (string-join
+   '("You are the planner for org-ai-skills."
+     "Your only job is to produce a machine-parseable plan from provided task, metadata, and run-state."
+     "Use only provided skills and constraints."
+     "Return strict JSON only. No markdown. No prose. No analysis. No hidden-thinking text."
+     "Do not include extra keys or commentary outside the required JSON contract.")
+   "\n")
+  "Default system prompt used for planner role requests.")
+
+(defconst org-ai-skills--default-system-prompt-execution
+  (string-join
+   '("You are the execution engine for org-ai-skills."
+     "Operate only within the provided scope, input content, and skill context."
+     "Always return valid Org-mode content as the final artifact."
+     "Do not return commentary, analysis, progress notes, or markdown code fences."
+     "Follow provided contracts and requirements; do not invent missing external context.")
+   "\n")
+  "Default system prompt used for execution role requests.")
+
+(defcustom org-ai-skills-system-prompt-planner
+  org-ai-skills--default-system-prompt-planner
+  "System prompt used for planner role requests.
+When set to an empty string, dispatch falls back to the default planner system prompt."
+  :type 'string
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-system-prompt-execution
+  org-ai-skills--default-system-prompt-execution
+  "System prompt used for execution role requests.
+When set to an empty string, dispatch falls back to the default execution system prompt."
+  :type 'string
+  :group 'org-ai-skills)
+
+(defconst org-ai-skills--planner-response-schema
+  '(:type "object"
+    :properties
+    (:candidates
+     (:type "array"
+      :items
+      (:type "object"
+       :properties (:skill_id (:type "string")
+                    :why (:type "string")
+                    :score (:type "number"))))
+     :plan
+     (:type "array"
+      :items
+      (:type "object"
+       :properties (:step_id (:type "string")
+                    :goal (:type "string")
+                    :skills (:type "array" :items (:type "string"))
+                    :input_from (:type "array" :items (:type "string"))
+                    :expected_output (:type "string")
+                    :composition_reason (:type "string"))))
+     :replan_signal
+     (:type "object"
+      :properties (:enabled (:type "boolean")
+                   :condition (:type "string")))))
+  "JSON schema used for planner structured output.")
+
 (defconst org-ai-skills--allowed-tags
   '((effect . ("pure" "local" "external" "irreversible"))
     (invocation . ("auto" "suggest" "manual"))
@@ -526,6 +614,7 @@ This parser intentionally avoids extracting full context sections."
            "- replan_signal: {enabled, condition}\n"
            "No markdown. No prose.")))
     (list :event-type 'planner
+          :request-role 'planner
           :task task
           :metadata-count (length metadata-list)
           :run-state run-state
@@ -653,14 +742,22 @@ Return a list of one or more normalized steps."
   "Parse planner TEXT into normalized structure using METADATA-LIST.
 When ALLOW-EMPTY-PLAN is non-nil, an empty plan is accepted."
   (let* ((json-object (org-ai-skills--extract-json-object text))
-         (raw (json-parse-string
-               json-object
-               :object-type 'plist
-               :array-type 'list
-               :null-object nil
-               :false-object nil))
-         (known-skill-ids (mapcar (lambda (meta) (plist-get meta :skill-id))
-                                  metadata-list))
+         (raw (condition-case err
+                  (json-parse-string
+                   json-object
+                   :object-type 'plist
+                   :array-type 'list
+                   :null-object nil
+                   :false-object nil)
+                (error
+                 (signal 'org-ai-skills-planner-error
+                         (list
+                          (format
+                           "Planner response contains malformed JSON (%s). Common causes: truncated model output or non-JSON text in response."
+                           (error-message-string err)))))))
+         (known-skill-ids
+          (mapcar (lambda (meta) (plist-get meta :skill-id))
+                  metadata-list))
          (candidates-raw (or (plist-get raw :candidates) nil))
          (plan-raw (or (plist-get raw :plan) nil))
          (normalized-plan-raw
@@ -669,8 +766,9 @@ When ALLOW-EMPTY-PLAN is non-nil, an empty plan is accepted."
           (if allow-empty-plan
               (cl-remove-if-not #'org-ai-skills--planner-step-has-skills-p normalized-plan-raw)
             normalized-plan-raw))
-         (replan-raw (or (org-ai-skills--plist-value raw :replan-signal :replan_signal)
-                         nil)))
+         (replan-raw
+          (or (org-ai-skills--plist-value raw :replan-signal :replan_signal)
+              nil)))
     (unless (listp plan-raw)
       (signal 'org-ai-skills-planner-error
               (list "Planner response must include plan list")))
@@ -904,7 +1002,9 @@ INSTRUCTION overrides the default rewrite goal."
                   "- Keep Org syntax valid.\n\n"
                   "Rewrite the following Org subtree:\n\n"
                   (plist-get subtree :text))))
-    (list :skill-id (plist-get base-payload :skill-id)
+    (list :event-type 'rewrite
+          :request-role 'execution
+          :skill-id (plist-get base-payload :skill-id)
           :skill-title (plist-get base-payload :skill-title)
           :goal goal
           :description (plist-get base-payload :description)
@@ -976,6 +1076,7 @@ INSTRUCTION overrides the default rewrite goal."
            "\nInput content:\n\n"
            input-text)))
     (list :event-type 'step-execution
+          :request-role 'execution
           :step-id (plist-get step :step-id)
           :skill-ids (plist-get step :skills)
           :composition-reason (or (plist-get step :composition-reason) "")
@@ -1059,12 +1160,13 @@ Only skills referenced by STEP are loaded from DIRECTORY."
   (let ((request (org-ai-skills-build-planner-request task metadata run-state)))
     (org-ai-skills-gptel-dispatch-rewrite
      request
-      (lambda (&rest response)
-        (let* ((text (apply #'org-ai-skills--extract-gptel-response-text response))
-              (parsed (org-ai-skills-parse-planner-response
-                       text metadata (and (listp (plist-get run-state :steps))
-                                           (plist-get run-state :steps)))))
-          (funcall callback parsed))))))
+     (lambda (&rest response)
+       (let ((text (apply #'org-ai-skills--extract-gptel-response-text-if-ready response)))
+         (when text
+           (let ((parsed (org-ai-skills-parse-planner-response
+                          text metadata (and (listp (plist-get run-state :steps))
+                                             (plist-get run-state :steps)))))
+             (funcall callback parsed))))))))
 
 (defun org-ai-skills--run-plan-steps (task metadata run-state plan callback &optional directory)
   "Run PLAN steps recursively for TASK and METADATA.
@@ -1134,10 +1236,16 @@ OPTIONS is a plist; CALLBACK receives final run-state."
     (let* ((timestamp (format-time-string "%Y-%m-%d %H:%M:%S %z"))
            (source (plist-get (plist-get request :skill-context) :source-subtree))
            (event-type (or (plist-get request :event-type) 'rewrite))
+           (request-role (or (plist-get request :request-role) ""))
+           (effective-model (or (plist-get request :effective-model) ""))
+           (system-fingerprint (or (plist-get request :effective-system-prompt-fingerprint) ""))
            (entry
             (concat
              (format "=== org-ai-skills gptel dispatch @ %s ===\n" timestamp)
              (format "Event: %s\n" event-type)
+             (format "Request role: %s\n" request-role)
+             (format "Effective model: %s\n" effective-model)
+             (format "System prompt fingerprint: %s\n" system-fingerprint)
              (format "Buffer: %s\n" (or (plist-get request :buffer-name) ""))
              (format "File: %s\n" (or (plist-get request :buffer-file) ""))
              (format "Headline: %s\n" (or (plist-get source :headline) ""))
@@ -1903,6 +2011,60 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
   (mapcar #'org-ai-skills--function-call-to-gptel-tool
           (org-ai-skills--request-function-calls request)))
 
+(defun org-ai-skills--resolve-request-role (request)
+  "Return normalized request role symbol from REQUEST."
+  (let ((role (or (plist-get request :request-role)
+                  (if (eq (plist-get request :event-type) 'planner)
+                      'planner
+                    'execution))))
+    (unless (memq role '(planner execution))
+      (org-ai-skills--signal-gptel-error
+       (format "Unsupported request role: %s" role)))
+    role))
+
+(defun org-ai-skills--resolve-role-model (role)
+  "Return effective model override for ROLE, or nil for gptel default."
+  (pcase role
+    ('planner org-ai-skills-model-planner)
+    ('execution org-ai-skills-model-execution)
+    (_ (org-ai-skills--signal-gptel-error
+        (format "Unsupported request role for model routing: %s" role)))))
+
+(defun org-ai-skills--resolve-role-system-prompt (role)
+  "Return effective system prompt string for ROLE."
+  (let ((raw (pcase role
+               ('planner org-ai-skills-system-prompt-planner)
+               ('execution org-ai-skills-system-prompt-execution)
+               (_ (org-ai-skills--signal-gptel-error
+                   (format "Unsupported request role for system prompt routing: %s" role)))))
+        (fallback (pcase role
+                    ('planner org-ai-skills--default-system-prompt-planner)
+                    ('execution org-ai-skills--default-system-prompt-execution))))
+    (if (string-empty-p (or raw ""))
+        fallback
+      raw)))
+
+(defun org-ai-skills--system-prompt-fingerprint (text)
+  "Return short fingerprint string for system prompt TEXT."
+  (substring (secure-hash 'sha1 (or text "")) 0 12))
+
+(defun org-ai-skills--resolve-role-generation-settings (role)
+  "Return generation settings plist for ROLE."
+  (pcase role
+    ('planner (list :temperature org-ai-skills-planner-temperature
+                    :max-tokens org-ai-skills-planner-max-tokens))
+    ('execution nil)
+    (_ (org-ai-skills--signal-gptel-error
+        (format "Unsupported request role for generation settings: %s" role)))))
+
+(defun org-ai-skills--resolve-role-schema (role)
+  "Return structured response schema for ROLE, or nil."
+  (pcase role
+    ('planner org-ai-skills--planner-response-schema)
+    ('execution nil)
+    (_ (org-ai-skills--signal-gptel-error
+        (format "Unsupported request role for schema routing: %s" role)))))
+
 (defun org-ai-skills-gptel-dispatch-rewrite (request callback)
   "Send rewrite REQUEST to gptel and run CALLBACK with response."
   (unless (or (featurep 'gptel) (org-ai-skills-require-gptel))
@@ -1911,10 +2073,21 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
   (unless (fboundp 'gptel-request)
     (org-ai-skills--signal-gptel-error
      "gptel-request is not available in current gptel version"))
-  (let* ((tools (org-ai-skills--request-gptel-tools request))
+  (let* ((role (org-ai-skills--resolve-request-role request))
+         (effective-model (org-ai-skills--resolve-role-model role))
+         (effective-system-prompt (org-ai-skills--resolve-role-system-prompt role))
+         (effective-schema (org-ai-skills--resolve-role-schema role))
+         (generation-settings (org-ai-skills--resolve-role-generation-settings role))
+         (tools (org-ai-skills--request-gptel-tools request))
          (tool-names (mapcar (lambda (fn-spec) (plist-get fn-spec :name))
                              (org-ai-skills--request-function-calls request)))
          (logged-request (append request
+                                 (list :request-role role
+                                       :effective-model effective-model
+                                       :effective-schema (if effective-schema t nil)
+                                       :effective-system-prompt-fingerprint
+                                       (org-ai-skills--system-prompt-fingerprint
+                                        effective-system-prompt))
                                  (list :gptel-tool-names tool-names
                                        :gptel-use-tools (and tools t))))
          (logged-metadata nil)
@@ -1927,6 +2100,11 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
                   (setq logged-metadata t)
                   (org-ai-skills--append-debug-entry
                    (list :event-type 'gptel-request-data
+                         :request-role role
+                         :effective-model effective-model
+                         :effective-system-prompt-fingerprint
+                         (org-ai-skills--system-prompt-fingerprint
+                          effective-system-prompt)
                          :step-id (plist-get request :step-id)
                          :skill-ids (plist-get request :skill-ids)
                          :prompt "gptel request data payload"
@@ -1935,16 +2113,47 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
               (when (and (consp first) (memq (car first) '(tool-call tool-result)))
                 (org-ai-skills--append-debug-entry
                  (list :event-type (car first)
+                       :request-role role
+                       :effective-model effective-model
+                       :effective-system-prompt-fingerprint
+                       (org-ai-skills--system-prompt-fingerprint
+                        effective-system-prompt)
                        :step-id (plist-get request :step-id)
                        :skill-ids (plist-get request :skill-ids)
                        :prompt (format "gptel callback event: %S" first))))
-              (apply callback response)))))
+              (condition-case err
+                  (apply callback response)
+                (error
+                 (org-ai-skills--append-debug-entry
+                  (list :event-type 'callback-error
+                        :request-role role
+                        :effective-model effective-model
+                        :effective-system-prompt-fingerprint
+                        (org-ai-skills--system-prompt-fingerprint
+                         effective-system-prompt)
+                        :step-id (plist-get request :step-id)
+                        :skill-ids (plist-get request :skill-ids)
+                        :prompt (format "org-ai-skills callback error: %s"
+                                        (error-message-string err))
+                        :response-preview
+                        (truncate-string-to-width (format "%S" first) 260 nil nil t)))
+                 (signal (car err) (cdr err))))))))
     (org-ai-skills--append-debug-entry logged-request)
     (let ((gptel-tools tools)
-          (gptel-use-tools (and tools t)))
-      (funcall #'gptel-request
-               (plist-get request :prompt)
-               :callback wrapped-callback))))
+          (gptel-use-tools (and tools t))
+          (gptel-model (or effective-model gptel-model))
+          (gptel-temperature (or (plist-get generation-settings :temperature)
+                                 gptel-temperature))
+          (gptel-max-tokens (or (plist-get generation-settings :max-tokens)
+                                gptel-max-tokens)))
+      (apply #'gptel-request
+             (append
+              (list (plist-get request :prompt)
+                    :callback wrapped-callback
+                    :system effective-system-prompt)
+              (if effective-schema
+                  (list :schema effective-schema)
+                nil))))))
 
 (defun org-ai-skills--interactive-rewrite-args ()
   "Read interactive arguments for `org-ai-skills-org-rewrite-subtree'."

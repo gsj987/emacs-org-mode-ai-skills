@@ -988,6 +988,7 @@
                    '(:task "Polish this subtree" :steps nil :plan-revision 1)))
          (prompt (plist-get request :prompt)))
     (should (stringp prompt))
+    (should (eq (plist-get request :request-role) 'planner))
     (should (string-match-p "\"skill-id\":\"gen-notes\"" prompt))
     (should (string-match-p "Skill metadata list (JSON):" prompt))))
 
@@ -1040,6 +1041,53 @@
          (json "{\"candidates\":[],\"plan\":[],\"replan_signal\":{\"enabled\":false,\"condition\":\"\"}}"))
     (should-error (org-ai-skills-parse-planner-response json metadata)
                   :type 'org-ai-skills-planner-error)))
+
+(ert-deftest org-ai-skills-parse-planner-response-signals-planner-error-on-malformed-json ()
+  "Planner parser should surface malformed JSON as planner error."
+  (let* ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
+         (json "{\"candidates\":[{\"skill_id\":\"gen-notes\"}],\"plan\":["))
+    (should-error (org-ai-skills-parse-planner-response json metadata)
+                  :type 'org-ai-skills-planner-error)))
+
+(ert-deftest org-ai-skills-request-planner-plan-fails-on-malformed-json ()
+  "Planner request should fail fast when planner response JSON is malformed."
+  (let ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
+        (malformed "{\"candidates\":[],\"plan\":["))
+    (cl-letf (((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback malformed '(:data (:payload t)))))
+              ((symbol-function 'org-ai-skills--extract-gptel-response-text)
+               (lambda (&rest response) (car response))))
+      (should-error
+       (org-ai-skills--request-planner-plan
+        "task"
+        metadata
+        '(:task "task" :steps nil :plan-revision 1)
+        #'ignore)
+       :type 'org-ai-skills-planner-error))))
+
+(ert-deftest org-ai-skills-request-planner-plan-ignores-reasoning-until-final-text ()
+  "Planner request should ignore interim reasoning callbacks until final text arrives."
+  (let ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
+        (valid "{\"candidates\":[{\"skill_id\":\"gen-notes\",\"why\":\"fit\",\"score\":0.9}],\"plan\":[{\"step_id\":\"s1\",\"goal\":\"g\",\"skills\":[\"gen-notes\"],\"input_from\":[\"task\"],\"expected_output\":\"o\",\"composition_reason\":\"r\"}],\"replan_signal\":{\"enabled\":false,\"condition\":\"\"}}")
+        callback-result)
+    (cl-letf (((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback '(reasoning . "thinking...") '(:data (:payload t)))
+                 (funcall callback valid '(:data (:payload t)))))
+              ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
+               (lambda (&rest response)
+                 (let ((first (car response)))
+                   (if (and (consp first) (eq (car first) 'reasoning))
+                       nil
+                     first)))))
+      (org-ai-skills--request-planner-plan
+       "task"
+       metadata
+       '(:task "task" :steps nil :plan-revision 1)
+       (lambda (parsed) (setq callback-result parsed))))
+    (should (listp callback-result))
+    (should (= (length (plist-get callback-result :plan)) 1))))
 
 (ert-deftest org-ai-skills-parse-planner-response-allows-empty-plan-for-replan ()
   "Planner parser should allow empty plan in replan context."
@@ -1194,6 +1242,218 @@
        #'ignore))
     (should captured-use-tools)
     (should (= (length captured-tools) 1))))
+
+(ert-deftest org-ai-skills-build-gptel-rewrite-request-tags-execution-role ()
+  "Rewrite request builder should annotate execution request role."
+  (let* ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--first-skill-file))
+         (subtree '(:heading "Leaf"
+                    :context-mode current
+                    :levels-up 0
+                    :path "Top/Leaf"
+                    :text "*** Leaf\nBody\n"))
+         (request (org-ai-skills-build-gptel-rewrite-request
+                   skill subtree "Rewrite now")))
+    (should (eq (plist-get request :request-role) 'execution))
+    (should (eq (plist-get request :event-type) 'rewrite))))
+
+(ert-deftest org-ai-skills-gptel-dispatch-routes-role-model-and-system-prompt ()
+  "Dispatch should route model/system prompt by planner vs execution roles."
+  (let ((org-ai-skills-model-planner 'planner-model)
+        (org-ai-skills-model-execution 'exec-model)
+        (org-ai-skills-system-prompt-planner "planner system")
+        (org-ai-skills-system-prompt-execution "execution system")
+        captured
+        (orig-featurep (symbol-function 'featurep))
+        (orig-fboundp (symbol-function 'fboundp)))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (if (eq feature 'gptel)
+                     t
+                   (funcall orig-featurep feature))))
+              ((symbol-function 'fboundp)
+               (lambda (symbol)
+                 (if (eq symbol 'gptel-request)
+                     t
+                   (funcall orig-fboundp symbol))))
+              ((symbol-function 'gptel-request)
+               (lambda (&rest args)
+                 (push (list :args (cdr args) :model gptel-model) captured)
+                 t)))
+      (org-ai-skills-gptel-dispatch-rewrite
+       '(:prompt "plan" :request-role planner)
+       #'ignore)
+      (org-ai-skills-gptel-dispatch-rewrite
+       '(:prompt "exec" :request-role execution)
+       #'ignore))
+    (let* ((exec-call (car captured))
+           (planner-call (cadr captured))
+           (exec-args (plist-get exec-call :args))
+           (planner-args (plist-get planner-call :args)))
+      (should (eq (plist-get planner-call :model) 'planner-model))
+      (should (string= (plist-get planner-args :system) "planner system"))
+      (should (eq (plist-get exec-call :model) 'exec-model))
+      (should (string= (plist-get exec-args :system) "execution system")))))
+
+(ert-deftest org-ai-skills-gptel-dispatch-omits-model-when-role-model-is-nil ()
+  "Dispatch should preserve ambient gptel-model when role model override is nil."
+  (let ((org-ai-skills-model-execution nil)
+        (org-ai-skills-system-prompt-execution "execution system")
+        captured-args
+        captured-model
+        (orig-featurep (symbol-function 'featurep))
+        (orig-fboundp (symbol-function 'fboundp)))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (if (eq feature 'gptel)
+                     t
+                   (funcall orig-featurep feature))))
+              ((symbol-function 'fboundp)
+               (lambda (symbol)
+                 (if (eq symbol 'gptel-request)
+                     t
+                   (funcall orig-fboundp symbol))))
+              ((symbol-function 'gptel-request)
+               (lambda (&rest args)
+                 (setq captured-args (cdr args))
+                 (setq captured-model gptel-model)
+                 t)))
+      (let ((gptel-model 'ambient-model))
+        (org-ai-skills-gptel-dispatch-rewrite
+         '(:prompt "exec" :request-role execution)
+         #'ignore)))
+    (should (string= (plist-get captured-args :system) "execution system"))
+    (should (eq captured-model 'ambient-model))))
+
+(ert-deftest org-ai-skills-gptel-dispatch-planner-applies-generation-settings ()
+  "Planner dispatch should apply planner-specific temperature and max tokens."
+  (let ((org-ai-skills-planner-temperature 0.0)
+        (org-ai-skills-planner-max-tokens 2048)
+        captured-temperature
+        captured-max-tokens
+        (orig-featurep (symbol-function 'featurep))
+        (orig-fboundp (symbol-function 'fboundp)))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (if (eq feature 'gptel)
+                     t
+                   (funcall orig-featurep feature))))
+              ((symbol-function 'fboundp)
+               (lambda (symbol)
+                 (if (eq symbol 'gptel-request)
+                     t
+                   (funcall orig-fboundp symbol))))
+              ((symbol-function 'gptel-request)
+               (lambda (&rest _args)
+                 (setq captured-temperature gptel-temperature)
+                 (setq captured-max-tokens gptel-max-tokens)
+                 t)))
+      (org-ai-skills-gptel-dispatch-rewrite
+       '(:prompt "plan" :request-role planner)
+       #'ignore))
+    (should (equal captured-temperature 0.0))
+    (should (equal captured-max-tokens 2048))))
+
+(ert-deftest org-ai-skills-gptel-dispatch-planner-includes-structured-schema ()
+  "Planner dispatch should include :schema for structured output."
+  (let (captured-args
+        (orig-featurep (symbol-function 'featurep))
+        (orig-fboundp (symbol-function 'fboundp)))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (if (eq feature 'gptel)
+                     t
+                   (funcall orig-featurep feature))))
+              ((symbol-function 'fboundp)
+               (lambda (symbol)
+                 (if (eq symbol 'gptel-request)
+                     t
+                   (funcall orig-fboundp symbol))))
+              ((symbol-function 'gptel-request)
+               (lambda (&rest args)
+                 (setq captured-args (cdr args))
+                 t)))
+      (org-ai-skills-gptel-dispatch-rewrite
+       '(:prompt "plan" :request-role planner)
+       #'ignore))
+    (should (plist-member captured-args :schema))
+    (should (equal (plist-get (plist-get captured-args :schema) :type) "object"))))
+
+(ert-deftest org-ai-skills-gptel-dispatch-execution-keeps-default-generation-settings ()
+  "Execution dispatch should not override ambient gptel generation settings."
+  (let ((org-ai-skills-planner-temperature 0.0)
+        (org-ai-skills-planner-max-tokens 2048)
+        captured-temperature
+        captured-max-tokens
+        (orig-featurep (symbol-function 'featurep))
+        (orig-fboundp (symbol-function 'fboundp)))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (if (eq feature 'gptel)
+                     t
+                   (funcall orig-featurep feature))))
+              ((symbol-function 'fboundp)
+               (lambda (symbol)
+                 (if (eq symbol 'gptel-request)
+                     t
+                   (funcall orig-fboundp symbol))))
+              ((symbol-function 'gptel-request)
+               (lambda (&rest _args)
+                 (setq captured-temperature gptel-temperature)
+                 (setq captured-max-tokens gptel-max-tokens)
+                 t)))
+      (let ((gptel-temperature 0.7)
+            (gptel-max-tokens 512))
+        (org-ai-skills-gptel-dispatch-rewrite
+         '(:prompt "exec" :request-role execution)
+         #'ignore)))
+    (should (equal captured-temperature 0.7))
+    (should (equal captured-max-tokens 512))))
+
+(ert-deftest org-ai-skills-gptel-dispatch-falls-back-to-default-system-prompt-when-empty ()
+  "Dispatch should use default system prompt when configured system prompt is empty."
+  (let ((org-ai-skills-system-prompt-execution "")
+        captured-args
+        (orig-featurep (symbol-function 'featurep))
+        (orig-fboundp (symbol-function 'fboundp)))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (if (eq feature 'gptel)
+                     t
+                   (funcall orig-featurep feature))))
+              ((symbol-function 'fboundp)
+               (lambda (symbol)
+                 (if (eq symbol 'gptel-request)
+                     t
+                   (funcall orig-fboundp symbol))))
+              ((symbol-function 'gptel-request)
+               (lambda (&rest args)
+                 (setq captured-args (cdr args))
+                 t)))
+      (org-ai-skills-gptel-dispatch-rewrite
+       '(:prompt "exec" :request-role execution)
+       #'ignore))
+    (should (string= (plist-get captured-args :system)
+                     org-ai-skills--default-system-prompt-execution))))
+
+(ert-deftest org-ai-skills-gptel-dispatch-errors-on-unsupported-request-role ()
+  "Dispatch should reject unsupported request role values."
+  (let ((orig-featurep (symbol-function 'featurep))
+        (orig-fboundp (symbol-function 'fboundp)))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (if (eq feature 'gptel)
+                     t
+                   (funcall orig-featurep feature))))
+              ((symbol-function 'fboundp)
+               (lambda (symbol)
+                 (if (eq symbol 'gptel-request)
+                     t
+                   (funcall orig-fboundp symbol)))))
+      (should-error
+       (org-ai-skills-gptel-dispatch-rewrite
+        '(:prompt "bad" :request-role unknown-role)
+        #'ignore)
+       :type 'org-ai-skills-gptel-error))))
 
 (ert-deftest org-ai-skills-function-call-to-gptel-tool-prefers-skill-arg-hints ()
   "Tool arg descriptions should use per-argument hints from skill spec."
