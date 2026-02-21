@@ -36,6 +36,12 @@
   :type 'boolean
   :group 'org-ai-skills)
 
+(defcustom org-ai-skills-debug-property-retention nil
+  "When non-nil, append subtree property-retention match diagnostics to debug buffer.
+Requires `org-ai-skills-debug-enabled' to be non-nil."
+  :type 'boolean
+  :group 'org-ai-skills)
+
 (defcustom org-ai-skills-debug-buffer-name "*org-ai-skills-debug*"
   "Buffer name used for org-ai-skills debug logs."
   :type 'string
@@ -101,6 +107,16 @@ When nil, interactive flow asks user to select a candidate explicitly."
 
 (defcustom org-ai-skills-ui-control-window-width 34
   "Preferred width (columns) for the control window."
+  :type 'integer
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-enable-core-read-tools t
+  "When non-nil, expose core buffer/file read tools on every gptel request."
+  :type 'boolean
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-core-read-max-chars 20000
+  "Default max characters returned by core read tools."
   :type 'integer
   :group 'org-ai-skills)
 
@@ -832,6 +848,8 @@ When ALLOW-EMPTY-PLAN is non-nil, an empty plan is accepted."
    :source-subtree (list :headline (plist-get subtree :heading)
                          :level (plist-get subtree :level)
                          :path (plist-get subtree :path)
+                         :purpose (plist-get subtree :purpose)
+                         :source-file-path (plist-get subtree :source-file-path)
                          :context-mode (plist-get subtree :context-mode)
                          :levels-up (plist-get subtree :levels-up)
                          :text (plist-get subtree :text))))
@@ -867,7 +885,13 @@ Caller must ensure point is at a valid Org heading."
   (let ((begin (point))
         (level (org-outline-level))
         (heading (org-get-heading t t t t))
-        (path (mapconcat #'identity (org-ai-skills--heading-path-at-point) "/")))
+        (path (mapconcat #'identity (org-ai-skills--heading-path-at-point) "/"))
+        (purpose (or (org-entry-get (point) "PURPOSE" t)
+                     (org-ai-skills--file-keyword-value "PURPOSE")
+                     ""))
+        (source-file-path (or (org-entry-get (point) "SOURCE_FILE_PATH" t)
+                              (org-ai-skills--file-keyword-value "SOURCE_FILE_PATH")
+                              (buffer-file-name))))
     (save-excursion
       (org-end-of-subtree t t)
       (list :begin begin
@@ -875,6 +899,8 @@ Caller must ensure point is at a valid Org heading."
             :level level
             :heading heading
             :path path
+            :purpose purpose
+            :source-file-path source-file-path
             :text (buffer-substring-no-properties begin (point))))))
 
 (defun org-ai-skills--heading-path-at-point ()
@@ -887,6 +913,15 @@ Caller must ensure point is at a valid Org heading."
       (while (org-up-heading-safe)
         (push (org-get-heading t t t t) parts)))
     parts))
+
+(defun org-ai-skills--file-keyword-value (keyword)
+  "Return first file-level KEYWORD value in current Org buffer, or nil."
+  (let* ((key (upcase keyword))
+         (items (car (org-collect-keywords (list key))))
+         (values (cdr items))
+         (first (car values)))
+    (when (stringp first)
+      (string-trim first))))
 
 (defun org-ai-skills-org-resolve-subtree (&optional context-mode levels-up)
   "Resolve target subtree at point.
@@ -945,6 +980,8 @@ INSTRUCTION overrides the default rewrite goal."
   (let* ((heading (plist-get subtree :heading))
          (mode (plist-get subtree :context-mode))
          (levels-up (plist-get subtree :levels-up))
+         (skill-id (plist-get skill :skill-id))
+         (default-constraints (org-ai-skills--skill-default-rewrite-constraints skill-id))
          (goal (if (string-empty-p (or instruction ""))
                    (format "Rewrite Org subtree for heading: %s" heading)
                  instruction))
@@ -988,20 +1025,35 @@ INSTRUCTION overrides the default rewrite goal."
                   (number-to-string levels-up)
                   "\nHeading path: "
                   (or (plist-get subtree :path) heading)
+                  "\nPurpose: "
+                  (or (plist-get subtree :purpose) "")
+                  "\nSource file path: "
+                  (or (plist-get subtree :source-file-path) "")
                   "\n\nSkill description:\n"
                   (or (plist-get skill :description) "")
                   "\n\n"
                   outputs-block
                   contracts-block
                   requirements-block
-                  function-calls-block
+                 function-calls-block
                   "\n\nOutput requirements:\n"
                   "- Return only the rewritten Org subtree.\n"
                   "- Do not include explanations, analysis, or progress notes.\n"
                   "- Do not wrap output in code fences.\n"
-                  "- Keep Org syntax valid.\n\n"
+                  "- Keep Org syntax valid.\n"
+                  (if (plist-get default-constraints :preserve-headlines)
+                      "- Keep every headline line unchanged at all levels.\n"
+                    "")
+                  (if (plist-get default-constraints :omit-property-drawers)
+                      "- Do not output any property drawer block.\n"
+                    "")
+                  "\n"
+                  (if (and (stringp skill-id)
+                           (string= skill-id org-ai-skills--compose-skill-id))
+                      "For composition, derive a concise summary internally first, then expand section-by-section.\n\n"
+                    "")
                   "Rewrite the following Org subtree:\n\n"
-                  (plist-get subtree :text))))
+                  (org-ai-skills--rewrite-context-text skill subtree))))
     (list :event-type 'rewrite
           :request-role 'execution
           :skill-id (plist-get base-payload :skill-id)
@@ -1012,7 +1064,9 @@ INSTRUCTION overrides the default rewrite goal."
           :headline heading
           :context-mode mode
           :levels-up levels-up
+          :source-file-path (plist-get subtree :source-file-path)
           :source-text (plist-get subtree :text)
+          :rewrite-constraints default-constraints
           :skill-context skill-context
           :prompt rewrite-prompt)))
 
@@ -1027,9 +1081,19 @@ INSTRUCTION overrides the default rewrite goal."
   "Build one execution request from STEP, RUN-STATE, and LOADED-SKILLS."
   (let* ((task (or (plist-get run-state :task) ""))
          (subtree (plist-get run-state :subtree))
+         (compose-step-p
+          (seq-some (lambda (skill)
+                      (string= (plist-get skill :skill-id) org-ai-skills--compose-skill-id))
+                    loaded-skills))
          (input-text (or (org-ai-skills--run-state-latest-output run-state)
                          (plist-get subtree :text)
                          ""))
+         (effective-input
+          (if compose-step-p
+              (concat
+               "Outline summary (compact context):\n"
+               (org-ai-skills--compose-outline-summary input-text))
+            input-text))
          (skill-block
           (mapconcat
            (lambda (skill)
@@ -1071,16 +1135,26 @@ INSTRUCTION overrides the default rewrite goal."
            (format "- goal: %s\n" (or (plist-get step :goal) ""))
            (format "- expected_output: %s\n" (or (plist-get step :expected-output) ""))
            (format "- composition_reason: %s\n\n" (or (plist-get step :composition-reason) ""))
+           (format "Source file path: %s\n\n"
+                   (or (plist-get subtree :source-file-path) ""))
+           (if compose-step-p
+               (concat
+                "Strict compose constraints:\n"
+                "- Keep all headline lines unchanged at all levels.\n"
+                "- Do not output property drawers.\n"
+                "- Internally summarize outline first, then expand each heading.\n\n")
+             "")
            "Selected skills:\n"
            skill-block
            "\nInput content:\n\n"
-           input-text)))
+           effective-input)))
     (list :event-type 'step-execution
           :request-role 'execution
           :step-id (plist-get step :step-id)
           :skill-ids (plist-get step :skills)
           :composition-reason (or (plist-get step :composition-reason) "")
           :plan-revision (or (plist-get run-state :plan-revision) 1)
+          :source-file-path (plist-get subtree :source-file-path)
           :skill-contexts (mapcar
                            (lambda (skill)
                              (org-ai-skills-build-skill-context skill subtree))
@@ -1157,16 +1231,37 @@ Only skills referenced by STEP are loaded from DIRECTORY."
 
 (defun org-ai-skills--request-planner-plan (task metadata run-state callback)
   "Request planner plan using TASK, METADATA, and RUN-STATE, then CALLBACK."
-  (let ((request (org-ai-skills-build-planner-request task metadata run-state)))
+  (let ((request (org-ai-skills-build-planner-request task metadata run-state))
+        (planner-text "")
+        (done nil))
     (org-ai-skills-gptel-dispatch-rewrite
      request
      (lambda (&rest response)
-       (let ((text (apply #'org-ai-skills--extract-gptel-response-text-if-ready response)))
-         (when text
-           (let ((parsed (org-ai-skills-parse-planner-response
-                          text metadata (and (listp (plist-get run-state :steps))
-                                             (plist-get run-state :steps)))))
-             (funcall callback parsed))))))))
+       (unless done
+         (let ((first (car response))
+               (text (apply #'org-ai-skills--extract-gptel-response-text-if-ready response)))
+           (when (and (eq first t)
+                      (not done)
+                      (not (string-empty-p planner-text)))
+             (signal 'org-ai-skills-planner-error
+                     (list
+                      "Planner response ended before complete JSON payload was received")))
+           (when text
+             (setq planner-text (concat planner-text text))
+             (condition-case err
+                 (let ((parsed (org-ai-skills-parse-planner-response
+                                planner-text metadata
+                                (and (listp (plist-get run-state :steps))
+                                     (plist-get run-state :steps)))))
+                   (setq done t)
+                   (funcall callback parsed))
+               (org-ai-skills-planner-error
+                (let ((msg (error-message-string err)))
+                  ;; Some backends emit chunked planner text even when stream is off.
+                  ;; Keep accumulating until JSON is complete.
+                  (unless (or (string-match-p "End of file while parsing JSON" msg)
+                              (string-match-p "does not contain a JSON object" msg))
+                    (signal (car err) (cdr err)))))))))))))
 
 (defun org-ai-skills--run-plan-steps (task metadata run-state plan callback &optional directory)
   "Run PLAN steps recursively for TASK and METADATA.
@@ -1266,6 +1361,19 @@ OPTIONS is a plist; CALLBACK receives final run-state."
         (goto-char (point-max))
         (insert entry)))))
 
+(defun org-ai-skills--append-property-retention-debug (phase payload)
+  "Append property-retention debug entry with PHASE and PAYLOAD."
+  (when (and org-ai-skills-debug-enabled
+             org-ai-skills-debug-property-retention)
+    (org-ai-skills--append-debug-entry
+     (list :event-type 'property-retention
+           :request-role 'execution
+           :prompt (format "property-retention %s" phase)
+           :phase phase
+           :payload payload
+           :buffer-name (buffer-name)
+           :buffer-file (buffer-file-name)))))
+
 (defun org-ai-skills-debug-toggle (&optional enabled)
   "Toggle org-ai-skills debug logging.
 If ENABLED is non-nil, set debug mode accordingly."
@@ -1350,62 +1458,512 @@ or stream completion markers are ignored and return nil."
 
 (defun org-ai-skills--sanitize-rewrite-output (rewritten-text subtree)
   "Sanitize REWRITTEN-TEXT and normalize heading levels for SUBTREE."
-  (let* ((target-level (plist-get subtree :level))
-         (target-heading (plist-get subtree :heading))
-         (cleaned (org-ai-skills--extract-subtree-body rewritten-text))
-         (with-heading
-          (if (string-match "^\\*+\\s-+" cleaned)
-              cleaned
-            (format "%s %s\n%s"
-                    (make-string target-level ?*)
-                    target-heading
-                    (string-trim-left cleaned)))))
-    (org-ai-skills--normalize-subtree-levels with-heading target-level)))
+  (if (eq (plist-get subtree :context-mode) 'buffer)
+      (org-ai-skills--strip-markdown-fences (or rewritten-text ""))
+    (let* ((target-level (plist-get subtree :level))
+           (target-heading (plist-get subtree :heading))
+           (cleaned (org-ai-skills--extract-subtree-body rewritten-text))
+           (with-heading
+            (if (string-match "^\\*+\\s-+" cleaned)
+                cleaned
+              (format "%s %s\n%s"
+                      (make-string target-level ?*)
+                      target-heading
+                      (string-trim-left cleaned)))))
+      (org-ai-skills--normalize-subtree-levels with-heading target-level))))
+
+(defun org-ai-skills--strip-property-drawers-from-text (text)
+  "Return TEXT with Org property drawers removed."
+  (with-temp-buffer
+    (insert (or text ""))
+    (goto-char (point-min))
+    (while (re-search-forward "^[ \t]*:PROPERTIES:[ \t]*$" nil t)
+      (let ((start (line-beginning-position)))
+        (if (re-search-forward "^[ \t]*:END:[ \t]*$" nil t)
+            (delete-region start
+                           (min (point-max)
+                                (1+ (line-end-position))))
+          ;; Unclosed drawer: drop from :PROPERTIES: to end of buffer.
+          (delete-region start (point-max)))))
+    (buffer-string)))
+
+(defun org-ai-skills--strip-indented-property-drawers-from-text (text)
+  "Return TEXT with only indented pseudo property drawers removed.
+Keep valid non-indented drawers intact."
+  (with-temp-buffer
+    (insert (or text ""))
+    (goto-char (point-min))
+    (while (re-search-forward "^[ \t]+:PROPERTIES:[ \t]*$" nil t)
+      (let ((start (line-beginning-position)))
+        (if (re-search-forward "^[ \t]+:END:[ \t]*$" nil t)
+            (delete-region start
+                           (min (point-max)
+                                (1+ (line-end-position))))
+          (delete-region start (point-max)))))
+    (buffer-string)))
+
+(defun org-ai-skills--org-heading-lines (text)
+  "Return all Org heading lines from TEXT."
+  (let ((lines nil))
+    (with-temp-buffer
+      (insert (or text ""))
+      (goto-char (point-min))
+      (while (re-search-forward "^\\*+\\s-+.*$" nil t)
+        (push (buffer-substring-no-properties
+               (line-beginning-position)
+               (line-end-position))
+              lines)))
+    (nreverse lines)))
+
+(defun org-ai-skills--enforce-rewrite-constraints (rewritten-text subtree constraints)
+  "Apply rewrite CONSTRAINTS to REWRITTEN-TEXT for SUBTREE."
+  (let ((result (or rewritten-text "")))
+    (when (plist-get constraints :omit-property-drawers)
+      (setq result (org-ai-skills--strip-property-drawers-from-text result)))
+    (when (and (plist-get constraints :preserve-headlines)
+               (not (eq (plist-get subtree :context-mode) 'buffer)))
+      (let ((expected (org-ai-skills--org-heading-lines (plist-get subtree :text)))
+            (actual (org-ai-skills--org-heading-lines result)))
+        (unless (equal expected actual)
+          (org-ai-skills--signal-org-context-error
+           "Strict rewrite rejected: headline lines changed"))))
+    result))
+
+(defconst org-ai-skills--strict-rewrite-guard
+  (concat
+   "Strict constraints:\n"
+   "- Keep every headline line unchanged at all levels (same stars and same text).\n"
+   "- Do not add/remove/reorder headlines.\n"
+   "- Do not output any property drawer block (:PROPERTIES: ... :END:).\n"
+   "- Only rewrite paragraph/list content under existing headings.")
+  "Guard instruction used by strict rewrite command.")
+
+(defconst org-ai-skills--compose-skill-id "article-compose-from-outline"
+  "Skill id used for article composition from approved outline.")
+
+(defun org-ai-skills--strict-rewrite-instruction (instruction)
+  "Build strict rewrite instruction string from optional INSTRUCTION."
+  (if (string-empty-p (or instruction ""))
+      org-ai-skills--strict-rewrite-guard
+    (concat org-ai-skills--strict-rewrite-guard
+            "\n\nAdditional instruction:\n"
+            instruction)))
+
+(defun org-ai-skills--skill-default-rewrite-constraints (skill-id)
+  "Return default rewrite constraints for SKILL-ID."
+  (if (and (stringp skill-id)
+           (string= skill-id org-ai-skills--compose-skill-id))
+      '(:preserve-headlines t :omit-property-drawers t)
+    nil))
+
+(defun org-ai-skills--merge-rewrite-constraints (base override)
+  "Merge BASE and OVERRIDE rewrite constraints plists."
+  (let ((result (copy-sequence (or base nil))))
+    (while override
+      (setq result (plist-put result (car override) (cadr override)))
+      (setq override (cddr override)))
+    result))
+
+(defun org-ai-skills--compose-outline-summary (text)
+  "Build compact outline summary from Org TEXT."
+  (with-temp-buffer
+    (insert (or text ""))
+    (goto-char (point-min))
+    (let ((parts nil))
+      (while (re-search-forward "^\\(\\*+\\)\\s-+\\(.*\\)$" nil t)
+        (let ((heading (format "%s %s" (match-string 1) (match-string 2)))
+              (purpose nil)
+              (source-path nil)
+              (start (line-end-position))
+              (end (save-excursion
+                     (if (re-search-forward "^\\*+\\s-+" nil t)
+                         (line-beginning-position)
+                       (point-max)))))
+          (save-excursion
+            (goto-char start)
+            (when (re-search-forward "^[ \t]*:PURPOSE:[ \t]*\\(.*\\)$" end t)
+              (setq purpose (string-trim (match-string 1))))
+            (goto-char start)
+            (when (re-search-forward "^[ \t]*:SOURCE_FILE_PATH:[ \t]*\\(.*\\)$" end t)
+              (setq source-path (string-trim (match-string 1)))))
+          (push (concat heading
+                        (if (and (stringp purpose) (not (string-empty-p purpose)))
+                            (format "\n  PURPOSE: %s" purpose)
+                          "")
+                        (if (and (stringp source-path) (not (string-empty-p source-path)))
+                            (format "\n  SOURCE_FILE_PATH: %s" source-path)
+                          ""))
+                parts)))
+      (string-join (nreverse parts) "\n"))))
+
+(defun org-ai-skills--rewrite-context-text (skill subtree)
+  "Return context text used in rewrite prompt for SKILL and SUBTREE."
+  (let* ((skill-id (plist-get skill :skill-id))
+         (full (or (plist-get subtree :text) "")))
+    (if (and (stringp skill-id)
+             (string= skill-id org-ai-skills--compose-skill-id))
+        (concat
+         "Outline summary (compact context):\n"
+         (org-ai-skills--compose-outline-summary full)
+         "\n\nGeneration guidance:\n"
+         "- First internally derive a concise article-level summary from the outline.\n"
+         "- Then expand section-by-section using the existing headings only.\n"
+         "- Keep heading lines unchanged.\n")
+      full)))
+
+(defun org-ai-skills--run-state-has-skill-id-p (run-state skill-id)
+  "Return non-nil when RUN-STATE contains SKILL-ID in completed steps."
+  (let ((steps (or (plist-get run-state :steps) nil))
+        (hit nil))
+    (while (and steps (not hit))
+      (setq hit (member skill-id (or (plist-get (car steps) :skills) nil)))
+      (setq steps (cdr steps)))
+    hit))
+
+(defun org-ai-skills--run-state-last-step-skill-ids (run-state)
+  "Return skill id list from final completed step in RUN-STATE."
+  (let ((steps (or (plist-get run-state :steps) nil))
+        (last-skills nil))
+    (dolist (step steps)
+      (let ((skills (plist-get step :skills)))
+        (when (listp skills)
+          (setq last-skills skills))))
+    last-skills))
+
+(defun org-ai-skills--planner-constraints-for-run-state (run-state)
+  "Return rewrite constraints inferred from final completed step of RUN-STATE."
+  (let ((skills (org-ai-skills--run-state-last-step-skill-ids run-state))
+        (merged nil))
+    (dolist (skill-id skills)
+      (setq merged
+            (org-ai-skills--merge-rewrite-constraints
+             merged
+             (org-ai-skills--skill-default-rewrite-constraints skill-id))))
+    merged))
+
+(defun org-ai-skills--org-front-matter-end (text)
+  "Return end position of leading Org file front matter in TEXT."
+  (with-temp-buffer
+    (insert (or text ""))
+    (goto-char (point-min))
+    (while (and (not (eobp))
+                (looking-at-p
+                 (concat
+                  "\\(?:[ \t]*\\)$"
+                  "\\|^#\\+[[:alnum:]_@-]+:"
+                  "\\|^#[ \t]")))
+      (forward-line 1))
+    (point)))
+
+(defun org-ai-skills--extract-org-front-matter (text)
+  "Extract leading Org file front matter from TEXT."
+  (let ((end (org-ai-skills--org-front-matter-end text)))
+    (substring (or text "") 0 (max 0 (1- end)))))
+
+(defun org-ai-skills--strip-org-front-matter (text)
+  "Strip leading Org file front matter from TEXT."
+  (let* ((source (or text ""))
+         (end (org-ai-skills--org-front-matter-end source)))
+    (if (> end (length source))
+        ""
+      (substring source (max 0 (1- end))))))
+
+(defun org-ai-skills--merge-buffer-rewrite-preserving-front-matter (existing rewritten)
+  "Merge EXISTING and REWRITTEN text while preserving existing file front matter."
+  (let* ((front (string-trim-right
+                 (org-ai-skills--extract-org-front-matter existing)))
+         (body (string-trim-left
+                (org-ai-skills--strip-org-front-matter rewritten))))
+    (if (string-empty-p front)
+        rewritten
+      (if (string-empty-p body)
+          (concat front "\n")
+        (concat front "\n\n" body)))))
+
+(defun org-ai-skills--collect-subtree-explicit-properties (begin end keys)
+  "Collect explicit KEYS property values from headings in region BEGIN..END."
+  (let ((entries nil)
+        (end-pos (if (markerp end) (marker-position end) end))
+        (index 0)
+        (level-index (make-hash-table :test #'eql)))
+    (save-excursion
+      (save-restriction
+        (narrow-to-region begin end-pos)
+        (goto-char (point-min))
+        (when (org-at-heading-p)
+          (while (org-at-heading-p)
+            (setq index (1+ index))
+            (let ((path (mapconcat #'identity (org-get-outline-path t t) "\x1f"))
+                  (title (or (org-get-heading t t t t) ""))
+                  (level (org-outline-level))
+                  (level-pos 0)
+                  (props nil))
+              (setq level-pos (1+ (or (gethash level level-index) 0)))
+              (puthash level level-pos level-index)
+              (dolist (key keys)
+                (let ((value (org-entry-get (point) key nil)))
+                  (when (and (stringp value)
+                             (not (string-empty-p value)))
+                    (push (cons key value) props))))
+              (when props
+                (push (list :index index
+                            :path path
+                            :title title
+                            :level level
+                            :level-pos level-pos
+                            :props props)
+                      entries)))
+            (outline-next-heading)))))
+    (org-ai-skills--append-property-retention-debug
+     "collect"
+     (list :begin begin
+           :end end
+           :keys keys
+           :entry-count (length entries)
+           :entries (cl-subseq entries 0 (min (length entries) 20))))
+    (nreverse entries)))
+
+(defun org-ai-skills--string-similarity (left right)
+  "Return normalized similarity score in [0,1] for LEFT and RIGHT."
+  (let* ((a (downcase (or left "")))
+         (b (downcase (or right "")))
+         (max-len (max (length a) (length b))))
+    (if (= max-len 0)
+        1.0
+      (- 1.0 (/ (float (string-distance a b)) max-len)))))
+
+(defun org-ai-skills--restore-subtree-explicit-properties (begin end keys entries)
+  "Restore explicit KEYS from ENTRIES onto matching headings in BEGIN..END."
+  (when entries
+    (let* ((end-pos (if (markerp end) (marker-position end) end))
+           (path-table (make-hash-table :test #'equal))
+           (title-table (make-hash-table :test #'equal))
+           (level-title-table (make-hash-table :test #'equal))
+           (order-table (make-hash-table :test #'equal))
+           (used (make-hash-table :test #'equal))
+           (decisions nil))
+      (dolist (entry entries)
+        (let* ((path (plist-get entry :path))
+               (title (or (plist-get entry :title) ""))
+               (level (plist-get entry :level))
+               (level-pos (plist-get entry :level-pos))
+               (order-key (format "%d|%d" level level-pos))
+               (level-title-key (format "%d|%s" level (downcase title))))
+          (puthash path entry path-table)
+          (puthash order-key entry order-table)
+          (puthash title (cons entry (gethash title title-table)) title-table)
+          (puthash level-title-key
+                   (cons entry (gethash level-title-key level-title-table))
+                   level-title-table)))
+      (save-excursion
+        (save-restriction
+          (narrow-to-region begin end-pos)
+          (goto-char (point-min))
+          (let ((level-index (make-hash-table :test #'eql)))
+            (when (org-at-heading-p)
+              (while (org-at-heading-p)
+                (let* ((path (mapconcat #'identity (org-get-outline-path t t) "\x1f"))
+                       (title (or (org-get-heading t t t t) ""))
+                       (level (org-outline-level))
+                       (level-pos (1+ (or (gethash level level-index) 0)))
+                       (order-key (format "%d|%d" level level-pos))
+                       (level-title-key (format "%d|%s" level (downcase title)))
+                       (path-match (gethash path path-table))
+                       (title-matches (gethash title title-table))
+                       (title-match (and (= (length title-matches) 1)
+                                         (car title-matches)))
+                       (level-title-matches (gethash level-title-key level-title-table))
+                       (level-title-match (and (= (length level-title-matches) 1)
+                                               (car level-title-matches)))
+                       (order-match (gethash order-key order-table))
+                       (fuzzy-match
+                        (let ((best nil)
+                              (best-score 0.0))
+                          (dolist (candidate entries)
+                            (when (and (= (plist-get candidate :level) level)
+                                       (not (gethash (plist-get candidate :index) used)))
+                              (let ((score (org-ai-skills--string-similarity
+                                            title
+                                            (plist-get candidate :title))))
+                                (when (> score best-score)
+                                  (setq best-score score)
+                                  (setq best candidate)))))
+                          (when (>= best-score 0.6) best)))
+                       (match-strategy 'unmatched)
+                       (saved nil)
+                       (restored-keys nil))
+                  (setq saved
+                        (cond
+                         ((and path-match
+                               (not (gethash (plist-get path-match :index) used)))
+                          (setq match-strategy 'path)
+                          path-match)
+                         ((and level-title-match
+                               (not (gethash (plist-get level-title-match :index) used)))
+                          (setq match-strategy 'exact-level-title)
+                          level-title-match)
+                         ((and title-match
+                               (not (gethash (plist-get title-match :index) used)))
+                          (setq match-strategy 'title)
+                          title-match)
+                         ((and order-match
+                               (not (gethash (plist-get order-match :index) used)))
+                          (setq match-strategy 'level-order)
+                          order-match)
+                         ((and fuzzy-match
+                               (not (gethash (plist-get fuzzy-match :index) used)))
+                          (setq match-strategy 'fuzzy-level-title)
+                          fuzzy-match)
+                         (t nil)))
+                  (puthash level level-pos level-index)
+                  (when saved
+                    (puthash (plist-get saved :index) t used)
+                    (dolist (key keys)
+                      (let ((saved-value (cdr (assoc key (plist-get saved :props))))
+                            (current-value (org-entry-get (point) key nil)))
+                        (when (and (stringp saved-value)
+                                   (or (null current-value)
+                                       (string-empty-p current-value)))
+                          (org-entry-put (point) key saved-value)
+                          (push key restored-keys)))))
+                  (push (list :path path
+                              :title title
+                              :level level
+                              :strategy match-strategy
+                              :restored (nreverse restored-keys))
+                        decisions)
+                  (outline-next-heading)))))))
+      (org-ai-skills--append-property-retention-debug
+       "restore"
+       (list :begin begin
+             :end end
+             :keys keys
+             :entry-count (length entries)
+             :decision-count (length decisions)
+             :decisions (nreverse
+                         (cl-subseq decisions 0 (min (length decisions) 40))))))))
+
+(defun org-ai-skills--ensure-subtree-heading-ids (begin end)
+  "Ensure all headings in BEGIN..END have explicit :ID:."
+  (let ((end-pos (if (markerp end) (marker-position end) end)))
+    (save-excursion
+      (save-restriction
+        (narrow-to-region begin end-pos)
+        (goto-char (point-min))
+        (when (org-at-heading-p)
+          (while (org-at-heading-p)
+            (unless (org-entry-get (point) "ID" nil)
+              (org-entry-put (point) "ID" (org-id-new)))
+            (outline-next-heading)))))))
 
 (defun org-ai-skills-org-apply-rewrite-result (subtree rewritten-text)
   "Replace SUBTREE region with REWRITTEN-TEXT.
 Preserve target heading and property drawer by replacing subtree body."
-  (unless (stringp rewritten-text)
-    (org-ai-skills--signal-org-context-error "Rewritten text must be a string"))
-  (let ((begin (plist-get subtree :begin))
-        (end (plist-get subtree :end)))
-    (unless (and begin end (<= begin end))
-      (org-ai-skills--signal-org-context-error
-       "Invalid subtree range for rewrite"))
-    (let ((new-body "")
-          (existing-heading-line "")
-          (existing-drawer ""))
-      (with-temp-buffer
-        (insert rewritten-text)
-        (goto-char (point-min))
-        (if (re-search-forward "^\\*+\\s-+" nil t)
-            (progn
-              (beginning-of-line)
-              (forward-line 1)
-              (when (looking-at-p "^[ \t]*:PROPERTIES:[ \t]*$")
-                (when (re-search-forward "^[ \t]*:END:[ \t]*$" nil t)
-                  (forward-line 1)))
-              (setq new-body (buffer-substring-no-properties (point) (point-max))))
-          (setq new-body rewritten-text)))
-      (setq new-body (replace-regexp-in-string "\\`\n+" "" (or new-body "")))
-      (save-excursion
-        (org-fold-core-ignore-modifications
-         (goto-char begin)
-         (setq existing-heading-line
-               (buffer-substring-no-properties
-                (line-beginning-position)
-                (min (point-max) (1+ (line-end-position)))))
-         (forward-line 1)
-         (when (looking-at-p "^[ \t]*:PROPERTIES:[ \t]*$")
-           (let ((drawer-start (point)))
-             (when (re-search-forward "^[ \t]*:END:[ \t]*$" end t)
-               (forward-line 1)
-               (setq existing-drawer
-                     (buffer-substring-no-properties drawer-start (point))))))
-         (delete-region begin end)
-         (insert existing-heading-line existing-drawer new-body)
-         (unless (or (bolp) (string-suffix-p "\n" new-body))
-           (insert "\n")))))))
+  (let ((cleaned-text (org-ai-skills--strip-indented-property-drawers-from-text
+                       rewritten-text)))
+    (unless (stringp cleaned-text)
+      (org-ai-skills--signal-org-context-error "Rewritten text must be a string"))
+    (let ((begin (plist-get subtree :begin))
+          (end (plist-get subtree :end)))
+      (unless (and begin end (<= begin end))
+        (org-ai-skills--signal-org-context-error
+         "Invalid subtree range for rewrite"))
+      (if (eq (plist-get subtree :context-mode) 'buffer)
+          (let* ((preserve-keys '("PURPOSE" "SOURCE_FILE_PATH"))
+                 (existing (buffer-substring-no-properties begin end))
+                 (merged (org-ai-skills--merge-buffer-rewrite-preserving-front-matter
+                          existing
+                          cleaned-text))
+                 (saved-props nil)
+                 (saved-begin nil)
+                 (new-begin nil)
+                 (new-end nil))
+            (save-excursion
+              (org-fold-core-ignore-modifications
+               (goto-char begin)
+               (when (re-search-forward "^\\*+\\s-+" end t)
+                 (setq saved-begin (line-beginning-position))
+                 (setq saved-props
+                       (org-ai-skills--collect-subtree-explicit-properties
+                        saved-begin end preserve-keys)))
+               (delete-region begin end)
+               (goto-char begin)
+               (setq new-begin (point))
+               (insert merged)
+               (setq new-end (point))
+               (unless (or (bolp) (string-suffix-p "\n" merged))
+                 (insert "\n")
+                 (setq new-end (point)))
+               (when saved-props
+                 (goto-char new-begin)
+                 (when (re-search-forward "^\\*+\\s-+" new-end t)
+                   (org-ai-skills--restore-subtree-explicit-properties
+                    (line-beginning-position) new-end preserve-keys saved-props))))))
+        (let ((new-body "")
+              (existing-heading-line "")
+              (existing-drawer "")
+              (preserve-keys '("PURPOSE" "SOURCE_FILE_PATH"))
+              (saved-props nil)
+              (new-end nil))
+          (with-temp-buffer
+            (insert cleaned-text)
+            (goto-char (point-min))
+            (if (re-search-forward "^\\*+\\s-+" nil t)
+                (progn
+                  (beginning-of-line)
+                  (forward-line 1)
+                  (when (looking-at-p "^[ \t]*:PROPERTIES:[ \t]*$")
+                    (when (re-search-forward "^[ \t]*:END:[ \t]*$" nil t)
+                      (forward-line 1)))
+                  (setq new-body (buffer-substring-no-properties (point) (point-max))))
+              (setq new-body cleaned-text)))
+          (setq new-body (replace-regexp-in-string "\\`\n+" "" (or new-body "")))
+          (save-excursion
+            (org-fold-core-ignore-modifications
+             (goto-char begin)
+             (unless (org-at-heading-p)
+               (org-back-to-heading t))
+             (setq saved-props
+                   (org-ai-skills--collect-subtree-explicit-properties
+                    begin end preserve-keys))
+             (setq existing-heading-line
+                   (format "%s %s"
+                           (make-string (org-outline-level) ?*)
+                           (org-get-heading t t t t)))
+             (forward-line 1)
+             (when (looking-at-p "^[ \t]*:PROPERTIES:[ \t]*$")
+               (let ((drawer-start (point)))
+                 (when (re-search-forward "^[ \t]*:END:[ \t]*$" end t)
+                   (forward-line 1)
+                   (setq existing-drawer
+                         (buffer-substring-no-properties drawer-start (point))))))
+             (delete-region begin end)
+             (insert existing-heading-line "\n" existing-drawer new-body)
+             (unless (or (bolp) (string-suffix-p "\n" new-body))
+               (insert "\n"))
+             (goto-char begin)
+             (unless (org-at-heading-p)
+               (org-back-to-heading t))
+             (org-end-of-subtree t t)
+             (setq new-end (point))
+             (org-ai-skills--restore-subtree-explicit-properties
+              begin new-end preserve-keys saved-props)
+             (org-ai-skills--ensure-subtree-heading-ids begin new-end))))))))
+(defun org-ai-skills--buffer-scope-target ()
+  "Return whole-buffer scope target plist."
+  (let ((source-file (or (org-ai-skills--file-keyword-value "SOURCE_FILE_PATH")
+                         (buffer-file-name)))
+        (name (buffer-name)))
+    (list :begin (point-min)
+          :end (point-max)
+          :level 0
+          :heading (or source-file name)
+          :path (or source-file name)
+          :purpose (or (org-ai-skills--file-keyword-value "PURPOSE") "")
+          :source-file-path source-file
+          :context-mode 'buffer
+          :levels-up 0
+          :text (buffer-substring-no-properties (point-min) (point-max)))))
 
 (defun org-ai-skills-org-collect-context-candidates ()
   "Collect subtree rewrite scope candidates from current heading upward.
@@ -1413,35 +1971,38 @@ Return an alist where each item is (DISPLAY . SUBTREE-PLIST)."
   (org-ai-skills--require-org-mode)
   (save-excursion
     (org-with-wide-buffer
-      (when (org-before-first-heading-p)
-        (org-ai-skills--signal-org-context-error "No Org heading at point"))
-      (unless (org-at-heading-p)
-        (org-back-to-heading t))
-      (let ((items nil)
-            (levels-up 0)
-            (done nil))
-        (while (not done)
-          (let* ((path (mapconcat #'identity (org-ai-skills--heading-path-at-point) "/"))
-                 (subtree (org-ai-skills--subtree-at-heading-point))
-                 (mode (if (= levels-up 0) 'current 'upper-level))
-                 (display (format "[%s] %s"
-                                  (if (= levels-up 0)
-                                      "current"
-                                    (format "up:%d" levels-up))
-                                  path)))
-            (push (cons display
-                        (append subtree
-                                (list :context-mode mode
-                                      :levels-up levels-up
-                                      :path path)))
-                  items))
-          (if (org-up-heading-safe)
-              (setq levels-up (1+ levels-up))
-            (setq done t)))
-        (nreverse items)))))
+      (let ((buffer-item
+             (cons (format "[buffer] %s" (or (buffer-file-name) (buffer-name)))
+                   (org-ai-skills--buffer-scope-target))))
+        (if (org-before-first-heading-p)
+            (list buffer-item)
+          (unless (org-at-heading-p)
+            (org-back-to-heading t))
+          (let ((items (list buffer-item))
+                (levels-up 0)
+                (done nil))
+            (while (not done)
+              (let* ((path (mapconcat #'identity (org-ai-skills--heading-path-at-point) "/"))
+                     (subtree (org-ai-skills--subtree-at-heading-point))
+                     (mode (if (= levels-up 0) 'current 'upper-level))
+                     (display (format "[%s] %s"
+                                      (if (= levels-up 0)
+                                          "current"
+                                        (format "up:%d" levels-up))
+                                      path)))
+                (push (cons display
+                            (append subtree
+                                    (list :context-mode mode
+                                          :levels-up levels-up
+                                          :path path)))
+                      items))
+              (if (org-up-heading-safe)
+                  (setq levels-up (1+ levels-up))
+                (setq done t)))
+            (nreverse items)))))))
 
 (defun org-ai-skills-org-read-rewrite-target ()
-  "Read rewrite target subtree from minibuffer with headline path preview."
+  "Read rewrite target scope from minibuffer with preview."
   (let* ((candidates (org-ai-skills-org-collect-context-candidates))
          (choice (completing-read "Rewrite scope: "
                                   (mapcar #'car candidates)
@@ -1680,18 +2241,19 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
     (let ((run-type (org-ai-skills--ui-run-get :run-type)))
     (pcase run-type
       ('planner
-       (let* ((target (org-ai-skills--ui-run-get :target))
+       (let* ((target (org-ai-skills--ui-current-target))
               (current-task (or (org-ai-skills--ui-run-get :task) ""))
               (task (read-string "Planner task: " current-task)))
          (org-ai-skills--ui-run-set
           :rerun-fn
           (lambda ()
             (interactive)
-            (org-ai-skills-org-plan-and-run-subtree target task t)))
-         (org-ai-skills-org-plan-and-run-subtree target task t)))
+            (org-ai-skills-plan-run target task t)))
+         (org-ai-skills-plan-run target task t)))
       ('rewrite
-       (let* ((target (org-ai-skills--ui-run-get :target))
+       (let* ((target (org-ai-skills--ui-current-target))
               (skill (org-ai-skills--ui-run-get :skill))
+              (constraints (org-ai-skills--ui-run-get :rewrite-constraints))
               (current-instruction (or (org-ai-skills--ui-run-get :instruction) ""))
               (instruction (read-string "Rewrite instruction: " current-instruction)))
          (org-ai-skills--ui-run-set :instruction instruction)
@@ -1699,8 +2261,10 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
           :rerun-fn
           (lambda ()
             (interactive)
-            (org-ai-skills-org-rewrite-subtree target skill instruction t)))
-         (org-ai-skills-org-rewrite-subtree target skill instruction t)))
+            (org-ai-skills-org-rewrite-subtree
+             target skill instruction t constraints)))
+         (org-ai-skills-org-rewrite-subtree
+          target skill instruction t constraints)))
       (_
        (org-ai-skills--signal-org-context-error "Unsupported run type"))))))
 
@@ -1722,15 +2286,56 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
       (message "org-ai-skills: apply unavailable while running")
     (let* ((candidate (or (org-ai-skills--ui-run-get :selected-candidate)
                           (org-ai-skills-ui-select-candidate)))
-           (begin (org-ai-skills--ui-run-get :begin))
-           (end (org-ai-skills--ui-run-get :end)))
+           (source-buffer (or (org-ai-skills--ui-run-get :source-buffer)
+                              (current-buffer)))
+           (target (org-ai-skills--ui-current-target)))
       (unless candidate
         (org-ai-skills--signal-version-store-error "No selected candidate"))
-      (org-ai-skills-org-apply-candidate-to-subtree
-       (list :begin begin :end end)
-       candidate)
+      (unless (buffer-live-p source-buffer)
+        (org-ai-skills--signal-org-context-error "Source buffer is not available"))
+      (with-current-buffer source-buffer
+        (unless target
+          (org-ai-skills--signal-org-context-error "No apply target available"))
+        (org-ai-skills-org-apply-candidate-to-subtree
+         target
+         candidate))
       (org-ai-skills--ui-clear-overlay)
       (org-ai-skills--ui-set-status 'applied "applied"))))
+
+(defun org-ai-skills--ui-current-target ()
+  "Return current UI target, reconstructing from runtime state when missing."
+  (let ((target (org-ai-skills--ui-run-get :target)))
+    (if (consp target)
+        target
+      (let ((begin (org-ai-skills--ui-run-get :begin))
+            (end (org-ai-skills--ui-run-get :end))
+            (context-mode (org-ai-skills--ui-effective-context-mode))
+            (heading (org-ai-skills--ui-run-get :heading)))
+        (when (and begin end)
+          (list :begin begin
+                :end end
+                :context-mode context-mode
+                :heading heading))))))
+
+(defun org-ai-skills--ui-effective-context-mode ()
+  "Return effective context mode inferred from UI run state."
+  (let ((context-mode (org-ai-skills--ui-run-get :context-mode))
+        (target (org-ai-skills--ui-run-get :target))
+        (slot-id (org-ai-skills--ui-run-get :slot-id))
+        (begin (org-ai-skills--ui-run-get :begin))
+        (end (org-ai-skills--ui-run-get :end)))
+    (cond
+     ((memq context-mode '(buffer current upper-level)) context-mode)
+     ((and (consp target) (memq (plist-get target :context-mode)
+                                '(buffer current upper-level)))
+      (plist-get target :context-mode))
+     ((equal slot-id "buffer-root") 'buffer)
+     ((and (integer-or-marker-p begin)
+           (integer-or-marker-p end)
+           (= (if (markerp begin) (marker-position begin) begin) (point-min))
+           (= (if (markerp end) (marker-position end) end) (point-max)))
+      'buffer)
+     (t 'current))))
 
 (defun org-ai-skills-ui-discard-selected-candidate ()
   "Discard selected candidate from UI state."
@@ -1779,19 +2384,33 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
 
 (defun org-ai-skills--ensure-subtree-slot-id (subtree)
   "Ensure SUBTREE has stable slot id; write back Org =:ID:= when possible."
-  (let* ((buffer (current-buffer))
+  (let* ((begin-raw (plist-get subtree :begin))
+         (buffer (cond
+                  ((and (markerp begin-raw) (marker-buffer begin-raw))
+                   (marker-buffer begin-raw))
+                  ((and (bufferp (plist-get subtree :source-buffer))
+                        (buffer-live-p (plist-get subtree :source-buffer)))
+                   (plist-get subtree :source-buffer))
+                  (t (current-buffer))))
          (begin (org-ai-skills--subtree-begin-position subtree))
+         (context-mode (plist-get subtree :context-mode))
          (slot-id (plist-get subtree :slot-id)))
     (unless (stringp slot-id)
-      (when (and begin (derived-mode-p 'org-mode))
-        (save-excursion
-          (goto-char begin)
-          (unless (org-at-heading-p)
-            (org-back-to-heading t))
-          (setq slot-id (org-entry-get (point) "ID"))
-          (unless (stringp slot-id)
-            (setq slot-id (org-id-new))
-            (org-entry-put (point) "ID" slot-id))))
+      (when (and begin
+                 (not (eq context-mode 'buffer)))
+        (with-current-buffer buffer
+          (when (derived-mode-p 'org-mode)
+            (save-excursion
+              (goto-char begin)
+              (unless (org-at-heading-p)
+                (org-back-to-heading t))
+              (setq slot-id (org-entry-get (point) "ID"))
+              (unless (stringp slot-id)
+                (setq slot-id (org-id-new))
+                (org-entry-put (point) "ID" slot-id))))))
+      (when (and (not (stringp slot-id))
+                 (eq context-mode 'buffer))
+        (setq slot-id "buffer-root"))
       (unless (stringp slot-id)
         ;; Non-Org or marker-free callers keep compatibility with runtime-only id.
         (setq slot-id (format "runtime-%s" (org-ai-skills--candidate-id)))))
@@ -1946,7 +2565,8 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
        "No candidate available for selected slot"))
     (org-ai-skills-org-apply-candidate-to-subtree
      (list :begin (plist-get slot :begin)
-           :end (plist-get slot :end))
+           :end (plist-get slot :end)
+           :context-mode (plist-get slot :context-mode))
      candidate)))
 
 (defun org-ai-skills--parse-function-arg-names (arg-spec)
@@ -1955,19 +2575,100 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
          (clean (replace-regexp-in-string "[()]" "" raw)))
     (split-string clean "[ \t\n,]+" t)))
 
-(defun org-ai-skills--request-function-calls (request)
-  "Collect function call specs from REQUEST contexts."
-  (let ((calls nil)
-        (skill-context (plist-get request :skill-context))
-        (skill-contexts (plist-get request :skill-contexts)))
-    (when skill-context
-      (setq calls (append calls (or (plist-get skill-context :function-calls) nil))))
-    (dolist (ctx skill-contexts)
-      (setq calls (append calls (or (plist-get ctx :function-calls) nil))))
-    (cl-remove-duplicates
-     calls
-     :test (lambda (a b)
-             (equal (plist-get a :name) (plist-get b :name))))))
+(defun org-ai-skills--coerce-max-chars (max-chars)
+  "Coerce MAX-CHARS into bounded integer."
+  (let ((n (cond
+            ((integerp max-chars) max-chars)
+            ((and (stringp max-chars)
+                  (string-match-p "^[0-9]+$" max-chars))
+             (string-to-number max-chars))
+            (t org-ai-skills-core-read-max-chars))))
+    (max 1 n)))
+
+(defun org-ai-skills--slice-string-by-chars (text max-chars)
+  "Return TEXT truncated to MAX-CHARS if needed."
+  (let ((limit (org-ai-skills--coerce-max-chars max-chars)))
+    (if (<= (length text) limit)
+        text
+      (substring text 0 limit))))
+
+(defun org-ai-skills-read-buffer (&optional buffer_name start end)
+  "Read text from BUFFER_NAME with optional START and END positions.
+When BUFFER_NAME is nil/empty, use current buffer.
+START and END are 1-based positions and are clamped to buffer bounds."
+  (let* ((target (if (and (stringp buffer_name)
+                          (not (string-empty-p buffer_name)))
+                     (get-buffer buffer_name)
+                   (current-buffer))))
+    (unless (buffer-live-p target)
+      (org-ai-skills--signal-function-call-error
+       (format "Buffer not found: %s" (or buffer_name ""))))
+    (with-current-buffer target
+      (let* ((beg (max (point-min)
+                       (cond
+                        ((integerp start) start)
+                        ((and (stringp start)
+                              (string-match-p "^[0-9]+$" start))
+                         (string-to-number start))
+                        (t (point-min)))))
+             (fin (min (point-max)
+                       (cond
+                        ((integerp end) end)
+                        ((and (stringp end)
+                              (string-match-p "^[0-9]+$" end))
+                         (string-to-number end))
+                        (t (point-max))))))
+        (when (> beg fin)
+          (setq beg fin))
+        (buffer-substring-no-properties beg fin)))))
+
+(defun org-ai-skills-read-file (&optional file_path max_chars)
+  "Read source file content from FILE_PATH with optional MAX_CHARS limit."
+  (unless (and (stringp file_path) (not (string-empty-p file_path)))
+    (org-ai-skills--signal-function-call-error
+     "file_path is required for org-ai-skills-read-file"))
+  (let* ((abs (expand-file-name file_path))
+         (raw (if (file-readable-p abs)
+                  (with-temp-buffer
+                    (insert-file-contents abs)
+                    (buffer-string))
+                (org-ai-skills--signal-function-call-error
+                 (format "Source file is not readable: %s" abs)))))
+    (org-ai-skills--slice-string-by-chars raw max_chars)))
+
+(defconst org-ai-skills--core-read-function-calls
+  '((:name "org-ai-skills-read-buffer"
+     :when "when current/named buffer context is needed"
+     :args "(buffer_name start end)"
+     :buffer_name "optional buffer name; empty means current buffer"
+     :start "optional 1-based start position"
+     :end "optional 1-based end position")
+    (:name "org-ai-skills-read-file"
+     :when "when source material is in an external file path"
+     :args "(file_path max_chars)"
+     :file_path "absolute or project-relative source file path"
+     :max_chars "optional maximum characters to return"))
+  "Core always-available read tool specs.")
+
+(defun org-ai-skills--request-function-calls (request &optional role)
+  "Collect function call specs from REQUEST contexts.
+When ROLE is `planner', return nil because planner must not use tools."
+  (let ((request-role (or role (org-ai-skills--resolve-request-role request))))
+    (if (eq request-role 'planner)
+        nil
+      (let ((calls nil)
+            (skill-context (plist-get request :skill-context))
+            (skill-contexts (plist-get request :skill-contexts)))
+        (when org-ai-skills-enable-core-read-tools
+          (setq calls (append calls org-ai-skills--core-read-function-calls)))
+        (when skill-context
+          (setq calls (append calls (or (plist-get skill-context :function-calls) nil))))
+        (dolist (ctx skill-contexts)
+          (setq calls (append calls (or (plist-get ctx :function-calls) nil))))
+        (cl-remove-duplicates
+         calls
+         :test (lambda (a b)
+                 (equal (plist-get a :name) (plist-get b :name))))))))
 
 (defun org-ai-skills--function-call-to-gptel-tool (fn-spec)
   "Convert FN-SPEC into a gptel tool struct."
@@ -2006,10 +2707,10 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
                                   :optional t))
                           args)))))
 
-(defun org-ai-skills--request-gptel-tools (request)
-  "Build gptel tool list from REQUEST."
+(defun org-ai-skills--request-gptel-tools (request &optional role)
+  "Build gptel tool list from REQUEST and ROLE."
   (mapcar #'org-ai-skills--function-call-to-gptel-tool
-          (org-ai-skills--request-function-calls request)))
+          (org-ai-skills--request-function-calls request role)))
 
 (defun org-ai-skills--resolve-request-role (request)
   "Return normalized request role symbol from REQUEST."
@@ -2078,9 +2779,9 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
          (effective-system-prompt (org-ai-skills--resolve-role-system-prompt role))
          (effective-schema (org-ai-skills--resolve-role-schema role))
          (generation-settings (org-ai-skills--resolve-role-generation-settings role))
-         (tools (org-ai-skills--request-gptel-tools request))
+         (tools (org-ai-skills--request-gptel-tools request role))
          (tool-names (mapcar (lambda (fn-spec) (plist-get fn-spec :name))
-                             (org-ai-skills--request-function-calls request)))
+                             (org-ai-skills--request-function-calls request role)))
          (logged-request (append request
                                  (list :request-role role
                                        :effective-model effective-model
@@ -2162,8 +2863,15 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
          (instruction (read-string "Rewrite instruction (optional): ")))
     (list target skill instruction)))
 
-(defun org-ai-skills--interactive-plan-run-args ()
-  "Read interactive arguments for `org-ai-skills-org-plan-and-run-subtree'."
+(defun org-ai-skills--interactive-rewrite-strict-args ()
+  "Read interactive arguments for strict rewrite command."
+  (let* ((target (org-ai-skills-org-read-rewrite-target))
+         (skill (org-ai-skills-read-skill))
+         (instruction (read-string "Strict rewrite addendum (optional): ")))
+    (list target skill instruction)))
+
+(defun org-ai-skills--interactive-plan-args ()
+  "Read interactive arguments for `org-ai-skills-plan-run'."
   (let* ((target (org-ai-skills-org-read-rewrite-target))
          (task (read-string "Planner task: "
                             nil
@@ -2171,7 +2879,7 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
                             org-ai-skills--last-planner-task)))
     (list target task)))
 
-(defun org-ai-skills--interactive-plan-run-repeat-args ()
+(defun org-ai-skills--interactive-plan-repeat-args ()
   "Read interactive arguments for planner rerun with last task."
   (let ((target (org-ai-skills-org-read-rewrite-target)))
     (list target)))
@@ -2189,13 +2897,14 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
               (list (format "Unknown planner preset: %s" choice))))
     (cons choice task)))
 
-(defun org-ai-skills--interactive-plan-run-preset-args ()
+(defun org-ai-skills--interactive-plan-preset-args ()
   "Read interactive args for preset-based planner run."
   (let* ((target (org-ai-skills-org-read-rewrite-target))
          (preset (org-ai-skills-read-planner-task-preset)))
     (list target (car preset))))
 
-(defun org-ai-skills-org-rewrite-subtree (target skill &optional instruction interactive-origin)
+(defun org-ai-skills-org-rewrite-subtree
+    (target skill &optional instruction interactive-origin constraints)
   "Rewrite Org TARGET subtree at point via gptel using SKILL.
 When TARGET is nil, resolve current subtree."
   (interactive (org-ai-skills--interactive-rewrite-args))
@@ -2203,6 +2912,11 @@ When TARGET is nil, resolve current subtree."
                               (called-interactively-p 'interactive)))
          (subtree (or target (org-ai-skills-org-resolve-subtree 'current)))
          (slot (org-ai-skills--ensure-subtree-slot-id subtree))
+         (effective-constraints
+          (org-ai-skills--merge-rewrite-constraints
+           (org-ai-skills--skill-default-rewrite-constraints
+            (plist-get skill :skill-id))
+           constraints))
          (request nil)
          (buffer (current-buffer))
          (dispatched nil)
@@ -2220,18 +2934,21 @@ When TARGET is nil, resolve current subtree."
            :source-buffer buffer
            :begin begin
            :end end
+           :context-mode (plist-get slot :context-mode)
            :heading (plist-get slot :heading)
            :slot-key (plist-get slot :slot-key)
            :slot-id (plist-get slot :slot-id)
            :skill skill
            :instruction instruction
+           :rewrite-constraints effective-constraints
            :task (or instruction "rewrite")
            :preset-id nil
            :selected-candidate nil
            :stop-requested nil
            :rerun-fn (lambda ()
                        (interactive)
-                       (org-ai-skills-org-rewrite-subtree target skill instruction t))))
+                       (org-ai-skills-org-rewrite-subtree
+                        target skill instruction t effective-constraints))))
     (unwind-protect
         (progn
           (org-ai-skills-apply-skill-function-calls skill)
@@ -2252,6 +2969,9 @@ When TARGET is nil, resolve current subtree."
                                        raw
                                        slot))
                            (candidate nil))
+                       (setq rewritten
+                             (org-ai-skills--enforce-rewrite-constraints
+                              rewritten slot effective-constraints))
                        (setq candidate
                              (org-ai-skills--record-generated-candidate
                               slot
@@ -2270,7 +2990,9 @@ When TARGET is nil, resolve current subtree."
                              (if org-ai-skills-auto-apply-generated-candidate
                                  (progn
                                    (org-ai-skills-org-apply-candidate-to-subtree
-                                    (list :begin begin :end end)
+                                    (list :begin begin
+                                          :end end
+                                          :context-mode (plist-get slot :context-mode))
                                     candidate)
                                    (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
                                      (org-ai-skills--ui-clear-overlay)
@@ -2279,7 +3001,9 @@ When TARGET is nil, resolve current subtree."
                                                 (plist-get slot :slot-key) t)))
                                  (when selected
                                    (org-ai-skills-org-apply-candidate-to-subtree
-                                    (list :begin begin :end end)
+                                    (list :begin begin
+                                          :end end
+                                          :context-mode (plist-get slot :context-mode))
                                     selected))
                                  (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
                                    (org-ai-skills--ui-set-overlay 'ready)
@@ -2297,10 +3021,22 @@ When TARGET is nil, resolve current subtree."
           (org-ai-skills--ui-set-status 'failed "dispatch-failed"))
         (org-ai-skills-exclude-skill-function-calls skill)))))
 
-(defun org-ai-skills-org-plan-and-run-subtree (target task &optional interactive-origin preset-id)
+(defun org-ai-skills-org-rewrite-subtree-strict
+    (target skill &optional instruction interactive-origin)
+  "Rewrite TARGET with strict structure constraints."
+  (interactive (org-ai-skills--interactive-rewrite-strict-args))
+  (org-ai-skills-org-rewrite-subtree
+   target
+   skill
+   (org-ai-skills--strict-rewrite-instruction instruction)
+   interactive-origin
+   '(:preserve-headlines t
+     :omit-property-drawers t)))
+
+(defun org-ai-skills-plan-run (target task &optional interactive-origin preset-id)
   "Run planner-driven rewrite on TARGET subtree using TASK.
 When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-apply flow."
-  (interactive (org-ai-skills--interactive-plan-run-args))
+  (interactive (org-ai-skills--interactive-plan-args))
   (when (string-empty-p (or task ""))
     (signal 'org-ai-skills-planner-error
             (list "Planner task cannot be empty")))
@@ -2324,6 +3060,7 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
            :source-buffer buffer
            :begin begin
            :end end
+           :context-mode (plist-get slot :context-mode)
            :heading (plist-get slot :heading)
            :slot-key (plist-get slot :slot-key)
            :slot-id (plist-get slot :slot-id)
@@ -2335,7 +3072,7 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
            :stop-requested nil
            :rerun-fn (lambda ()
                        (interactive)
-                       (org-ai-skills-org-plan-and-run-subtree target task t preset-id))))
+                       (org-ai-skills-plan-run target task t preset-id))))
     (org-ai-skills-run-task-with-planner
      task
      slot
@@ -2344,13 +3081,16 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
        (if (org-ai-skills--ui-stop-requested-p run-id)
            (org-ai-skills--ui-set-status 'canceled "canceled")
          (let* ((raw (or (plist-get run-state :final-output) ""))
+                (planner-constraints
+                 (org-ai-skills--planner-constraints-for-run-state run-state))
                 (rewritten (org-ai-skills--sanitize-rewrite-output raw slot))
                 (candidate (org-ai-skills--record-generated-candidate
                             slot
                             task
                             "planner"
                             task
-                            rewritten)))
+                            (org-ai-skills--enforce-rewrite-constraints
+                             rewritten slot planner-constraints))))
            (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
              (org-ai-skills--ui-run-set :selected-candidate candidate)
              (org-ai-skills--ui-set-status 'ready "candidate-ready"))
@@ -2363,7 +3103,9 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
                  (if org-ai-skills-auto-apply-generated-candidate
                      (progn
                        (org-ai-skills-org-apply-candidate-to-subtree
-                        (list :begin begin :end end)
+                        (list :begin begin
+                              :end end
+                              :context-mode (plist-get slot :context-mode))
                         candidate)
                        (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
                          (org-ai-skills--ui-clear-overlay)
@@ -2372,7 +3114,9 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
                                     (plist-get slot :slot-key) t)))
                      (when selected
                        (org-ai-skills-org-apply-candidate-to-subtree
-                        (list :begin begin :end end)
+                        (list :begin begin
+                              :end end
+                              :context-mode (plist-get slot :context-mode))
                         selected))
                      (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
                        (org-ai-skills--ui-set-overlay 'ready)
@@ -2384,22 +3128,22 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
                  (org-ai-skills--ui-set-overlay 'ready)
                  (org-ai-skills--ui-set-status 'ready "candidate-ready"))))))))))
 
-(defun org-ai-skills-org-plan-and-run-subtree-repeat-task (target)
+(defun org-ai-skills-plan-repeat-task (target)
   "Run planner-driven rewrite on TARGET using last planner task."
-  (interactive (org-ai-skills--interactive-plan-run-repeat-args))
+  (interactive (org-ai-skills--interactive-plan-repeat-args))
   (when (string-empty-p (or org-ai-skills--last-planner-task ""))
     (signal 'org-ai-skills-planner-error
-            (list "No previous planner task; run org-ai-skills-org-plan-and-run-subtree first")))
-  (org-ai-skills-org-plan-and-run-subtree target org-ai-skills--last-planner-task t nil))
+            (list "No previous planner task; run org-ai-skills-plan-run first")))
+  (org-ai-skills-plan-run target org-ai-skills--last-planner-task t nil))
 
-(defun org-ai-skills-org-plan-and-run-subtree-preset (target preset-id)
+(defun org-ai-skills-plan-run-preset (target preset-id)
   "Run planner-driven rewrite on TARGET using planner task PRESET-ID."
-  (interactive (org-ai-skills--interactive-plan-run-preset-args))
+  (interactive (org-ai-skills--interactive-plan-preset-args))
   (let ((task (cdr (assoc preset-id org-ai-skills-planner-task-presets))))
     (unless (stringp task)
       (signal 'org-ai-skills-planner-error
               (list (format "Unknown planner preset: %s" preset-id))))
-    (org-ai-skills-org-plan-and-run-subtree target task t preset-id)))
+    (org-ai-skills-plan-run target task t preset-id)))
 
 (defmacro org-ai-skills-define-plan-run-preset-command (command-name task &optional docstring)
   "Define COMMAND-NAME to run planner with fixed TASK.
@@ -2407,13 +3151,13 @@ Optional DOCSTRING overrides the generated command documentation."
   `(defun ,command-name (target)
      ,(or docstring (format "Run planner-driven rewrite with fixed task: %s" task))
      (interactive (list (org-ai-skills-org-read-rewrite-target)))
-     (org-ai-skills-org-plan-and-run-subtree target ,task t nil)))
+     (org-ai-skills-plan-run target ,task t nil)))
 
 (defvar org-ai-skills-embark-org-heading-map
   (let ((map (make-sparse-keymap)))
     (define-key map (kbd "R") #'org-ai-skills-embark-rewrite-subtree-action)
-    (define-key map (kbd "P") #'org-ai-skills-embark-plan-and-run-subtree-action)
-    (define-key map (kbd "p") #'org-ai-skills-embark-plan-and-run-subtree-repeat-task-action)
+    (define-key map (kbd "P") #'org-ai-skills-embark-plan-run-action)
+    (define-key map (kbd "p") #'org-ai-skills-embark-plan-repeat-task-action)
     map)
   "Embark keymap for Org heading actions provided by org-ai-skills.")
 
@@ -2422,15 +3166,15 @@ Optional DOCSTRING overrides the generated command documentation."
   (interactive)
   (call-interactively #'org-ai-skills-org-rewrite-subtree))
 
-(defun org-ai-skills-embark-plan-and-run-subtree-action (&optional _target)
-  "Embark action adapter for `org-ai-skills-org-plan-and-run-subtree'."
+(defun org-ai-skills-embark-plan-run-action (&optional _target)
+  "Embark action adapter for `org-ai-skills-plan-run'."
   (interactive)
-  (call-interactively #'org-ai-skills-org-plan-and-run-subtree))
+  (call-interactively #'org-ai-skills-plan-run))
 
-(defun org-ai-skills-embark-plan-and-run-subtree-repeat-task-action (&optional _target)
-  "Embark action adapter for `org-ai-skills-org-plan-and-run-subtree-repeat-task'."
+(defun org-ai-skills-embark-plan-repeat-task-action (&optional _target)
+  "Embark action adapter for `org-ai-skills-plan-repeat-task'."
   (interactive)
-  (call-interactively #'org-ai-skills-org-plan-and-run-subtree-repeat-task))
+  (call-interactively #'org-ai-skills-plan-repeat-task))
 
 (defun org-ai-skills-embark-install-action ()
   "Install org-ai-skills rewrite action into Embark Org heading target map.

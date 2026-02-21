@@ -22,6 +22,18 @@
 (defconst org-ai-skills-test--financial-skill-file
   (expand-file-name "skills/003-daily-financial-news-report.org" org-ai-skills-test--project-root))
 
+(defconst org-ai-skills-test--article-outline-skill-file
+  (expand-file-name "skills/004-article-outline-from-source.org" org-ai-skills-test--project-root))
+
+(defconst org-ai-skills-test--article-compose-skill-file
+  (expand-file-name "skills/005-article-compose-from-outline.org" org-ai-skills-test--project-root))
+
+(defconst org-ai-skills-test--article-repair-skill-file
+  (expand-file-name "skills/006-article-repair-subtree.org" org-ai-skills-test--project-root))
+
+(defconst org-ai-skills-test--article-polish-skill-file
+  (expand-file-name "skills/007-article-polish-editorial.org" org-ai-skills-test--project-root))
+
 (defconst org-ai-skills-test--gptel-dir
   (expand-file-name "~/.emacs.d/straight/repos/gptel/"))
 
@@ -78,6 +90,23 @@
     (should (= (length (plist-get skill :function-definitions)) 1))
     (should (equal (plist-get (car (plist-get skill :function-calls)) :name)
                    "org-ai-skills-search1api-fetch-financial-news-raw"))))
+
+(ert-deftest org-ai-skills-parse-article-workflow-skills-success ()
+  "Article workflow skills should parse with expected IDs."
+  (let ((skills (mapcar #'org-ai-skills-parse-skill-file
+                        (list org-ai-skills-test--article-outline-skill-file
+                              org-ai-skills-test--article-compose-skill-file
+                              org-ai-skills-test--article-repair-skill-file
+                              org-ai-skills-test--article-polish-skill-file))))
+    (should (equal (mapcar (lambda (skill) (plist-get skill :skill-id)) skills)
+                   '("article-outline-from-source"
+                     "article-compose-from-outline"
+                     "article-repair-subtree"
+                     "article-polish-editorial")))
+    (should (equal (plist-get (car (plist-get (car skills) :function-calls)) :name)
+                   "org-ai-skills-read-buffer"))
+    (should (equal (plist-get (car (last (plist-get (nth 2 skills) :function-calls))) :name)
+                   "org-ai-skills-read-file"))))
 
 (ert-deftest org-ai-skills-parse-new-sections-for-context-bundle ()
   "Parser should extract contracts, requirements, and function calls."
@@ -190,6 +219,26 @@
       (should (= (plist-get subtree :levels-up) 1))
       (should (string-prefix-p "** Child" (plist-get subtree :text))))))
 
+(ert-deftest org-ai-skills-org-resolve-subtree-includes-purpose-and-source-path ()
+  "Resolved subtree should carry inherited PURPOSE and SOURCE_FILE_PATH."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Root\n:PROPERTIES:\n:PURPOSE: Explain article strategy\n:SOURCE_FILE_PATH: ./notes/source.md\n:END:\n** Child\nBody.\n")
+    (search-backward "Body.")
+    (let ((subtree (org-ai-skills-org-resolve-subtree 'current)))
+      (should (equal (plist-get subtree :purpose) "Explain article strategy"))
+      (should (equal (plist-get subtree :source-file-path) "./notes/source.md")))))
+
+(ert-deftest org-ai-skills-org-resolve-subtree-falls-back-to-file-keywords ()
+  "Resolved subtree should read PURPOSE and SOURCE_FILE_PATH from file keywords."
+  (with-temp-buffer
+    (org-mode)
+    (insert "#+PURPOSE: File-level purpose\n#+SOURCE_FILE_PATH: ./docs/source.txt\n\n* Child\nBody.\n")
+    (search-backward "Body.")
+    (let ((subtree (org-ai-skills-org-resolve-subtree 'current)))
+      (should (equal (plist-get subtree :purpose) "File-level purpose"))
+      (should (equal (plist-get subtree :source-file-path) "./docs/source.txt")))))
+
 (ert-deftest org-ai-skills-org-resolve-subtree-errors-without-heading ()
   "Subtree resolution should fail when point is before first heading."
   (with-temp-buffer
@@ -214,6 +263,8 @@
          (subtree '(:heading "Leaf"
                     :level 3
                     :path "Top/Child/Leaf"
+                    :purpose "Explain details"
+                    :source-file-path "./notes/source.md"
                     :text "*** Leaf\nBody\n"
                     :context-mode current
                     :levels-up 0))
@@ -228,8 +279,89 @@
                    "gen-notes"))
     (should (string-match-p "Rewrite with concise style"
                             (plist-get request :prompt)))
+    (should (string-match-p "Source file path: ./notes/source.md"
+                            (plist-get request :prompt)))
+    (should (equal (plist-get request :source-file-path) "./notes/source.md"))
     (should (string-match-p "\\*\\*\\* Leaf"
                             (plist-get request :prompt)))))
+
+(ert-deftest org-ai-skills-build-gptel-rewrite-request-compose-enforces-outline-lock ()
+  "Compose skill rewrite request should include strict outline constraints."
+  (let* ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--article-compose-skill-file))
+         (subtree '(:heading "Draft"
+                    :level 1
+                    :path "Draft"
+                    :purpose "Compose article"
+                    :source-file-path "./notes/source.md"
+                    :text "* Draft\n** A\n:PURPOSE: p\n:END:\n"
+                    :context-mode current
+                    :levels-up 0))
+         (request (org-ai-skills-build-gptel-rewrite-request skill subtree "Compose")))
+    (should (plist-get request :rewrite-constraints))
+    (should (plist-get (plist-get request :rewrite-constraints) :preserve-headlines))
+    (should (plist-get (plist-get request :rewrite-constraints) :omit-property-drawers))
+    (should (string-match-p "Keep every headline line unchanged"
+                            (plist-get request :prompt)))
+    (should (string-match-p "Outline summary (compact context)"
+                            (plist-get request :prompt)))))
+
+(ert-deftest org-ai-skills-build-step-request-compose-uses-compact-context ()
+  "Planner step request for compose skill should use compact outline context."
+  (let* ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--article-compose-skill-file))
+         (step '(:step-id "s1" :goal "compose" :skills ("article-compose-from-outline")))
+         (run-state '(:task "compose article"
+                     :subtree (:text "* Root\n** A\n:PURPOSE: x\n:END:\n")))
+         (request (org-ai-skills-build-step-request step run-state (list skill))))
+    (should (string-match-p "Outline summary (compact context)"
+                            (plist-get request :prompt)))
+    (should (string-match-p "Strict compose constraints"
+                            (plist-get request :prompt)))))
+
+(ert-deftest org-ai-skills-core-read-tools-enabled-by-default ()
+  "Core read tools should be included in tool-call surface by default."
+  (let* ((calls (org-ai-skills--request-function-calls '()))
+         (names (mapcar (lambda (entry) (plist-get entry :name)) calls)))
+    (should (member "org-ai-skills-read-buffer" names))
+    (should (member "org-ai-skills-read-file" names))))
+
+(ert-deftest org-ai-skills-core-read-tools-can-be-disabled ()
+  "Core read tools should be omitted when feature flag is nil."
+  (let ((org-ai-skills-enable-core-read-tools nil))
+    (should-not (org-ai-skills--request-function-calls '()))))
+
+(ert-deftest org-ai-skills-read-file-respects-max-chars ()
+  "File read helper should truncate content by max char budget."
+  (let ((file (make-temp-file "org-ai-skills-read-file-")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "abcdef"))
+          (should (equal (org-ai-skills-read-file file 3) "abc"))
+          (should (equal (org-ai-skills-read-file file "4") "abcd")))
+      (delete-file file))))
+
+(ert-deftest org-ai-skills-read-file-supports-relative-source-path ()
+  "File read helper should resolve project-relative source paths."
+  (let* ((dir (make-temp-file "org-ai-skills-source-rel-" t))
+         (file (expand-file-name "source.md" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "relative source content"))
+          (let ((default-directory dir))
+            (should (equal (org-ai-skills-read-file "./source.md")
+                           "relative source content"))))
+      (delete-directory dir t))))
+
+(ert-deftest org-ai-skills-read-buffer-supports-range-and-buffer-name ()
+  "Buffer read helper should support named buffer and start/end slicing."
+  (let ((buf (generate-new-buffer "*org-ai-skills-read-buffer*")))
+    (unwind-protect
+        (with-current-buffer buf
+          (insert "0123456789")
+          (should (equal (org-ai-skills-read-buffer (buffer-name buf) 3 7)
+                         "2345")))
+      (kill-buffer buf))))
 
 (ert-deftest org-ai-skills-function-calls-available-only-when-skill-applied ()
   "Function calls should be available only while skill is active."
@@ -480,19 +612,22 @@
     (kill-buffer org-ai-skills-debug-buffer-name)))
 
 (ert-deftest org-ai-skills-org-context-candidates-show-path-preview ()
-  "Rewrite target candidates should include current and ancestor path previews."
+  "Rewrite target candidates should include buffer/current/ancestor previews."
   (with-temp-buffer
     (org-mode)
     (insert "* Top\n** Child\n*** Leaf\nLeaf body.\n")
     (search-backward "Leaf body.")
     (let ((candidates (org-ai-skills-org-collect-context-candidates)))
-      (should (= (length candidates) 3))
-      (should (string-match-p "\\[current\\] Top/Child/Leaf"
+      (should (= (length candidates) 4))
+      (should (string-match-p "\\[buffer\\]"
                               (car (nth 0 candidates))))
-      (should (string-match-p "\\[up:1\\] Top/Child"
+      (should (string-match-p "\\[current\\] Top/Child/Leaf"
                               (car (nth 1 candidates))))
-      (should (equal (plist-get (cdr (nth 0 candidates)) :heading) "Leaf"))
-      (should (equal (plist-get (cdr (nth 1 candidates)) :heading) "Child")))))
+      (should (string-match-p "\\[up:1\\] Top/Child"
+                              (car (nth 2 candidates))))
+      (should (eq (plist-get (cdr (nth 0 candidates)) :context-mode) 'buffer))
+      (should (equal (plist-get (cdr (nth 1 candidates)) :heading) "Leaf"))
+      (should (equal (plist-get (cdr (nth 2 candidates)) :heading) "Child")))))
 
 (ert-deftest org-ai-skills-org-read-rewrite-target-uses-selected-preview ()
   "Selected preview candidate should resolve to expected target subtree."
@@ -502,11 +637,33 @@
     (search-backward "Leaf body.")
     (cl-letf (((symbol-function 'completing-read)
                (lambda (_prompt collection &rest _rest)
-                 (nth 1 collection))))
+                 (nth 2 collection))))
       (let ((target (org-ai-skills-org-read-rewrite-target)))
         (should (equal (plist-get target :heading) "Child"))
         (should (eq (plist-get target :context-mode) 'upper-level))
         (should (= (plist-get target :levels-up) 1))))))
+
+(ert-deftest org-ai-skills-org-collect-context-candidates-allows-buffer-without-heading ()
+  "Scope picker should still provide buffer target before first heading."
+  (with-temp-buffer
+    (org-mode)
+    (insert "Title only\nNo headings yet.\n")
+    (goto-char (point-min))
+    (let ((candidates (org-ai-skills-org-collect-context-candidates)))
+      (should (= (length candidates) 1))
+      (should (eq (plist-get (cdar candidates) :context-mode) 'buffer)))))
+
+(ert-deftest org-ai-skills-org-collect-context-candidates-buffer-uses-file-keywords ()
+  "Buffer scope candidate should include file-level PURPOSE and SOURCE_FILE_PATH."
+  (with-temp-buffer
+    (org-mode)
+    (insert "#+PURPOSE: Whole-file purpose\n#+SOURCE_FILE_PATH: ./notes/file.md\n\nPlain text.\n")
+    (goto-char (point-min))
+    (let* ((candidates (org-ai-skills-org-collect-context-candidates))
+           (buffer-scope (cdar candidates)))
+      (should (eq (plist-get buffer-scope :context-mode) 'buffer))
+      (should (equal (plist-get buffer-scope :purpose) "Whole-file purpose"))
+      (should (equal (plist-get buffer-scope :source-file-path) "./notes/file.md")))))
 
 (ert-deftest org-ai-skills-sanitize-rewrite-output-fixes-level-and-preface ()
   "Sanitizer should remove explanation preface and enforce target level."
@@ -516,6 +673,48 @@
     (should-not (string-match-p "Here is the rewrite" cleaned))
     (should (string-prefix-p "** Child Revised" cleaned))
     (should (string-match-p "^\\*\\*\\* Sub$" cleaned))))
+
+(ert-deftest org-ai-skills-strip-property-drawers-from-text-removes-drawers ()
+  "Property drawer stripping helper should remove all drawer blocks."
+  (let* ((raw "* H\n:PROPERTIES:\n:K: V\n:END:\nBody\n")
+         (cleaned (org-ai-skills--strip-property-drawers-from-text raw)))
+    (should-not (string-match-p ":PROPERTIES:" cleaned))
+    (should (string-match-p "^\\* H$" cleaned))
+    (should (string-match-p "Body" cleaned))))
+
+(ert-deftest org-ai-skills-strip-indented-property-drawers-only-removes-indented ()
+  "Indented pseudo drawers should be removed while canonical drawers remain."
+  (let* ((raw "* H\n:PROPERTIES:\n:ID: keep\n:END:\n\n  :PROPERTIES:\n  :PURPOSE: bad\n  :END:\n")
+         (cleaned (org-ai-skills--strip-indented-property-drawers-from-text raw)))
+    (should (string-match-p "^:PROPERTIES:$" cleaned))
+    (should-not (string-match-p "^  :PROPERTIES:$" cleaned))))
+
+(ert-deftest org-ai-skills-enforce-rewrite-constraints-rejects-heading-change ()
+  "Strict constraints should reject rewritten content with heading changes."
+  (let ((subtree '(:context-mode current
+                   :text "* Root\n** A\nText\n** B\nText\n")))
+    (should-error
+     (org-ai-skills--enforce-rewrite-constraints
+      "* Root\n** A-Changed\nText\n** B\nText\n"
+      subtree
+      '(:preserve-headlines t))
+     :type 'org-ai-skills-org-context-error)))
+
+(ert-deftest org-ai-skills-rewrite-subtree-strict-builds-guarded-request ()
+  "Strict rewrite command should forward heading-lock/drawer constraints."
+  (let ((captured nil))
+    (cl-letf (((symbol-function 'org-ai-skills-org-rewrite-subtree)
+               (lambda (target skill instruction interactive-origin constraints)
+                 (setq captured (list target skill instruction interactive-origin constraints)))))
+      (org-ai-skills-org-rewrite-subtree-strict
+       '(:begin 1 :end 2 :context-mode current)
+       '(:skill-id "x")
+       "Focus tone"
+       t))
+    (should (plist-get (nth 4 captured) :preserve-headlines))
+    (should (plist-get (nth 4 captured) :omit-property-drawers))
+    (should (string-match-p "Strict constraints:" (nth 2 captured)))
+    (should (string-match-p "Focus tone" (nth 2 captured)))))
 
 (ert-deftest org-ai-skills-ensure-subtree-slot-id-writes-id-property ()
   "Slot identity helper should auto-generate and write back :ID:."
@@ -529,6 +728,357 @@
       (goto-char (point-min))
       (should (string= (org-entry-get (point) "ID")
                        (plist-get slot :slot-id))))))
+
+(ert-deftest org-ai-skills-ensure-subtree-slot-id-uses-stable-buffer-slot-for-buffer-scope ()
+  "Buffer-scope target should use stable slot id without Org heading mutation."
+  (with-temp-buffer
+    (org-mode)
+    (insert "#+TITLE: Draft\nBody\n")
+    (let* ((slot (org-ai-skills--ensure-subtree-slot-id
+                  (list :begin (point-min)
+                        :end (point-max)
+                        :context-mode 'buffer))))
+      (should (equal (plist-get slot :slot-id) "buffer-root"))
+      (should (string-match-p "|buffer-root$" (plist-get slot :slot-key))))))
+
+(ert-deftest org-ai-skills-ensure-subtree-slot-id-prefers-marker-buffer-over-current-buffer ()
+  "Slot id/file should be derived from target marker buffer, not control buffer."
+  (let ((source (generate-new-buffer " *org-ai-source*"))
+        (control (generate-new-buffer " *org-ai-control*")))
+    (unwind-protect
+        (with-current-buffer source
+          (org-mode)
+          (insert "* Root\n** Leaf\nBody\n")
+          (goto-char (point-min))
+          (re-search-forward "^\\*\\* Leaf$")
+          (beginning-of-line)
+          (let* ((begin (copy-marker (point)))
+                 (end (save-excursion
+                        (org-end-of-subtree t t)
+                        (copy-marker (point))))
+                 (subtree (list :begin begin
+                                :end end
+                                :context-mode 'current))
+                 slot)
+            (with-current-buffer control
+              (setq slot (org-ai-skills--ensure-subtree-slot-id subtree)))
+            (should (string-match-p
+                     "buffer: \\*org-ai-source\\*\\|buffer:\\*org-ai-source\\*"
+                     (plist-get slot :slot-file)))))
+      (when (buffer-live-p source)
+        (kill-buffer source))
+      (when (buffer-live-p control)
+        (kill-buffer control)))))
+
+(ert-deftest org-ai-skills-org-apply-rewrite-result-buffer-scope-preserves-front-matter ()
+  "Buffer scope apply should keep existing file front matter and replace body."
+  (with-temp-buffer
+    (org-mode)
+    (insert "#+TITLE: Old\n#+FILETAGS: :blog:\n#+PURPOSE: Draft\n\n* A\nOld body.\n")
+    (org-ai-skills-org-apply-rewrite-result
+     (list :begin (point-min)
+           :end (point-max)
+           :context-mode 'buffer)
+     "#+TITLE: New\n#+FILETAGS: :new:\n\n* A\nNew body.\n")
+    (should (string= (buffer-string)
+                     "#+TITLE: Old\n#+FILETAGS: :blog:\n#+PURPOSE: Draft\n\n* A\nNew body.\n"))))
+
+(ert-deftest org-ai-skills-org-apply-rewrite-result-buffer-scope-replaces-when-no-front-matter ()
+  "Buffer scope apply should fully replace content when no front matter exists."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* A\nOld body.\n")
+    (org-ai-skills-org-apply-rewrite-result
+     (list :begin (point-min)
+           :end (point-max)
+           :context-mode 'buffer)
+     "* A\nNew body.\n")
+    (should (string= (buffer-string) "* A\nNew body.\n"))))
+
+(ert-deftest org-ai-skills-org-apply-rewrite-result-buffer-scope-preserves-subheading-properties ()
+  "Buffer scope apply should retain PURPOSE/SOURCE_FILE_PATH on nested headings."
+  (with-temp-buffer
+    (org-mode)
+    (insert "#+TITLE: Draft\n#+PURPOSE: File purpose\n\n"
+            "* Root\n"
+            ":PROPERTIES:\n"
+            ":PURPOSE: Root purpose\n"
+            ":END:\n"
+            "** A\n"
+            ":PROPERTIES:\n"
+            ":PURPOSE: A purpose\n"
+            ":END:\n"
+            "** B\n"
+            ":PROPERTIES:\n"
+            ":PURPOSE: B purpose\n"
+            ":SOURCE_FILE_PATH: /tmp/b.md\n"
+            ":END:\n")
+    (org-ai-skills-org-apply-rewrite-result
+     (list :begin (point-min)
+           :end (point-max)
+           :context-mode 'buffer)
+     "#+TITLE: Draft 2\n\n* Root Changed\n** A changed\nBody A\n** B changed\nBody B\n")
+    (goto-char (point-min))
+    (re-search-forward "^\\*\\* A changed$")
+    (should (string= (org-entry-get (point) "PURPOSE" nil) "A purpose"))
+    (re-search-forward "^\\*\\* B changed$")
+    (should (string= (org-entry-get (point) "PURPOSE" nil) "B purpose"))
+    (should (string= (org-entry-get (point) "SOURCE_FILE_PATH" nil) "/tmp/b.md"))))
+
+(ert-deftest org-ai-skills-ui-apply-selected-candidate-preserves-buffer-context-mode ()
+  "UI apply should forward buffer context to avoid heading-only apply path."
+  (let ((applied-subtree nil))
+    (cl-letf (((symbol-function 'org-ai-skills-org-apply-candidate-to-subtree)
+               (lambda (subtree _candidate)
+                 (setq applied-subtree subtree)))
+              ((symbol-function 'org-ai-skills-ui-select-candidate)
+               (lambda ()
+                 '(:slot-key "k" :candidate-id "c1" :output-text "x")))
+              ((symbol-function 'org-ai-skills--ui-clear-overlay)
+               (lambda () nil))
+              ((symbol-function 'org-ai-skills--ui-set-status)
+               (lambda (_status _progress) nil)))
+      (let ((org-ai-skills--ui-run-state
+             (list :status 'ready
+                   :begin 1
+                   :end 10
+                   :context-mode 'buffer
+                   :selected-candidate nil)))
+        (org-ai-skills-ui-apply-selected-candidate)))
+    (should (eq (plist-get applied-subtree :context-mode) 'buffer))))
+
+(ert-deftest org-ai-skills-ui-apply-selected-candidate-runs-in-source-buffer ()
+  "Control-panel apply should update source buffer rather than control buffer."
+  (with-temp-buffer
+    (org-mode)
+    (insert "#+TITLE: Draft\nOld\n")
+    (let ((source-buffer (current-buffer))
+          (begin (copy-marker (point-min)))
+          (end (copy-marker (point-max)))
+          (org-ai-skills--ui-run-state nil))
+      (with-temp-buffer
+        (setq org-ai-skills--ui-run-state
+              (list :status 'ready
+                    :begin begin
+                    :end end
+                    :context-mode 'buffer
+                    :source-buffer source-buffer
+                    :selected-candidate
+                    '(:slot-key "k" :candidate-id "c1" :output-text "#+TITLE: Draft\nNew\n")))
+        (cl-letf (((symbol-function 'org-ai-skills--ui-clear-overlay)
+                   (lambda () nil))
+                  ((symbol-function 'org-ai-skills--ui-set-status)
+                   (lambda (_status _progress) nil))
+                  ((symbol-function 'org-ai-skills--update-candidate-status)
+                   (lambda (_slot-key _candidate-id _status) nil)))
+          (org-ai-skills-ui-apply-selected-candidate)))
+      (with-current-buffer source-buffer
+        (should (string= (buffer-string) "#+TITLE: Draft\n\nNew\n"))))))
+
+(ert-deftest org-ai-skills-ui-current-target-reconstructs-from-ui-state ()
+  "When stored target is absent, UI should reconstruct scope from run state."
+  (let* ((org-ai-skills--ui-run-state
+          (list :target nil
+                :begin 1
+                :end 10
+                :context-mode 'buffer
+                :heading "Demo"))
+         (target (org-ai-skills--ui-current-target)))
+    (should (equal (plist-get target :begin) 1))
+    (should (equal (plist-get target :end) 10))
+    (should (eq (plist-get target :context-mode) 'buffer))
+    (should (equal (plist-get target :heading) "Demo"))))
+
+(ert-deftest org-ai-skills-ui-current-target-infers-buffer-from-slot-id ()
+  "UI target reconstruction should infer buffer context from slot id."
+  (with-temp-buffer
+    (org-mode)
+    (insert "#+TITLE: Draft\nBody\n")
+    (let* ((org-ai-skills--ui-run-state
+            (list :target nil
+                  :begin (copy-marker (point-min))
+                  :end (copy-marker (point-max))
+                  :context-mode nil
+                  :slot-id "buffer-root"
+                  :heading "Draft"))
+           (target (org-ai-skills--ui-current-target)))
+      (should (eq (plist-get target :context-mode) 'buffer)))))
+
+(ert-deftest org-ai-skills-plan-run-buffer-scope-auto-apply-preserves-context-mode ()
+  "Planner auto-apply should keep buffer context mode in apply path."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t))
+        (applied-subtree nil))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir)
+              (org-ai-skills-auto-apply-generated-candidate t))
+          (with-temp-buffer
+            (org-mode)
+            (insert "#+TITLE: Draft\nBody\n")
+            (let ((target (list :begin (point-min)
+                                :end (point-max)
+                                :context-mode 'buffer
+                                :heading (buffer-name)
+                                :path (buffer-name)
+                                :text (buffer-string))))
+              (cl-letf (((symbol-function 'org-ai-skills-run-task-with-planner)
+                         (lambda (_task _slot _options callback)
+                           (funcall callback '(:final-output "#+TITLE: Draft\nUpdated\n"))))
+                        ((symbol-function 'org-ai-skills-org-apply-candidate-to-subtree)
+                         (lambda (subtree _candidate)
+                           (setq applied-subtree subtree))))
+                (org-ai-skills-plan-run target "outline" t nil))))
+          (should (eq (plist-get applied-subtree :context-mode) 'buffer)))
+      (delete-directory store-dir t))))
+
+(ert-deftest org-ai-skills-planner-constraints-follow-last-step-skill ()
+  "Planner constraints should be derived from final completed step only."
+  (should (equal (org-ai-skills--planner-constraints-for-run-state
+                  '(:steps ((:skills ("gen-notes"))
+                            (:skills ("article-compose-from-outline")))))
+                 '(:preserve-headlines t :omit-property-drawers t)))
+  (should-not (org-ai-skills--planner-constraints-for-run-state
+               '(:steps ((:skills ("article-compose-from-outline"))
+                         (:skills ("article-polish-editorial")))))))
+
+(ert-deftest org-ai-skills-org-apply-rewrite-result-subtree-scope-keeps-siblings ()
+  "Subtree apply should not modify sibling subtree content."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Root\n** A\nOld A.\n** B\nKeep B.\n")
+    (goto-char (point-min))
+    (re-search-forward "^\\*\\* A$")
+    (let ((target (org-ai-skills-org-resolve-subtree 'current)))
+      (org-ai-skills-org-apply-rewrite-result target "** A\nNew A.\n"))
+    (goto-char (point-min))
+    (should (re-search-forward "New A\\." nil t))
+    (should (re-search-forward "^\\*\\* B\nKeep B\\.$" nil t))))
+
+(ert-deftest org-ai-skills-org-apply-rewrite-result-subtree-preserves-purpose-and-source-path ()
+  "Subtree apply should preserve PURPOSE/SOURCE_FILE_PATH on matching child headings."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Root\n"
+            ":PROPERTIES:\n"
+            ":PURPOSE: Root purpose\n"
+            ":END:\n"
+            "** Intro\n"
+            ":PROPERTIES:\n"
+            ":PURPOSE: Intro purpose\n"
+            ":SOURCE_FILE_PATH: /tmp/source.md\n"
+            ":END:\n"
+            "Old intro.\n"
+            "** Body\n"
+            ":PROPERTIES:\n"
+            ":PURPOSE: Body purpose\n"
+            ":END:\n"
+            "Old body.\n")
+    (goto-char (point-min))
+    (let ((target (org-ai-skills-org-resolve-subtree 'current)))
+      (org-ai-skills-org-apply-rewrite-result
+       target
+       "* Root\n** Intro\nNew intro.\n** Body\nNew body.\n"))
+    (goto-char (point-min))
+    (re-search-forward "^\\*\\* Intro$")
+    (should (string= (org-entry-get (point) "PURPOSE" nil) "Intro purpose"))
+    (should (string= (org-entry-get (point) "SOURCE_FILE_PATH" nil) "/tmp/source.md"))
+    (re-search-forward "^\\*\\* Body$")
+    (should (string= (org-entry-get (point) "PURPOSE" nil) "Body purpose"))))
+
+(ert-deftest org-ai-skills-org-apply-rewrite-result-removes-indented-pseudo-drawers ()
+  "Subtree apply should drop indented pseudo drawers to avoid duplicate drawers."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Root\n** Sec\n:PROPERTIES:\n:PURPOSE: keep me\n:END:\nOld.\n")
+    (goto-char (point-min))
+    (let ((target (org-ai-skills-org-resolve-subtree 'current)))
+      (org-ai-skills-org-apply-rewrite-result
+       target
+       "* Root\n** Sec\n\n     :PROPERTIES:\n     :PURPOSE: model\n     :END:\nNew.\n"))
+    (goto-char (point-min))
+    (re-search-forward "^\\*\\* Sec$")
+    (should (string= (org-entry-get (point) "PURPOSE" nil) "keep me"))
+    (should (= 0 (how-many "^[ \t]+:PROPERTIES:[ \t]*$" (point-min) (point-max))))))
+
+(ert-deftest org-ai-skills-org-apply-rewrite-result-subtree-assigns-heading-ids ()
+  "Subtree apply should ensure resulting headings have :ID:."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Root\n** Intro\nOld intro.\n** Body\nOld body.\n")
+    (goto-char (point-min))
+    (let ((target (org-ai-skills-org-resolve-subtree 'current)))
+      (org-ai-skills-org-apply-rewrite-result
+       target
+       "* Root\n** Intro\nNew intro.\n** Body\nNew body.\n"))
+    (goto-char (point-min))
+    (re-search-forward "^\\* Root$")
+    (should (stringp (org-entry-get (point) "ID" nil)))
+    (re-search-forward "^\\*\\* Intro$")
+    (should (stringp (org-entry-get (point) "ID" nil)))
+    (re-search-forward "^\\*\\* Body$")
+    (should (stringp (org-entry-get (point) "ID" nil)))))
+
+(ert-deftest org-ai-skills-org-apply-rewrite-result-subtree-preserves-properties-on-renamed-headings ()
+  "Subtree apply should preserve key properties when child headings are renamed."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Root\n"
+            "** Intro\n"
+            ":PROPERTIES:\n"
+            ":PURPOSE: Intro purpose\n"
+            ":SOURCE_FILE_PATH: /tmp/source.md\n"
+            ":END:\n"
+            "Old intro.\n"
+            "** Body\n"
+            ":PROPERTIES:\n"
+            ":PURPOSE: Body purpose\n"
+            ":END:\n"
+            "Old body.\n")
+    (goto-char (point-min))
+    (let ((target (org-ai-skills-org-resolve-subtree 'current)))
+      (org-ai-skills-org-apply-rewrite-result
+       target
+       "* Root\n** Introduction\nNew intro.\n** Main Body\nNew body.\n"))
+    (goto-char (point-min))
+    (re-search-forward "^\\*\\* Introduction$")
+    (should (string= (org-entry-get (point) "PURPOSE" nil) "Intro purpose"))
+    (should (string= (org-entry-get (point) "SOURCE_FILE_PATH" nil) "/tmp/source.md"))
+    (re-search-forward "^\\*\\* Main Body$")
+    (should (string= (org-entry-get (point) "PURPOSE" nil) "Body purpose"))))
+
+(ert-deftest org-ai-skills-org-apply-rewrite-result-subtree-preserves-later-sibling-properties ()
+  "Subtree apply should keep 2nd/3rd sibling properties despite inserted first sibling."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Root\n"
+            "** Alpha\n"
+            ":PROPERTIES:\n"
+            ":PURPOSE: Alpha purpose\n"
+            ":END:\n"
+            "A\n"
+            "** Beta\n"
+            ":PROPERTIES:\n"
+            ":PURPOSE: Beta purpose\n"
+            ":SOURCE_FILE_PATH: /tmp/beta.md\n"
+            ":END:\n"
+            "B\n"
+            "** Gamma\n"
+            ":PROPERTIES:\n"
+            ":PURPOSE: Gamma purpose\n"
+            ":SOURCE_FILE_PATH: /tmp/gamma.md\n"
+            ":END:\n"
+            "C\n")
+    (goto-char (point-min))
+    (let ((target (org-ai-skills-org-resolve-subtree 'current)))
+      (org-ai-skills-org-apply-rewrite-result
+       target
+       "* Root\n** Overview\nIntro\n** Beta Updated\nB2\n** Gamma Updated\nC2\n"))
+    (goto-char (point-min))
+    (re-search-forward "^\\*\\* Beta Updated$")
+    (should (string= (org-entry-get (point) "PURPOSE" nil) "Beta purpose"))
+    (should (string= (org-entry-get (point) "SOURCE_FILE_PATH" nil) "/tmp/beta.md"))
+    (re-search-forward "^\\*\\* Gamma Updated$")
+    (should (string= (org-entry-get (point) "PURPOSE" nil) "Gamma purpose"))
+    (should (string= (org-entry-get (point) "SOURCE_FILE_PATH" nil) "/tmp/gamma.md"))))
 
 (ert-deftest org-ai-skills-candidate-persistence-roundtrip-and-status-update ()
   "Candidate store should persist and allow applied-status updates."
@@ -851,10 +1401,10 @@
     (cl-letf (((symbol-function 'call-interactively)
                (lambda (command &optional _record-flag _keys)
                  (push command calls))))
-      (org-ai-skills-embark-plan-and-run-subtree-action "target")
-      (org-ai-skills-embark-plan-and-run-subtree-repeat-task-action "target"))
-    (should (member #'org-ai-skills-org-plan-and-run-subtree calls))
-    (should (member #'org-ai-skills-org-plan-and-run-subtree-repeat-task calls))))
+      (org-ai-skills-embark-plan-run-action "target")
+      (org-ai-skills-embark-plan-repeat-task-action "target"))
+    (should (member #'org-ai-skills-plan-run calls))
+    (should (member #'org-ai-skills-plan-repeat-task calls))))
 
 (ert-deftest org-ai-skills-plan-and-run-caches-last-task ()
   "Planner command should persist last task for reuse helper."
@@ -863,7 +1413,7 @@
     (cl-letf (((symbol-function 'org-ai-skills-run-task-with-planner)
                (lambda (task _subtree _options _callback)
                  (setq received-task task))))
-      (org-ai-skills-org-plan-and-run-subtree
+      (org-ai-skills-plan-run
        '(:heading "Leaf" :level 3 :text "*** Leaf\n")
        "Normalize and shorten"))
     (should (string= received-task "Normalize and shorten"))
@@ -889,11 +1439,11 @@
             (should (eq (lookup-key (symbol-value
                                      (cdr (assq 'org-heading embark-keymap-alist)))
                                     (kbd "P"))
-                        #'org-ai-skills-embark-plan-and-run-subtree-action))
+                        #'org-ai-skills-embark-plan-run-action))
             (should (eq (lookup-key (symbol-value
                                      (cdr (assq 'org-heading embark-keymap-alist)))
                                     (kbd "p"))
-                        #'org-ai-skills-embark-plan-and-run-subtree-repeat-task-action))))
+                        #'org-ai-skills-embark-plan-repeat-task-action))))
       (if had-bound
           (set 'embark-keymap-alist old-value)
         (makunbound 'embark-keymap-alist)))))
@@ -902,7 +1452,7 @@
   "Planner repeat helper should fail when no prior task exists."
   (let ((org-ai-skills--last-planner-task nil))
     (should-error
-     (org-ai-skills-org-plan-and-run-subtree-repeat-task '(:heading "Leaf"))
+     (org-ai-skills-plan-repeat-task '(:heading "Leaf"))
      :type 'org-ai-skills-planner-error)))
 
 (ert-deftest org-ai-skills-plan-repeat-reuses-last-task ()
@@ -911,13 +1461,13 @@
         called-target
         called-task
         called-origin)
-    (cl-letf (((symbol-function 'org-ai-skills-org-plan-and-run-subtree)
+    (cl-letf (((symbol-function 'org-ai-skills-plan-run)
                (lambda (target task &optional interactive-origin preset-id)
                  (setq called-target target)
                  (setq called-task task)
                  (setq called-origin interactive-origin)
                  (setq org-ai-skills-test--captured-preset preset-id))))
-      (org-ai-skills-org-plan-and-run-subtree-repeat-task '(:heading "Leaf")))
+      (org-ai-skills-plan-repeat-task '(:heading "Leaf")))
     (should (equal called-target '(:heading "Leaf")))
     (should (string= called-task "Refine notes"))
     (should called-origin)))
@@ -932,17 +1482,41 @@
   "Preset planner command should map preset id to task text."
   (let ((org-ai-skills-planner-task-presets
          '(("notes" . "Convert to concise notes"))))
-    (cl-letf (((symbol-function 'org-ai-skills-org-plan-and-run-subtree)
+    (cl-letf (((symbol-function 'org-ai-skills-plan-run)
                (lambda (target task &optional interactive-origin preset-id)
                  (setq org-ai-skills-test--captured-target target)
                  (setq org-ai-skills-test--captured-task task)
                  (setq org-ai-skills-test--captured-origin interactive-origin)
                  (setq org-ai-skills-test--captured-preset preset-id))))
-      (org-ai-skills-org-plan-and-run-subtree-preset '(:heading "Leaf") "notes")
+      (org-ai-skills-plan-run-preset '(:heading "Leaf") "notes")
       (should (equal org-ai-skills-test--captured-target '(:heading "Leaf")))
       (should (string= org-ai-skills-test--captured-task "Convert to concise notes"))
       (should org-ai-skills-test--captured-origin)
       (should (string= org-ai-skills-test--captured-preset "notes")))))
+
+(ert-deftest org-ai-skills-build-step-request-includes-source-path-for-stage-routing ()
+  "Planner step request should include source path for stage-grounded execution."
+  (let* ((step '(:step-id "s1"
+                :goal "compose draft"
+                :skills ("article-compose-from-outline")
+                :expected-output "draft"))
+         (run-state '(:task "compose"
+                     :subtree (:text "* Article\nBody\n"
+                               :source-file-path "./notes/source.md")
+                     :latest-output nil))
+         (skill '(:skill-id "article-compose-from-outline"
+                 :title "Compose"
+                 :description "Compose article sections."
+                 :outputs ("expanded-org-article-subtree")
+                 :contracts ("respect :PURPOSE:")
+                 :requirements ("preserve structure")
+                 :tags (:effect "pure" :invocation "manual" :context "project" :determinism "heuristic")
+                 :raw-sections (:description "Compose article sections.")
+                 :function-calls nil))
+         (request (org-ai-skills-build-step-request step run-state (list skill))))
+    (should (equal (plist-get request :source-file-path) "./notes/source.md"))
+    (should (string-match-p "Source file path: \\./notes/source\\.md"
+                            (plist-get request :prompt)))))
 
 (ert-deftest org-ai-skills-define-plan-run-preset-command-uses-fixed-task ()
   "Generated preset command should invoke planner with fixed task."
@@ -955,7 +1529,7 @@
      org-ai-skills-test--fixed-task-command
      "Turn subtree into action items")
     (unwind-protect
-        (cl-letf (((symbol-function 'org-ai-skills-org-plan-and-run-subtree)
+        (cl-letf (((symbol-function 'org-ai-skills-plan-run)
                    (lambda (target task &optional interactive-origin preset-id)
                      (setq captured-target target)
                      (setq captured-task task)
@@ -1055,9 +1629,11 @@
         (malformed "{\"candidates\":[],\"plan\":["))
     (cl-letf (((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
                (lambda (_request callback)
-                 (funcall callback malformed '(:data (:payload t)))))
-              ((symbol-function 'org-ai-skills--extract-gptel-response-text)
-               (lambda (&rest response) (car response))))
+                 (funcall callback malformed '(:data (:payload t)))
+                 (funcall callback t '(:data (:done t)))))
+              ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
+               (lambda (&rest response)
+                 (car response))))
       (should-error
        (org-ai-skills--request-planner-plan
         "task"
@@ -1081,6 +1657,27 @@
                    (if (and (consp first) (eq (car first) 'reasoning))
                        nil
                      first)))))
+      (org-ai-skills--request-planner-plan
+       "task"
+       metadata
+       '(:task "task" :steps nil :plan-revision 1)
+       (lambda (parsed) (setq callback-result parsed))))
+    (should (listp callback-result))
+    (should (= (length (plist-get callback-result :plan)) 1))))
+
+(ert-deftest org-ai-skills-request-planner-plan-accumulates-chunked-json ()
+  "Planner request should accumulate chunked text before JSON parse."
+  (let ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
+        (chunk-1 "{\"candidates\":[{\"skill_id\":\"gen-notes\"")
+        (chunk-2 ",\"why\":\"fit\",\"score\":0.9}],\"plan\":[{\"step_id\":\"s1\",\"goal\":\"g\",\"skills\":[\"gen-notes\"],\"input_from\":[\"task\"],\"expected_output\":\"o\",\"composition_reason\":\"r\"}],\"replan_signal\":{\"enabled\":false,\"condition\":\"\"}}")
+        callback-result)
+    (cl-letf (((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback chunk-1 '(:data (:payload t)))
+                 (funcall callback chunk-2 '(:data (:payload t)))))
+              ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
+               (lambda (&rest response)
+                 (car response))))
       (org-ai-skills--request-planner-plan
        "task"
        metadata
@@ -1209,6 +1806,7 @@
 (ert-deftest org-ai-skills-gptel-dispatch-registers-request-tools ()
   "Dispatch should register request-scoped function calls as gptel tools."
   (let ((org-ai-skills-debug-enabled nil)
+        (org-ai-skills-enable-core-read-tools nil)
         (gptel-use-tools nil)
         (gptel-tools nil)
         (captured-use-tools nil)
@@ -1242,6 +1840,41 @@
        #'ignore))
     (should captured-use-tools)
     (should (= (length captured-tools) 1))))
+
+(ert-deftest org-ai-skills-gptel-dispatch-planner-does-not-register-tools ()
+  "Planner dispatch should not expose gptel tools."
+  (let ((org-ai-skills-debug-enabled nil)
+        (gptel-use-tools nil)
+        (gptel-tools nil)
+        (captured-use-tools nil)
+        (captured-tools nil)
+        (orig-featurep (symbol-function 'featurep))
+        (orig-fboundp (symbol-function 'fboundp)))
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature)
+                 (if (eq feature 'gptel) t (funcall orig-featurep feature))))
+              ((symbol-function 'fboundp)
+               (lambda (symbol)
+                 (if (memq symbol '(gptel-request gptel-make-tool))
+                     t
+                   (funcall orig-fboundp symbol))))
+              ((symbol-function 'gptel-make-tool)
+               (lambda (&rest slots) slots))
+              ((symbol-function 'gptel-request)
+               (lambda (&rest args)
+                 (setq captured-use-tools gptel-use-tools)
+                 (setq captured-tools gptel-tools)
+                 (let ((callback (plist-get (cdr args) :callback)))
+                   (funcall callback "{\"candidates\":[],\"plan\":[],\"replan_signal\":{\"enabled\":false,\"condition\":\"\"}}"
+                            (list :data '(:payload t))))
+                 t)))
+      (org-ai-skills-gptel-dispatch-rewrite
+       '(:event-type planner
+         :request-role planner
+         :prompt "planner")
+       #'ignore))
+    (should-not captured-use-tools)
+    (should-not captured-tools)))
 
 (ert-deftest org-ai-skills-build-gptel-rewrite-request-tags-execution-role ()
   "Rewrite request builder should annotate execution request role."

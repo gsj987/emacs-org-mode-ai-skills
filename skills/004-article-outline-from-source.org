@@ -1,0 +1,51 @@
+* Skill: Article Outline From Source
+:PROPERTIES:
+:SKILL_ID: article-outline-from-source
+:END:
+
+#+EFFECT: pure
+#+INVOCATION: manual
+#+CONTEXT: project
+#+DETERMINISM: heuristic
+
+** Description
+Generate a structured Org article outline from source material and discussion notes, with subtree-level =:PURPOSE:= hints for human editing.
+
+** Inputs
+- source-content (from current subtree, current buffer, or source file path)
+- optional-source-anchor
+
+** Outputs
+- org-article-outline-subtree
+- each generated section heading includes =:PURPOSE:=
+- output must be valid Org subtree text only
+
+** Contracts
+- preserve the original query language
+- return only final Org artifact (no analysis prose)
+- include clear heading hierarchy for later expansion
+- include =:PURPOSE:= in root and section subtrees
+- when =:SOURCE_FILE_PATH:= is provided, use it as grounding context before outlining
+
+** Requirements
+- keep outline concise and logically ordered
+- avoid fabricating facts not present in source context
+- optimize outline for human reorder/edit workflow before compose stage
+
+** Function Calls
+- name: org-ai-skills-read-buffer
+  when: when the current working buffer is needed as source context
+  args: (buffer_name start end)
+  buffer_name: optional buffer name; empty means current buffer
+  start: optional start position (1-based)
+  end: optional end position (1-based)
+- name: org-ai-skills-read-file
+  when: when =:SOURCE_FILE_PATH:= provides external source document
+  args: (file_path max_chars)
+  file_path: absolute or project-relative path to source file
+  max_chars: optional max characters to read; default 20000
+
+** Steps
+1. Read source context from subtree/buffer/file as available.
+2. Infer the core narrative and section candidates.
+3. Return a clean Org outline subtree with =:PURPOSE:= for each section.

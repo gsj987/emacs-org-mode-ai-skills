@@ -182,6 +182,14 @@ Example skill set for composition testing:
     (including <= 280 character tweet sentence constraint in contracts).
 - =skills/003-daily-financial-news-report.org=
   - Uses Search1API-backed raw data function call; LLM formats final Org report.
+- =skills/004-article-outline-from-source.org=
+  - Builds article outline subtree from source context with =:PURPOSE:= guidance.
+- =skills/005-article-compose-from-outline.org=
+  - Expands approved outline into draft sections.
+- =skills/006-article-repair-subtree.org=
+  - Regenerates selected weak subtree while preserving surrounding scope.
+- =skills/007-article-polish-editorial.org=
+  - Runs final editorial consistency pass for wording/tone.
 
 Load gptel from straight checkout path if needed:
 
@@ -198,12 +206,17 @@ Interactive flow:
 - Place point in a target headline subtree.
 - Run:
   - =M-x org-ai-skills-org-rewrite-subtree=
+  - Or strict mode: =M-x org-ai-skills-org-rewrite-subtree-strict=
 - Choose rewrite scope from minibuffer preview list (org-refile-like):
+  - = [buffer] /path/to/file.org= (whole buffer)
   - = [current] Top/Child/Leaf=
   - = [up:1] Top/Child=
   - = [up:2] Top=
 - Choose a skill from =skills/=.
 - Optional: add a custom rewrite instruction.
+- Strict mode guarantees:
+  - headline lines stay unchanged at all levels (same stars + same text), otherwise apply is rejected.
+  - model output property drawers are stripped before candidate persistence/apply.
 - One command run generates one candidate output and stores it.
 - Interactive runs auto-open a 2-column workspace:
   - left: =*org-ai-skills-control*= (run status + operation keys)
@@ -261,7 +274,11 @@ Output handling:
 - Response sanitizer strips leading chatter/code fences and normalizes heading levels
   so replacement root level always matches selected target subtree level.
 - Rewrite request includes =:skill-context= with contracts/requirements/function-calls
-  and source subtree metadata.
+  and source subtree metadata (including inherited =:PURPOSE:= and
+  =:SOURCE_FILE_PATH:= when present).
+- Purpose/source-path metadata resolution supports both:
+  - headline property drawer keys: =:PURPOSE:=, =:SOURCE_FILE_PATH:=
+  - Org file keywords fallback: =#+PURPOSE:=, =#+SOURCE_FILE_PATH:=
 - Each run persists one candidate version under:
   - =~/.emacs.d/skills/versions/=
 - Candidate store read/write uses UTF-8 by default.
@@ -284,6 +301,14 @@ Function call lifecycle APIs:
 
 gptel tool registration behavior:
 - Active skill =Function Calls= are converted to request-scoped gptel tools.
+- Core read tools are exposed by default on all requests:
+  - =org-ai-skills-read-buffer= (buffer/range reads)
+  - =org-ai-skills-read-file= (source file reads)
+- Planner requests do not expose tools, to keep planner JSON schema output deterministic.
+- Toggle core read tools:
+  - =org-ai-skills-enable-core-read-tools= (default =t=)
+- Read cap for official file reads:
+  - =org-ai-skills-core-read-max-chars= (default =20000=)
 - Per-argument hints can be declared in =Function Calls= (for example =query:=,
   =limit:=, =language_hint:=, =date:=) and are propagated to gptel tool arg
   descriptions.
@@ -328,6 +353,7 @@ Debug observability:
   - =M-x org-ai-skills-debug-show-last=
 - Variables:
   - =org-ai-skills-debug-enabled=
+  - =org-ai-skills-debug-property-retention=
   - =org-ai-skills-debug-buffer-name=
 - Debug entry includes timestamp, request role, effective model, system prompt
   fingerprint, buffer/file, target headline/path, final prompt, and full request
@@ -335,6 +361,9 @@ Debug observability:
 - Additional debug events:
   - =gptel-request-data= includes request payload data captured from gptel callback info.
   - =tool-call= and =tool-result= events are logged when gptel emits tool-calling callbacks.
+  - =property-retention= logs subtree property collect/restore diagnostics:
+    matching strategy per heading (=path=, =exact-level-title=, =title=,
+    =level-order=, =fuzzy-level-title=, or =unmatched=) and restored keys.
 
 Embark integration:
 - Requires Embark installed.
@@ -345,15 +374,31 @@ Embark integration:
 
 Planner mode adds automatic skill candidate selection, multi-step execution, and optional replanning.
 
+Article workflow recommendation:
+- Use =M-x org-ai-skills-plan-run= with stage-specific task prompts:
+  - outline from source
+  - compose from edited outline
+  - repair selected subtree
+  - editorial polish
+- Choose = [buffer] ...= scope in picker when article flow should run on full file.
+- Keep per-headline intent in =:PURPOSE:=.
+- Use =:SOURCE_FILE_PATH:= on article root/subtree when source is external
+  (supports Org/Markdown/text files).
+- Compose safety defaults (=article-compose-from-outline=):
+  - Headline lines are treated as immutable (outline lock).
+  - Property drawers in model output are stripped before apply.
+  - Prompt context is compacted to outline summary to reduce prompt bloat.
+- Subtree apply ensures resulting headings have =:ID:= for rerun targeting.
+
 Core model:
 - Planner phase uses metadata-only skill index:
   - =org-ai-skills-load-skill-metadata=
 - Execution phase lazy-loads full skill context only for selected step skills:
   - =org-ai-skills-load-skill-by-id=
 - Planner command:
-  - =M-x org-ai-skills-org-plan-and-run-subtree=
-  - =M-x org-ai-skills-org-plan-and-run-subtree-repeat-task= (reuse previous planner task)
-  - =M-x org-ai-skills-org-plan-and-run-subtree-preset= (select preset task intent)
+  - =M-x org-ai-skills-plan-run=
+  - =M-x org-ai-skills-plan-repeat-task= (reuse previous planner task)
+  - =M-x org-ai-skills-plan-run-preset= (select preset task intent)
 
 Planner APIs:
 - Build planner request:
@@ -376,12 +421,25 @@ Behavior notes:
   - =reject=: signal planner validation error.
   - =split=: auto-split one oversized step into bounded step parts.
 - Planner apply behavior:
-  - Interactive planner commands (=org-ai-skills-org-plan-and-run-subtree=,
+  - Interactive planner commands (=org-ai-skills-plan-run=,
     =...-repeat-task=, =...-preset=, and fixed-task commands from
     =org-ai-skills-define-plan-run-preset-command=) auto-apply the newly
     generated candidate by default.
   - Set =(setq org-ai-skills-auto-apply-generated-candidate nil)= to require
     manual candidate selection/apply.
+  - For =[buffer]= scope apply, existing file-level front matter
+    (for example =#+TITLE:=, =#+FILETAGS:=, =#+PURPOSE:=, =#+SOURCE_FILE_PATH:=)
+    is preserved; generated content replaces the body section.
+  - For =[buffer]= scope apply, explicit heading-level =:PURPOSE:= and
+    =:SOURCE_FILE_PATH:= are also restored onto matching regenerated headings
+    when model output omits drawers.
+  - For subtree scope apply, explicit =:PURPOSE:= and =:SOURCE_FILE_PATH:=
+    are preserved on matching headings when regenerated content omits them.
+  - Apply flow strips malformed indented pseudo property drawers from model
+    output (for example `     :PROPERTIES:`), preventing duplicate drawers.
+  - Rewrite constraints are inferred from the final executed step skill only.
+    Example: if compose runs first but final step is editorial polish, compose
+    headline-lock constraints are not force-applied to the final artifact.
 - Debug logging includes planner events, step composition reason, and per-step skill ids.
 - Planner task reuse:
   - Last task is cached in =org-ai-skills--last-planner-task=.

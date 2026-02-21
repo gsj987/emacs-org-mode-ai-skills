@@ -1,0 +1,44 @@
+* Skill: Article Repair Subtree
+:PROPERTIES:
+:SKILL_ID: article-repair-subtree
+:END:
+
+#+EFFECT: pure
+#+INVOCATION: manual
+#+CONTEXT: buffer
+#+DETERMINISM: heuristic
+
+** Description
+Regenerate a targeted article subtree while preserving surrounding document structure and section intent.
+
+** Inputs
+- selected-article-subtree
+- local-repair-instruction
+- optional-source-file-context
+
+** Outputs
+- rewritten-selected-subtree
+- output must be valid Org subtree text only
+
+** Contracts
+- only rewrite the selected subtree scope
+- preserve original language unless explicitly requested otherwise
+- return only final Org artifact
+- keep section goal aligned with =:PURPOSE:=
+
+** Requirements
+- do not alter sibling sections outside selected scope
+- improve clarity, logic, and flow for the target subtree
+- keep heading levels valid and compatible with target location
+
+** Function Calls
+- name: org-ai-skills-read-file
+  when: when additional source grounding is required for repair
+  args: (file_path max_chars)
+  file_path: absolute or project-relative path to source file
+  max_chars: optional max characters to read; default 20000
+
+** Steps
+1. Identify weaknesses in the selected subtree relative to =:PURPOSE:= and instruction.
+2. Recompose the subtree with stronger structure and wording.
+3. Return only rewritten subtree content.

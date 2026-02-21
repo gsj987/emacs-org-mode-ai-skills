@@ -1,0 +1,216 @@
+#+TITLE: PRD 011 - Agentic Article Workflow Skills and Official Context Access
+#+STARTUP: overview
+
+* Problem
+You want an agentic, human-in-the-loop workflow for article writing from Org drafts/discussion buffers:
+1) summarize an outline from rough Org content,
+2) human adjusts order and adds hints,
+3) generate full article by outline,
+4) regenerate selected subtree when needed,
+5) run final editorial standardization.
+
+Current system can rewrite subtrees, but article-specific workflow conventions are not explicit yet.
+
+* Scope
+- In scope:
+  - Define article workflow skill architecture aligned with existing skill spec conventions.
+  - Reuse existing fields (especially `:PURPOSE:`) instead of introducing redundant properties.
+  - Add source-context contract (`source file path`) to support outline + generation stages.
+  - Prioritize official context access tools (buffer/file read) for reliable agent execution.
+- Out of scope:
+  - Full UI redesign for drag-drop outline editing.
+  - External publishing pipeline.
+
+* Constraints
+- Technical constraints:
+  - Preserve spec vs run-state separation.
+  - No runtime mutation of skill spec files under `skills/`.
+  - Keep subtree targeting deterministic and bounded.
+  - Prefer official framework tools/capabilities before custom ad-hoc tools.
+- Process constraints:
+  - Follow AGENTS workflow: PRD -> implementation -> tests -> test run -> README -> worklog.
+
+* Expected Behavior
+- Behavior 1:
+  - Agent can produce a clean outline subtree from selected noisy Org draft/discussion content.
+- Behavior 2:
+  - Human can reorder/edit outline and set per-headline `:PURPOSE:` hints before generation.
+- Behavior 3:
+  - Agent generates article body from approved outline and source context.
+- Behavior 4:
+  - Agent can regenerate only designated subtree(s) without touching unaffected sections.
+- Behavior 5:
+  - Agent runs final editorial pass for wording consistency and tone/intonation alignment.
+- Behavior 6:
+  - Scope picker supports full-buffer target in addition to current/ancestor subtree scopes.
+
+* Spec Design
+** 1) Keep Existing Spec Conventions
+Avoid new custom properties that duplicate semantics.
+
+Decisions:
+- Reuse `:PURPOSE:` for section intent/hint.
+- Do not introduce `:ARTICLE_STATUS:`.
+- Use Org filetags for state labels when needed (example: `:outline:`, `:draft:`, `:review:`).
+
+** 2) Required Source Context Contract
+Add explicit source-reference contract for article workflow.
+
+Required runtime fields:
+- `source_file_path`
+  - Absolute or project-relative path to origin source document (Org/Markdown/text).
+- `source_anchor` (optional but recommended)
+  - Subtree id/headline path/marker-like selector for precise source scope.
+
+Usage rules:
+- Outline stage reads source via `source_file_path` (+ optional anchor).
+- Generation/regeneration/editorial stages may re-read source for grounding and consistency.
+
+** 2.5) Example Outline Draft (Org)
+Example target artifact after outline stage:
+
+#+begin_example
+#+FILETAGS: :article:outline:
+
+,* AI Skill Workflow for Article Writing
+:PROPERTIES:
+:PURPOSE: Explain an agentic workflow to draft, iterate, and polish Org-based articles.
+:SOURCE_FILE_PATH: ./notes/discussion-2026-02-20.org
+:END:
+
+,** Problem Context
+:PROPERTIES:
+:PURPOSE: Summarize the pain points from raw discussion notes.
+:END:
+
+,** Workflow Design
+:PROPERTIES:
+:PURPOSE: Describe discover, align, compose, repair, and polish stages.
+:END:
+
+,** Human-in-the-Loop Control
+:PROPERTIES:
+:PURPOSE: Explain where users review, reorder, and adjust section intent.
+:END:
+
+,** Implementation Plan
+:PROPERTIES:
+:PURPOSE: List skill specs, runtime tool requirements, and test plan.
+:END:
+#+end_example
+
+** 3) Agentic Workflow (State-Driven, Human-Gated)
+Model workflow as a loop with explicit stage intent, not rigid one-shot pipeline.
+
+Agent stages:
+- `discover`
+  - Inspect source buffer/file and propose initial outline.
+- `align` (human gate)
+  - Human reorders headlines and edits `:PURPOSE:` per subtree.
+- `compose`
+  - Generate section drafts from outline + source context.
+- `repair`
+  - Regenerate selected weak subtree(s) only.
+- `polish`
+  - Run full editorial standardization pass.
+
+Transition principle:
+- Agent proposes next stage.
+- Human confirms or overrides stage/target.
+- Agent executes scoped action and records artifacts.
+
+Scope selection rule:
+- Reuse existing interactive scope picker.
+- Add a `buffer` scope option so planner/rewrite flows can run on full buffer when needed.
+
+** 4) Skill Architecture (Multiple Skills + Existing Planner Runtime)
+Use multiple focused skills and rely on existing orchestration via =org-ai-skills-plan-run=.
+
+Recommended skills:
+- `article-outline-from-org`
+  - Produce outline subtree, write `:PURPOSE:` stubs.
+- `article-compose-from-outline`
+  - Expand outline into section bodies.
+- `article-repair-subtree`
+  - Regenerate one selected subtree.
+- `article-polish-editorial`
+  - Normalize wording/tone across selected scope.
+
+
+** 5) Official Context Access Priority
+Most important requirement is dependable context access through official capabilities.
+
+Priority order:
+1. Buffer read capability (current working content, narrowed region/subtree)
+2. File read capability (`source_file_path`)
+3. Structured Org traversal helpers (headline/subtree selection)
+4. Scoped write/apply for selected subtree/root
+
+Implementation direction:
+- First expose/standardize official file/buffer read tools in core framework.
+- Reuse existing Org/runtime helpers where available.
+- Introduce new Org-specific wrappers only when official capabilities cannot satisfy needs.
+
+** 6) One Skill or Multiple Skills
+Decision: multiple skills are preferred.
+
+- Core authoring quality improves with stage-specialized prompts/contracts.
+- Evaluation/testing is simpler per stage.
+- Use existing planner-based execution (=org-ai-skills-plan-run=) to route stage actions.
+
+* Acceptance Scenarios
+1. Existing-field compatibility:
+- Workflow uses `:PURPOSE:` and filetags; no `:ARTICLE_HINT:`, `:ARTICLE_INTENT:`, or `:ARTICLE_STATUS:` is required.
+
+2. Source path grounding:
+- Given `source_file_path`, outline and generation stages can read source content deterministically.
+
+3. Human-gated stage transitions:
+- After agent proposes outline, human can reorder/add `:PURPOSE:` hints and trigger compose stage.
+
+4. Scoped repair:
+- Regenerating one subtree does not modify sibling sections.
+
+5. Editorial polish:
+- Final pass improves consistency and tone while preserving structure and key meaning.
+
+* Tasks
+- [X] Update article skill specs under `skills/` using existing field conventions (`:PURPOSE:`, filetags).
+- [X] Add source-path runtime contract (`source_file_path`, optional anchor).
+- [X] Expose/standardize official buffer read + file read capabilities in core runtime tool surface.
+- [X] Wire stage-specific prompts/contracts for outline/compose/repair/polish.
+- [X] Add tests for source-path reading, scoped subtree regeneration boundaries, and stage routing.
+- [X] Update README with agentic article workflow usage.
+- [X] Add a strict rewrite command mode that preserves all headline lines and omits property drawers from model output.
+- [X] Add tests for strict mode heading-lock validation and property-drawer stripping.
+
+* Worklog
+- 2026-02-20 :: Drafted initial PRD for article workflow skills and context IO. Test status: not run.
+- 2026-02-20 :: Revised PRD per review: removed over-designed custom properties, aligned with existing `:PURPOSE:` + filetags conventions, added source-org-path contract, and shifted design toward agentic stage routing with official buffer/file read capability priority. Test status: not run.
+- 2026-02-20 :: Revised PRD again: removed optional `article-workflow-router` and standardized orchestration on existing `org-ai-skills-plan-run`. Test status: not run.
+- 2026-02-20 :: Added concrete Org outline draft example (with filetags, `:PURPOSE:`, and source path) to make expected stage-A artifact explicit. Test status: not run.
+- 2026-02-20 :: Updated source reference naming from `source_org_file_path`/`:SOURCE_ORG_FILE_PATH:` to generic `source_file_path`/`:SOURCE_FILE_PATH:` so source material can be Org, Markdown, or plain text. Test status: not run.
+- 2026-02-20 :: Implemented v1 article workflow assets and runtime support: added four stage skills (outline/compose/repair/polish), introduced core read tools (`org-ai-skills-read-buffer`, `org-ai-skills-read-file`) with request-scope exposure, propagated inherited `:PURPOSE:` and `:SOURCE_FILE_PATH:` into subtree context/prompt payloads, added ERT coverage for new skills/source-path/read-tools, and updated README usage/docs. Test status: pass (87/87, batch ERT).
+- 2026-02-20 :: Renamed read tooling surface for clarity: `org-ai-skills-read-buffer-text` -> `org-ai-skills-read-buffer`, `org-ai-skills-read-file-text` -> `org-ai-skills-read-file`, and config vars from "official" to "core" naming. Added backward-compatible aliases for old names. Test status: pass (87/87, batch ERT).
+- 2026-02-20 :: Scope enhancement requirement added: existing target picker should include full-buffer scope alongside current/up-level subtree scopes for planner/rewrite runs. Test status: not run.
+- 2026-02-20 :: Implemented buffer scope in existing target picker (`[buffer]`) for rewrite/planner flows; updated sanitize/apply paths for full-buffer replacement and added tests for buffer scope candidate selection, slot identity, and apply behavior. Test status: pass (90/90, batch ERT).
+- 2026-02-20 :: Removed transitional backward-compat aliases for renamed core read tools/config variables to keep API surface clean during active development. Test status: pass (90/90, batch ERT).
+- 2026-02-20 :: Renamed planner command family to shorter names: `org-ai-skills-plan-run`, `org-ai-skills-plan-repeat-task`, and `org-ai-skills-plan-run-preset`; updated Embark adapters, README usage, and tests accordingly. Test status: pass (90/90, batch ERT).
+- 2026-02-20 :: Completed remaining test task in PRD: added explicit ERT coverage for relative `source_file_path` reads, subtree-scope boundary safety (sibling preservation), and stage-routing source-path propagation in step requests. Test status: pass (93/93, batch ERT).
+- 2026-02-20 :: Added file-keyword fallback support for context metadata so rewriter/planner can read `#+PURPOSE:` and `#+SOURCE_FILE_PATH:` (in addition to property drawers), including buffer-scope propagation. Added ERT coverage for subtree and buffer fallback behavior. Test status: pass (95/95, batch ERT).
+- 2026-02-20 :: Root-cause fix for planner malformed JSON with schema-enabled providers: planner dispatch no longer exposes tools (execution-only tools), and planner callback now safely accumulates chunked text before JSON parse to avoid premature EOF/partial-object failures. Added ERT coverage for planner no-tools dispatch and chunked planner JSON accumulation. Test status: pass (97/97, batch ERT).
+- 2026-02-20 :: Root-cause fix for planner callback error on buffer scope apply: context-mode metadata was dropped during candidate apply paths (UI auto-apply/manual apply), causing subtree-only heading operations at buffer position 1. Applied context-mode propagation across planner/rewrite/UI apply flows and added regression test (`org-ai-skills-ui-apply-selected-candidate-preserves-buffer-context-mode`). Test status: pass (98/98, batch ERT).
+- 2026-02-21 :: Root-cause fix for repeated planner callback error "Before first headline": apply paths were still dropping `:context-mode` in several candidate-apply call sites (UI and auto-apply). Added end-to-end context-mode propagation and planner buffer-scope auto-apply regression test. Test status: pass (99/99, batch ERT).
+- 2026-02-21 :: Root-cause fix for control-panel apply/rerun scope drift: `org-ai-skills-ui-apply-selected-candidate` now applies in `:source-buffer` (not control buffer), and UI rerun/adjust now reconstructs target from run state when stored target is absent, preserving buffer-scope context. Added regression tests for source-buffer apply and target reconstruction. Test status: pass (101/101, batch ERT).
+- 2026-02-21 :: Additional root-cause hardening for control-panel apply: when UI state has missing `:context-mode`, infer effective scope from run state (`:target`, `:slot-id` == `buffer-root`, or full-buffer range) before apply to prevent fallback into heading-only operations at buffer position 1. Added regression test for slot-id-based buffer inference. Test status: pass (102/102, batch ERT).
+- 2026-02-21 :: Buffer-scope apply behavior refined to preserve existing file front matter (`#+TITLE`, `#+FILETAGS`, `#+PURPOSE`, `#+SOURCE_FILE_PATH`, etc.) while replacing generated body content. Added regression tests for front-matter preservation and no-front-matter full replacement, and updated README behavior notes. Test status: pass (103/103, batch ERT).
+- 2026-02-21 :: Subtree-scope apply behavior refined to preserve explicit `:PURPOSE:` and `:SOURCE_FILE_PATH:` on matching headings when regenerated text omits those properties (root drawer preservation already existed). Added regression test for child-heading property retention and updated README behavior notes. Test status: pass (104/104, batch ERT).
+- 2026-02-21 :: Upgraded subtree property retention from path-only matching to multi-strategy matching (exact path, unique heading title, then level+order fallback) so `:PURPOSE:`/`:SOURCE_FILE_PATH:` survive more rewrite variations including heading renames. Added regression test for renamed headings. Test status: pass (105/105, batch ERT).
+- 2026-02-21 :: Hardened subtree property retention for sibling-shift cases (commonly 2nd/3rd headings): fallback matching now uses per-level order (instead of global order) and same-level fuzzy title similarity, with nil-safe heading handling. Added regression test for inserted leading sibling + renamed later siblings. Test status: pass (106/106, batch ERT).
+- 2026-02-21 :: Added strict rewrite command mode (`org-ai-skills-org-rewrite-subtree-strict`) with hard constraints: preserve headline lines at all levels and strip property drawers from generated output; strict mode rejects apply when heading lines differ. Wired strict constraints through rerun/adjust flow and added tests for drawer stripping, heading-lock rejection, and strict command argument forwarding. Updated README usage. Test status: pass (109/109, batch ERT).
+- 2026-02-21 :: Added property-retention debug diagnostics to existing debug buffer pipeline: optional `property-retention` events now log collect/restore summaries, per-heading match strategy, and restored keys to help investigate missing subtree properties. Added `org-ai-skills-debug-property-retention` toggle and updated README debug section. Test status: pass (109/109, batch ERT).
+- 2026-02-21 :: Composition hardening and context reduction pass: (1) compose skill defaults now enforce outline lock + drawer stripping in both direct rewrite and planner result apply paths, (2) compose prompts now use compact outline-summary context with internal summary-first guidance, (3) subtree apply now ensures all resulting headings have `:ID:` for rerun targeting without disrupting property-retention matching. Added/updated ERT coverage for compose defaults, compact step context, and heading ID assignment. Test status: pass (112/112, batch ERT).
+- 2026-02-21 :: Root-cause fix for lost 2nd/3rd-level drawers in full-buffer runs: buffer-scope apply previously preserved only file front matter and skipped heading-level property retention. Added buffer-branch collect/restore for explicit `:PURPOSE:` and `:SOURCE_FILE_PATH:` on regenerated headings, plus regression coverage for buffer-scope nested heading retention. Test status: pass (113/113, batch ERT).
+- 2026-02-21 :: Root-cause fix for duplicate drawers: model output sometimes contained indented pseudo drawers (e.g. `     :PROPERTIES:`) that Org ignores; property retention then added canonical drawers, producing duplicates. Added apply-time sanitizer to strip only indented pseudo drawers, plus regression tests for sanitizer behavior and subtree-apply duplicate prevention. Test status: pass (115/115, batch ERT).
+- 2026-02-21 :: Root-cause fix for control-buffer apply/replan context drift: slot identity derivation used `current-buffer`, so UI actions triggered in `*org-ai-skills-control*` could produce `slot-file=buffer:*org-ai-skills-control*` and later heading operations at position 1. `org-ai-skills--ensure-subtree-slot-id` now derives source buffer from subtree begin marker (or explicit `:source-buffer`) before reading/writing IDs and slot file keys. Added regression test for marker-buffer precedence under control-buffer invocation. Test status: pass (116/116, batch ERT).
+- 2026-02-21 :: Root-cause fix for over-strict planner apply on mixed-step runs: compose headline-lock constraints were applied whenever compose appeared in any completed step, causing false rejections when final step was editorial/polish and headings legitimately changed. Planner now derives rewrite constraints from the final completed step skill set only. Added regression test to verify compose-then-polish no longer inherits compose strict lock. Test status: pass (117/117, batch ERT).

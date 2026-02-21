@@ -1,0 +1,45 @@
+* Skill: Article Compose From Outline
+:PROPERTIES:
+:SKILL_ID: article-compose-from-outline
+:END:
+
+#+EFFECT: pure
+#+INVOCATION: manual
+#+CONTEXT: project
+#+DETERMINISM: heuristic
+
+** Description
+Expand an approved Org outline into a full article draft, using per-section =:PURPOSE:= and source references.
+
+** Inputs
+- approved-outline-subtree
+- optional-source-file-context
+
+** Outputs
+- expanded-org-article-subtree
+- substantive section paragraphs under each outline heading
+- output must be valid Org subtree text only
+
+** Contracts
+- preserve heading hierarchy and order from edited outline
+- respect each subtree =:PURPOSE:= as section intent
+- return only final Org artifact
+- preserve the original query language
+
+** Requirements
+- generate concrete, coherent section content
+- avoid headings-only output
+- keep style and terminology consistent across sections
+- use source references when available via =:SOURCE_FILE_PATH:=
+
+** Function Calls
+- name: org-ai-skills-read-file
+  when: when source file context is needed for grounded drafting
+  args: (file_path max_chars)
+  file_path: absolute or project-relative path to source file
+  max_chars: optional max characters to read; default 20000
+
+** Steps
+1. Parse the outline structure and per-section =:PURPOSE:= hints.
+2. Read source file context when provided.
+3. Expand sections into complete draft paragraphs while preserving structure.

@@ -1,0 +1,36 @@
+* Skill: Article Polish Editorial
+:PROPERTIES:
+:SKILL_ID: article-polish-editorial
+:END:
+
+#+EFFECT: pure
+#+INVOCATION: manual
+#+CONTEXT: project
+#+DETERMINISM: heuristic
+
+** Description
+Run a final editorial pass to standardize wording, tone, and intonation across the article while preserving structure and meaning.
+
+** Inputs
+- article-subtree-or-document
+- optional-style-direction
+
+** Outputs
+- editorially-polished-org-subtree
+- output must be valid Org subtree text only
+
+** Contracts
+- preserve original structure and key meaning
+- normalize wording and tone consistency end-to-end
+- return only final Org artifact
+- preserve original query language unless explicitly overridden
+
+** Requirements
+- avoid introducing unsupported new claims
+- reduce redundancy and wording drift across sections
+- keep transitions natural and voice consistent
+
+** Steps
+1. Review article-level tone, terminology, and sentence rhythm.
+2. Rewrite for consistency while preserving facts and structure.
+3. Return polished Org subtree only.
