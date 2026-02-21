@@ -1,0 +1,43 @@
+#+TITLE: Release Safety Sanitization and README Disclaimer
+#+STARTUP: overview
+
+* Problem
+The project is being prepared for public release, but repository contents may include
+personal identifiers, environment-specific references, or text that does not clearly
+communicate safety expectations to external readers.
+
+* Scope
+- In scope:
+  - Review tracked repository files for possible sensitive personal data exposure.
+  - Remove or generalize sensitive personal data found in project files.
+  - Add an explicit safety disclaimer at the beginning of =README.org=.
+  - Add a sharing-intent note that the project reflects a personal workflow and invites discussion in GitHub Issues.
+- Out of scope:
+  - Refactoring unrelated features.
+  - Adding new runtime behavior not required by release messaging/sanitization.
+
+* Constraints
+- Technical constraints:
+  - Keep existing behavior unchanged except where data sanitization requires textual edits.
+  - Preserve documentation readability and org-mode structure.
+- Process constraints:
+  - Follow AGENTS workflow: implement after PRD, add/update tests if logic changes, run tests, update worklog.
+
+* Expected Behavior
+- Behavior 1:
+  - Repository text does not expose obvious personal sensitive data (usernames, machine-local absolute paths, secret-like tokens).
+- Behavior 2:
+  - =README.org= starts with a clear warning that code is vibe-coded and not fully reviewed for harmful behavior.
+- Behavior 3:
+  - =README.org= states this is a personal workflow shared for communication and welcomes issue-based discussion.
+
+* Tasks
+- [X] Audit repo for sensitive personal data and secret-like strings.
+- [X] Sanitize detected sensitive data while preserving usage meaning.
+- [X] Add README disclaimer and collaboration note at beginning.
+- [X] Add or update tests only if implementation logic changes.
+- [X] Run tests and record results.
+- [X] Append worklog entry.
+
+* Worklog
+- 2026-02-21 :: Created release-safety PRD and completed full repository scan for sensitive personal data patterns (emails, absolute home paths, secret/token-like strings, private-key markers). No concrete personal secrets found in tracked files; documentation was updated with a top-level release warning and collaboration intent note in =README.org=. No implementation logic changes required, so no test additions were needed. Test status: pass (117/117, batch ERT).

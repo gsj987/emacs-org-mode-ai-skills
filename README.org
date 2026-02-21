@@ -1,6 +1,14 @@
 #+TITLE: org-ai-skills
 #+STARTUP: overview
 
+* Release Notice
+
+This repository was built via vibe coding and I have not fully reviewed all code paths.
+I cannot guarantee that there is no harmful behavior in this codebase.
+
+This project is a complete personal workflow.
+It is shared to communicate with people interested in this topic, and discussion is welcome in GitHub Issues.
+
 * Project Goal
 
 org-ai-skills is an experimental Emacs system for defining, executing,
@@ -103,7 +111,7 @@ Required structure:
 Minimal valid example:
 
 #+begin_example
-* Skill: Generate Structured Notes
+,* Skill: Generate Structured Notes
 :PROPERTIES:
 :SKILL_ID: gen-notes
 :END:
@@ -113,7 +121,7 @@ Minimal valid example:
 #+CONTEXT: project
 #+DETERMINISM: deterministic
 
-** Description
+,** Description
 Transform selected Org content into a concise, structured outline.
 #+end_example
 

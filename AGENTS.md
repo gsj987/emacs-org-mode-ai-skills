@@ -83,8 +83,12 @@ Append to the prd file in worklog section:
 - No hidden state mutation
 - No modifying Skill spec files during runtime
 
+## 4. Execution Quality Rules
 
-## 4. Self-Check Before Completion
+- Prioritize root-cause analysis and direct fixes; do not default to fallback or downgraded solutions unless constraints are explicitly documented in the PRD.
+- The agent may raise clarifying questions in the PRD file when requirements, constraints, or expected behavior are ambiguous.
+
+## 5. Self-Check Before Completion
 
 Before finishing a task, verify:
 

@@ -1,0 +1,38 @@
+#+TITLE: Agent Governance: Root Cause and PRD Questioning
+#+STARTUP: overview
+
+* Problem
+Current agent governance text does not explicitly require root-cause-first resolution,
+and does not explicitly allow agents to raise clarification questions directly in PRD files.
+This can cause shallow fallback behavior and weaker specification quality.
+
+* Scope
+- In scope:
+  - Update =AGENTS.md= with explicit rules:
+    - Prefer root-cause analysis over fallback/downgrade solutions.
+    - Agent may raise questions in PRD when clarification is needed.
+  - Record process completion in PRD worklog.
+- Out of scope:
+  - Changes to runtime implementation in =elisp/=.
+  - Functional behavior changes in skill execution pipeline.
+
+* Constraints
+- Technical constraints:
+  - Documentation-only change; preserve existing AGENTS structure and intent.
+- Process constraints:
+  - Follow mandatory PRD-first workflow before edits.
+
+* Expected Behavior
+- Behavior 1:
+  - Agent instructions explicitly prioritize root-cause resolution before fallback/downgrade.
+- Behavior 2:
+  - Agent instructions explicitly permit writing open questions into PRD files.
+
+* Tasks
+- [X] Add PRD for governance update.
+- [X] Update =AGENTS.md= with both requested items.
+- [X] Run tests and record status.
+- [X] Append worklog entry.
+
+* Worklog
+- 2026-02-21 :: Updated =AGENTS.md= with execution quality rules requiring root-cause-first resolution (no default fallback/downgrade) and explicit permission for agents to raise clarifying questions in PRD files when specs are ambiguous. Test status: pass (117/117, batch ERT).
