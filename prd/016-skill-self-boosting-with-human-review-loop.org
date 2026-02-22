@@ -6,7 +6,8 @@ The runtime does not currently learn systematically from completed runs. Useful 
 
 * Scope
 - In scope:
-  - Capture run outcomes and candidate reusable patterns.
+  - Capture run outcomes for later review and extraction.
+  - Provide a manual control-panel command to trigger pattern extraction.
   - Generate proposed skill updates from extracted patterns.
   - Add human review and explicit apply/reject workflow before any skill change.
   - Keep immutable audit trail of proposals and review decisions.
@@ -26,22 +27,41 @@ The runtime does not currently learn systematically from completed runs. Useful 
 
 * Expected Behavior
 - Behavior 1:
-  - After a run, system can extract candidate patterns (steps, checks, failure handling, heuristics) into proposal artifacts.
+  - Pattern extraction is operator-triggered (manual), not automatic on every run.
 - Behavior 2:
-  - A reviewer can inspect a proposal diff, rationale, confidence, and risk before decision.
+  - Control panel exposes an explicit extraction action/command that extracts candidate patterns (steps, checks, failure handling, heuristics) into proposal artifacts.
 - Behavior 3:
-  - Only approved proposals are applied via explicit workflow; rejected proposals remain archived.
+  - A reviewer can inspect a proposal diff, rationale, confidence, and risk before decision.
 - Behavior 4:
+  - Only approved proposals are applied via explicit workflow; rejected proposals remain archived.
+- Behavior 5:
   - Extraction and proposal quality are testable with fixture-based evaluation.
+- Behavior 6:
+  - Operator can preview selected proposal details (rationale, patterns, status/review/application metadata) before decision.
+- Behavior 7:
+  - Each proposal must bind a target skill (skill-id + skill file) inferred from previous run context; extraction fails when target cannot be resolved.
+- Behavior 8:
+  - Operator can explicitly apply an approved proposal to the bound target skill file via a separate confirmation workflow; this action is disabled while a run is active.
 
 * Tasks
-- [ ] Define proposal artifact schema and storage location.
-- [ ] Implement pattern extraction pipeline from run traces.
-- [ ] Implement proposal generator for skill updates (draft patch + rationale).
-- [ ] Implement review/apply/reject workflow with audit log.
-- [ ] Add safety checks preventing direct runtime skill mutation.
-- [ ] Add ERT tests for extraction quality gates, proposal generation, and review control flow.
-- [ ] Update README with self-boosting lifecycle and operator workflow.
+- [X] Define proposal artifact schema and storage location.
+- [X] Implement manual pattern extraction command (control panel action + keybinding).
+- [X] Implement pattern extraction pipeline from run traces, invoked by manual command.
+- [X] Implement proposal generator for skill updates (draft patch + rationale).
+- [X] Implement review/apply/reject workflow with audit log.
+- [X] Add safety checks preventing direct runtime skill mutation.
+- [X] Add ERT tests for review control flow and governance audit lifecycle.
+- [X] Add ERT tests for manual extraction command/control-panel flow and proposal artifact generation.
+- [X] Add control-panel proposal preview command and tests.
+- [X] Bind proposal target skill from previous run context and add tests.
+- [X] Add explicit confirmed skill-file apply workflow for approved proposals (separate from artifact-only apply) and tests.
+- [X] Update README with self-boosting lifecycle and operator workflow.
 
 * Worklog
 - 2026-02-22 :: PRD created for skill self-boosting with mandatory human review and proposal-based updates. Test status: not run.
+- 2026-02-22 :: PRD updated: extraction is now manual (not per-run), with explicit control-panel command required to trigger extraction. Tasks and expected behavior revised accordingly. Test status: not run.
+- 2026-02-22 :: Implemented manual control-panel extraction command (=x=), proposal artifact store/schema, deterministic pattern extraction groups (steps/checks/failure-handling/heuristics), and proposal persistence under =~/.emacs.d/skills/proposals/=. Added ERT coverage for extraction success + running-state guard and updated README key/flow docs. Test status: pass (119/119, batch ERT via =emacs -Q --batch -L elisp -l tests/org-ai-skills-test.el -f ert-run-tests-batch-and-exit=).
+- 2026-02-22 :: Implemented proposal governance loop in control panel: select proposal (=p=), approve (=y=), reject (=n=), and apply (=m=, artifact-only). Added persistent audit log at =~/.emacs.d/skills/proposals/audit-log.jsonl= and status transition enforcement. Added runtime safety gate that blocks apply when proposal implies mutation under =skills/=. Added ERT coverage for approve/apply audit flow, transition guard, and safety-block behavior. Test status: pass (122/122, batch ERT via =emacs -Q --batch -L elisp -l tests/org-ai-skills-test.el -f ert-run-tests-batch-and-exit=).
+- 2026-02-22 :: Added proposal preview workflow: control-panel key =v= opens =*org-ai-skills-proposal*= with rationale, extracted pattern groups, and review/application metadata for selected proposal. Added ERT tests for preview render and running-state guard. Updated README control keys. Test status: pass (120/120, batch ERT via =emacs -Q --batch -L elisp -l tests/org-ai-skills-test.el -f ert-run-tests-batch-and-exit=).
+- 2026-02-22 :: Added mandatory proposal target-skill binding from previous run context. Extraction now records =:target-skill-id= and =:target-skill-file= (rewrite skill directly, planner last-step skill from planner run-state metadata), and fails when no target can be resolved. Updated preview output and README. Added/updated ERT coverage for target-skill persistence and missing-target failure. Test status: pass (120/120, batch ERT via =emacs -Q --batch -L elisp -l tests/org-ai-skills-test.el -f ert-run-tests-batch-and-exit=).
+- 2026-02-22 :: Added explicit confirmed skill-file apply workflow: control key =M= applies approved proposal to bound target skill file after confirmation prompt, appending a structured extracted-pattern block. Kept =m= as artifact-only apply mode. Added tests for skill-file append success and running-state guard; updated README usage. Test status: pass (122/122, batch ERT via =emacs -Q --batch -L elisp -l tests/org-ai-skills-test.el -f ert-run-tests-batch-and-exit=).

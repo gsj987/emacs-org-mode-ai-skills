@@ -1738,6 +1738,343 @@
               (should-not (plist-get org-ai-skills--ui-run-state :overlay)))))
       (delete-directory store-dir t))))
 
+(ert-deftest org-ai-skills-ui-extract-pattern-proposal-persists-artifact ()
+  "Manual control-panel extraction should persist a proposal artifact."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t))
+        (proposal-dir (make-temp-file "org-ai-skills-proposals-" t)))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir)
+              (org-ai-skills-proposal-store-dir proposal-dir))
+          (with-temp-buffer
+            (org-mode)
+            (insert "* Leaf\nOriginal body.\n")
+            (goto-char (point-min))
+            (let* ((subtree (org-ai-skills-org-resolve-subtree 'current))
+                   (slot (org-ai-skills--ensure-subtree-slot-id subtree))
+                   (candidate (org-ai-skills--record-generated-candidate
+                               slot "rewrite" "rewrite" "prompt"
+                               "* Leaf\n- Step one\n- Step two\nEnsure formatting.\nIf missing data then retry.\n"))
+                   (begin (copy-marker (plist-get subtree :begin)))
+                   (end (copy-marker (plist-get subtree :end)))
+                   (org-ai-skills--ui-run-state
+                    (list :run-id "run-proposal-1"
+                          :run-type 'rewrite
+                          :source-buffer (current-buffer)
+                          :begin begin
+                          :end end
+                          :slot-key (plist-get slot :slot-key)
+                          :target-skill-id "gen-notes"
+                          :target-skill-file "/tmp/gen-notes.org"
+                          :status 'ready
+                          :progress "candidate-ready"
+                          :selected-candidate nil)))
+              (org-ai-skills-ui-extract-pattern-proposal)
+              (should (equal (plist-get org-ai-skills--ui-run-state :progress)
+                             "pattern-proposal-extracted"))
+              (let* ((proposal (plist-get org-ai-skills--ui-run-state :selected-proposal))
+                     (proposal-id (plist-get proposal :proposal-id))
+                     (file (expand-file-name (format "%s.json" proposal-id) proposal-dir))
+                     (artifact nil))
+                (should (stringp proposal-id))
+                (should (file-exists-p file))
+                (setq artifact
+                      (json-parse-string
+                       (with-temp-buffer
+                         (insert-file-contents file)
+                         (buffer-string))
+                       :object-type 'plist
+                       :array-type 'list
+                       :null-object nil
+                       :false-object nil))
+                (should (equal (plist-get artifact :source-candidate-id)
+                               (plist-get candidate :candidate-id)))
+                (should (equal (plist-get artifact :target-skill-id) "gen-notes"))
+                (should (equal (plist-get artifact :target-skill-file) "/tmp/gen-notes.org"))
+                (should (equal (plist-get artifact :extraction-mode)
+                               "manual-control-panel"))
+                (should (> (length (plist-get (plist-get artifact :patterns) :steps)) 0))))))
+      (delete-directory store-dir t)
+      (delete-directory proposal-dir t)))
+
+(ert-deftest org-ai-skills-ui-extract-pattern-proposal-unavailable-while-running ()
+  "Manual extraction should be unavailable while run status is running."
+  (let ((message-log nil)
+        (org-ai-skills--ui-run-state
+         (list :status 'running
+               :slot-key "dummy|slot")))
+    (cl-letf (((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (push (apply #'format format-string args) message-log))))
+      (org-ai-skills-ui-extract-pattern-proposal))
+    (should (equal (car message-log)
+                   "org-ai-skills: extract unavailable while running"))
+    (should-not (plist-get org-ai-skills--ui-run-state :selected-proposal))))
+
+(ert-deftest org-ai-skills-ui-extract-pattern-proposal-errors-without-target-skill ()
+  "Manual extraction should fail when previous run context has no target skill."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t))
+        (proposal-dir (make-temp-file "org-ai-skills-proposals-" t)))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir)
+              (org-ai-skills-proposal-store-dir proposal-dir))
+          (with-temp-buffer
+            (org-mode)
+            (insert "* Leaf\nOriginal body.\n")
+            (goto-char (point-min))
+            (let* ((subtree (org-ai-skills-org-resolve-subtree 'current))
+                   (slot (org-ai-skills--ensure-subtree-slot-id subtree))
+                   (_candidate (org-ai-skills--record-generated-candidate
+                                slot "rewrite" "rewrite" "prompt"
+                                "* Leaf\n- Step one\n"))
+                   (begin (copy-marker (plist-get subtree :begin)))
+                   (end (copy-marker (plist-get subtree :end)))
+                   (org-ai-skills--ui-run-state
+                    (list :run-id "run-proposal-no-target"
+                          :run-type 'rewrite
+                          :source-buffer (current-buffer)
+                          :begin begin
+                          :end end
+                          :slot-key (plist-get slot :slot-key)
+                          :status 'ready
+                          :progress "candidate-ready")))
+              (should-error (org-ai-skills-ui-extract-pattern-proposal)
+                            :type 'org-ai-skills-proposal-store-error))))
+      (delete-directory store-dir t)
+      (delete-directory proposal-dir t))))
+
+(ert-deftest org-ai-skills-ui-proposal-review-approve-and-apply-with-audit-log ()
+  "Proposal review workflow should persist status transitions and audit events."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t))
+        (proposal-dir (make-temp-file "org-ai-skills-proposals-" t)))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir)
+              (org-ai-skills-proposal-store-dir proposal-dir))
+          (with-temp-buffer
+            (org-mode)
+            (insert "* Leaf\nBody\n")
+            (goto-char (point-min))
+            (let* ((subtree (org-ai-skills-org-resolve-subtree 'current))
+                   (slot (org-ai-skills--ensure-subtree-slot-id subtree))
+                   (_candidate (org-ai-skills--record-generated-candidate
+                                slot "rewrite" "rewrite" "prompt"
+                                "* Leaf\n- Step one\nEnsure correctness.\n"))
+                   (begin (copy-marker (plist-get subtree :begin)))
+                   (end (copy-marker (plist-get subtree :end)))
+                   (org-ai-skills--ui-run-state
+                    (list :run-id "run-review-1"
+                          :run-type 'rewrite
+                          :source-buffer (current-buffer)
+                          :begin begin
+                          :end end
+                          :slot-key (plist-get slot :slot-key)
+                          :target-skill-id "gen-notes"
+                          :target-skill-file "/tmp/gen-notes.org"
+                          :status 'ready
+                          :progress "candidate-ready")))
+              (org-ai-skills-ui-extract-pattern-proposal)
+              (org-ai-skills-ui-approve-selected-proposal)
+              (should (equal (plist-get (plist-get org-ai-skills--ui-run-state :selected-proposal)
+                                        :status)
+                             "approved"))
+              (org-ai-skills-ui-apply-selected-proposal)
+              (let* ((selected (plist-get org-ai-skills--ui-run-state :selected-proposal))
+                     (proposal-id (plist-get selected :proposal-id))
+                     (proposal-file (expand-file-name (format "%s.json" proposal-id) proposal-dir))
+                     (artifact (json-parse-string
+                                (with-temp-buffer
+                                  (insert-file-contents proposal-file)
+                                  (buffer-string))
+                                :object-type 'plist
+                                :array-type 'list
+                                :null-object nil
+                                :false-object nil))
+                     (audit-file (expand-file-name "audit-log.jsonl" proposal-dir))
+                     (audit-lines (split-string
+                                   (with-temp-buffer
+                                     (insert-file-contents audit-file)
+                                     (buffer-string))
+                                   "\n" t))
+                     (actions (mapcar
+                               (lambda (line)
+                                 (plist-get (json-parse-string line
+                                                               :object-type 'plist
+                                                               :array-type 'list
+                                                               :null-object nil
+                                                               :false-object nil)
+                                            :action))
+                               audit-lines)))
+                (should (equal (plist-get artifact :status) "applied"))
+                (should (equal (plist-get (plist-get artifact :application) :mode)
+                               "artifact-only"))
+                (should (member "approved" actions))
+                (should (member "applied" actions))))))
+      (delete-directory store-dir t)
+      (delete-directory proposal-dir t))))
+
+(ert-deftest org-ai-skills-ui-proposal-apply-requires-approved-status ()
+  "Proposal apply should reject transitions from non-approved states."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t))
+        (proposal-dir (make-temp-file "org-ai-skills-proposals-" t)))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir)
+              (org-ai-skills-proposal-store-dir proposal-dir))
+          (with-temp-buffer
+            (org-mode)
+            (insert "* Leaf\nBody\n")
+            (goto-char (point-min))
+            (let* ((subtree (org-ai-skills-org-resolve-subtree 'current))
+                   (slot (org-ai-skills--ensure-subtree-slot-id subtree))
+                   (_candidate (org-ai-skills--record-generated-candidate
+                                slot "rewrite" "rewrite" "prompt" "* Leaf\n- Step one\n"))
+                   (begin (copy-marker (plist-get subtree :begin)))
+                   (end (copy-marker (plist-get subtree :end)))
+                   (org-ai-skills--ui-run-state
+                    (list :run-id "run-review-2"
+                          :run-type 'rewrite
+                          :source-buffer (current-buffer)
+                          :begin begin
+                          :end end
+                          :slot-key (plist-get slot :slot-key)
+                          :target-skill-id "gen-notes"
+                          :target-skill-file "/tmp/gen-notes.org"
+                          :status 'ready
+                          :progress "candidate-ready")))
+              (org-ai-skills-ui-extract-pattern-proposal)
+              (should-error (org-ai-skills-ui-apply-selected-proposal)
+                            :type 'org-ai-skills-proposal-store-error))))
+      (delete-directory store-dir t)
+      (delete-directory proposal-dir t))))
+
+(ert-deftest org-ai-skills-ui-proposal-apply-safety-blocks-skill-mutation ()
+  "Apply should fail when proposal indicates runtime mutation under skills/."
+  (let ((proposal-dir (make-temp-file "org-ai-skills-proposals-" t))
+        (skill-dir (make-temp-file "org-ai-skills-skills-" t)))
+    (unwind-protect
+        (let* ((org-ai-skills-proposal-store-dir proposal-dir)
+               (org-ai-skills-skill-dir skill-dir)
+               (unsafe-file (expand-file-name "001-skill.org" skill-dir))
+               (proposal (org-ai-skills--persist-proposal
+                          (list :proposal-id "proposal-safety-1"
+                                :created-at "2026-02-22T00:00:00+0000"
+                                :type "skill-pattern-proposal"
+                                :status "approved"
+                                :target-skill-file unsafe-file
+                                :proposed-files (vector unsafe-file)
+                                :source-slot-key "slot-1"
+                                :source-candidate-id "cand-1"))))
+          (let ((org-ai-skills--ui-run-state
+                 (list :status 'ready
+                       :slot-key "slot-1"
+                       :selected-proposal proposal)))
+            (should-error (org-ai-skills-ui-apply-selected-proposal)
+                          :type 'org-ai-skills-safety-error))))
+      (delete-directory proposal-dir t)
+      (delete-directory skill-dir t))))
+
+(ert-deftest org-ai-skills-ui-proposal-apply-to-skill-file-appends-block ()
+  "Confirmed skill-file apply should append proposal block and mark applied."
+  (let ((proposal-dir (make-temp-file "org-ai-skills-proposals-" t))
+        (skill-dir (make-temp-file "org-ai-skills-skills-" t)))
+    (unwind-protect
+        (let* ((org-ai-skills-proposal-store-dir proposal-dir)
+               (org-ai-skills-skill-dir skill-dir)
+               (skill-file (expand-file-name "001-target.org" skill-dir)))
+          (with-temp-file skill-file
+            (insert "* Skill: Target Skill\n:PROPERTIES:\n:SKILL_ID: target-skill\n:END:\n\n** Description\nBase.\n"))
+          (let* ((proposal (org-ai-skills--persist-proposal
+                            (list :proposal-id "proposal-file-1"
+                                  :created-at "2026-02-22T00:00:00+0000"
+                                  :type "skill-pattern-proposal"
+                                  :status "approved"
+                                  :target-skill-id "target-skill"
+                                  :target-skill-file skill-file
+                                  :patterns
+                                  (list :steps ["Step one"] :checks [] :failure-handling [] :heuristics [])
+                                  :source-slot-key "slot-1"
+                                  :source-candidate-id "cand-1")))
+                 (org-ai-skills--ui-run-state
+                  (list :status 'ready
+                        :slot-key "slot-1"
+                        :selected-proposal proposal)))
+            (cl-letf (((symbol-function 'yes-or-no-p)
+                       (lambda (&rest _args) t)))
+              (org-ai-skills-ui-apply-selected-proposal-to-skill-file))
+            (with-temp-buffer
+              (insert-file-contents skill-file)
+              (goto-char (point-min))
+              (should (re-search-forward "Extracted Pattern Proposal: proposal-file-1" nil t))
+              (should (re-search-forward ":TARGET_SKILL_ID: target-skill" nil t))
+              (should (re-search-forward "Step one" nil t)))
+            (should (equal (plist-get (plist-get org-ai-skills--ui-run-state :selected-proposal) :status)
+                           "applied"))
+            (should (equal (plist-get (plist-get (plist-get org-ai-skills--ui-run-state :selected-proposal)
+                                                 :application)
+                                      :mode)
+                           "skill-file-append"))))
+      (delete-directory proposal-dir t)
+      (delete-directory skill-dir t))))
+
+(ert-deftest org-ai-skills-ui-proposal-apply-to-skill-file-unavailable-while-running ()
+  "Skill-file apply should be unavailable while run status is running."
+  (let ((message-log nil)
+        (org-ai-skills--ui-run-state
+         (list :status 'running
+               :slot-key "slot-1")))
+    (cl-letf (((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (push (apply #'format format-string args) message-log))))
+      (org-ai-skills-ui-apply-selected-proposal-to-skill-file))
+    (should (equal (car message-log)
+                   "org-ai-skills: skill-file apply unavailable while running"))))
+
+(ert-deftest org-ai-skills-ui-preview-selected-proposal-renders-buffer ()
+  "Preview command should render selected proposal details."
+  (let ((proposal-dir (make-temp-file "org-ai-skills-proposals-" t)))
+    (unwind-protect
+        (let* ((org-ai-skills-proposal-store-dir proposal-dir)
+               (proposal (org-ai-skills--persist-proposal
+                          (list :proposal-id "proposal-preview-1"
+                                :created-at "2026-02-22T00:00:00+0000"
+                                :type "skill-pattern-proposal"
+                                :status "proposed"
+                                :source-slot-key "slot-1"
+                                :source-candidate-id "cand-1"
+                                :target-skill-id "gen-notes"
+                                :target-skill-file "/tmp/gen-notes.org"
+                                :rationale "Preview rationale"
+                                :confidence 0.5
+                                :risk "medium"
+                                :patterns
+                                (list :steps ["Step one"]
+                                      :checks ["Check one"]
+                                      :failure-handling ["Retry once"]
+                                      :heuristics ["Prefer concise edits"])))))
+          (let ((org-ai-skills--ui-run-state
+                 (list :status 'ready
+                       :slot-key "slot-1"
+                       :selected-proposal proposal)))
+            (org-ai-skills-ui-preview-selected-proposal)
+            (with-current-buffer (get-buffer "*org-ai-skills-proposal*")
+              (goto-char (point-min))
+              (should (re-search-forward "Proposal ID: proposal-preview-1" nil t))
+              (should (re-search-forward "Target skill: gen-notes" nil t))
+              (should (re-search-forward "Preview rationale" nil t))
+              (should (re-search-forward "Step one" nil t)))))
+      (delete-directory proposal-dir t))))
+
+(ert-deftest org-ai-skills-ui-preview-selected-proposal-unavailable-while-running ()
+  "Preview should be unavailable while run status is running."
+  (let ((message-log nil)
+        (org-ai-skills--ui-run-state
+         (list :status 'running
+               :slot-key "slot-1")))
+    (cl-letf (((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (push (apply #'format format-string args) message-log))))
+      (org-ai-skills-ui-preview-selected-proposal))
+    (should (equal (car message-log)
+                   "org-ai-skills: proposal preview unavailable while running"))))
+
 (ert-deftest org-ai-skills-ui-control-buffer-renders-candidate-history ()
   "Control buffer should render candidate history list for the current slot."
   (let ((store-dir (make-temp-file "org-ai-skills-versions-" t)))

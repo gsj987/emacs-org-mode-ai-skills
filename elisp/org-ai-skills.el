@@ -140,6 +140,12 @@ Each ID is a short key, and TASK is the full planner intent text."
   :type 'directory
   :group 'org-ai-skills)
 
+(defcustom org-ai-skills-proposal-store-dir
+  (expand-file-name "~/.emacs.d/skills/proposals/")
+  "Directory for persisted proposal artifacts."
+  :type 'directory
+  :group 'org-ai-skills)
+
 (defcustom org-ai-skills-auto-apply-generated-candidate t
   "When non-nil, interactive generation auto-applies the newly generated candidate.
 When nil, interactive flow asks user to select a candidate explicitly."
@@ -321,6 +327,8 @@ When set to an empty string, dispatch falls back to the default execution system
 (define-error 'org-ai-skills-execution-error "Code block execution error")
 
 (define-error 'org-ai-skills-version-store-error "Version store error")
+(define-error 'org-ai-skills-proposal-store-error "Proposal store error")
+(define-error 'org-ai-skills-safety-error "Runtime safety constraint violation")
 
 (defvar org-ai-skills--last-debug-entry nil
   "Last debug entry captured for gptel dispatch.")
@@ -351,11 +359,17 @@ Each entry is a plist with at least :timestamp, :event-type, :log-level,
 (defvar org-ai-skills--candidate-selection-history nil
   "Minibuffer history for candidate selection prompts.")
 
+(defvar org-ai-skills--proposal-selection-history nil
+  "Minibuffer history for proposal selection prompts.")
+
 (defconst org-ai-skills-control-buffer-name "*org-ai-skills-control*"
   "Buffer name for runtime control panel.")
 
 (defconst org-ai-skills-dag-buffer-name "*org-ai-skills-dag*"
   "Buffer name for execution DAG view.")
+
+(defconst org-ai-skills-proposal-preview-buffer-name "*org-ai-skills-proposal*"
+  "Buffer name for proposal preview.")
 
 (defvar org-ai-skills--ui-window-configuration nil
   "Window configuration captured before opening control workspace.")
@@ -372,6 +386,13 @@ Each entry is a plist with at least :timestamp, :event-type, :log-level,
     (define-key map (kbd "c") #'org-ai-skills-ui-select-candidate)
     (define-key map (kbd "a") #'org-ai-skills-ui-apply-selected-candidate)
     (define-key map (kbd "d") #'org-ai-skills-ui-discard-selected-candidate)
+    (define-key map (kbd "x") #'org-ai-skills-ui-extract-pattern-proposal)
+    (define-key map (kbd "p") #'org-ai-skills-ui-select-proposal)
+    (define-key map (kbd "y") #'org-ai-skills-ui-approve-selected-proposal)
+    (define-key map (kbd "n") #'org-ai-skills-ui-reject-selected-proposal)
+    (define-key map (kbd "m") #'org-ai-skills-ui-apply-selected-proposal)
+    (define-key map (kbd "M") #'org-ai-skills-ui-apply-selected-proposal-to-skill-file)
+    (define-key map (kbd "v") #'org-ai-skills-ui-preview-selected-proposal)
     (define-key map (kbd "q") #'org-ai-skills-ui-close-workspace)
     (define-key map (kbd "r") #'org-ai-skills-ui-refresh-control-buffer)
     map)
@@ -1526,12 +1547,15 @@ Caller must ensure point is at a valid Org heading."
   (replace-regexp-in-string "[),.;:!?，。；：！？）]+\\'" "" (or text "")))
 
 (defun org-ai-skills--normalize-existing-directory (path)
-  "Return existing directory for PATH, or nil when unavailable."
+  "Return normalized directory hint for PATH.
+Prefer existing paths; when unavailable, return expanded absolute/tilde hint."
   (when (and (stringp path) (not (string-empty-p path)))
-    (let ((abs (expand-file-name (org-ai-skills--trim-path-punctuation path))))
+    (let* ((trimmed (org-ai-skills--trim-path-punctuation path))
+           (abs (expand-file-name trimmed)))
       (cond
        ((file-directory-p abs) abs)
        ((file-exists-p abs) (file-name-directory abs))
+       ((string-match-p "\\`\\(?:~\\|/\\)" trimmed) abs)
        (t nil)))))
 
 (defun org-ai-skills--extract-directory-from-purpose (purpose)
@@ -1540,7 +1564,7 @@ Caller must ensure point is at a valid Org heading."
     (let ((start 0)
           (found nil))
       (while (and (not found)
-                  (string-match "\\(?:~\\|/\\)[^ \t\n\"'“”‘’<>|]+" purpose start))
+                  (string-match "\\(?:~\\|/\\)[A-Za-z0-9._~/-]*[A-Za-z0-9_~/-]" purpose start))
         (setq found (org-ai-skills--normalize-existing-directory
                      (match-string 0 purpose)))
         (setq start (match-end 0)))
@@ -2886,6 +2910,48 @@ Keep valid non-indented drawers intact."
           (setq last-skills skills))))
     last-skills))
 
+(defun org-ai-skills--planner-run-state-target-skill-id (run-state)
+  "Return target skill id inferred from planner RUN-STATE."
+  (let ((skills (org-ai-skills--run-state-last-step-skill-ids run-state)))
+    (when (and (listp skills) (> (length skills) 0))
+      (car (last skills)))))
+
+(defun org-ai-skills--planner-run-state-skill-file (run-state skill-id)
+  "Return skill file path for SKILL-ID from planner RUN-STATE metadata."
+  (let ((meta (seq-find
+               (lambda (entry)
+                 (equal (plist-get entry :skill-id) skill-id))
+               (or (plist-get run-state :metadata-snapshot) nil))))
+    (and meta (plist-get meta :file))))
+
+(defun org-ai-skills--resolve-target-skill-from-ui-run-state (ui-run-state)
+  "Resolve target skill binding plist from UI-RUN-STATE.
+Return plist with :skill-id, :skill-file, and :source; return nil when unknown."
+  (let* ((rewrite-skill (plist-get ui-run-state :skill))
+         (rewrite-skill-id (and (consp rewrite-skill)
+                                (plist-get rewrite-skill :skill-id)))
+         (rewrite-skill-file (and (consp rewrite-skill)
+                                  (plist-get rewrite-skill :file))))
+    (cond
+     ((stringp (plist-get ui-run-state :target-skill-id))
+      (list :skill-id (plist-get ui-run-state :target-skill-id)
+            :skill-file (plist-get ui-run-state :target-skill-file)
+            :source "ui-state"))
+     ((stringp rewrite-skill-id)
+      (list :skill-id rewrite-skill-id
+            :skill-file rewrite-skill-file
+            :source "rewrite"))
+     (t
+      (let* ((planner-state (plist-get ui-run-state :planner-run-state))
+             (planner-skill-id (and (consp planner-state)
+                                    (org-ai-skills--planner-run-state-target-skill-id planner-state)))
+             (planner-skill-file (and (stringp planner-skill-id)
+                                      (org-ai-skills--planner-run-state-skill-file planner-state planner-skill-id))))
+        (when (stringp planner-skill-id)
+          (list :skill-id planner-skill-id
+                :skill-file planner-skill-file
+                :source "planner-last-step")))))))
+
 (defun org-ai-skills--planner-constraints-for-run-state (run-state)
   "Return rewrite constraints inferred from final completed step of RUN-STATE."
   (let ((skills (org-ai-skills--run-state-last-step-skill-ids run-state))
@@ -3399,9 +3465,18 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
          (candidates (if (stringp slot-key)
                          (org-ai-skills--load-slot-candidates slot-key)
                        nil))
+         (proposals (if (stringp slot-key)
+                        (condition-case nil
+                            (org-ai-skills--load-proposals slot-key)
+                          (org-ai-skills-proposal-store-error nil))
+                      nil))
          (heading (or (org-ai-skills--ui-run-get :heading) ""))
          (selected (org-ai-skills--ui-run-get :selected-candidate))
          (selected-id (or (and selected (plist-get selected :candidate-id)) "none"))
+         (selected-proposal (org-ai-skills--ui-run-get :selected-proposal))
+         (selected-proposal-id (or (and selected-proposal
+                                        (plist-get selected-proposal :proposal-id))
+                                   "none"))
          (rerun-enabled (and (functionp (org-ai-skills--ui-run-get :rerun-fn))
                              (not running)))
          (adjust-enabled (and (memq run-type '(planner rewrite))
@@ -3417,6 +3492,25 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
               (plist-get dag-state :plan-revisions)
               (plist-get dag-state :steps)
               (plist-get dag-state :events)))
+         (extract-enabled (and candidate-enabled (not running)))
+         (proposal-enabled (and (listp proposals) (> (length proposals) 0)))
+         (preview-enabled (and proposal-enabled (not running)))
+         (approve-enabled (and proposal-enabled
+                               (not running)
+                               (let ((status* (and selected-proposal
+                                                   (plist-get selected-proposal :status))))
+                                 (equal status* "proposed"))))
+         (reject-enabled (and proposal-enabled
+                              (not running)
+                              (let ((status* (and selected-proposal
+                                                  (plist-get selected-proposal :status))))
+                                (member status* '("proposed" "approved")))))
+         (proposal-apply-enabled (and proposal-enabled
+                                     (not running)
+                                     (let ((status* (and selected-proposal
+                                                         (plist-get selected-proposal :status))))
+                                       (equal status* "approved"))))
+         (proposal-file-apply-enabled proposal-apply-enabled)
          (stop-enabled running)
          (key-face (lambda (enabled)
                      (if enabled
@@ -3439,7 +3533,8 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
                             " / "
                           "")
                         preset))
-        (insert (format "Selected candidate: %s\n\n" selected-id))
+        (insert (format "Selected candidate: %s\n" selected-id))
+        (insert (format "Selected proposal: %s\n\n" selected-proposal-id))
         (insert "Keys:\n")
         (insert (propertize "  s stop run" 'face (funcall key-face stop-enabled)) "\n")
         (insert (propertize "  g rerun" 'face (funcall key-face rerun-enabled)) "\n")
@@ -3448,6 +3543,13 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
         (insert (propertize "  c select candidate (minibuffer)" 'face (funcall key-face candidate-enabled)) "\n")
         (insert (propertize "  a apply selected candidate" 'face (funcall key-face apply-enabled)) "\n")
         (insert (propertize "  d discard selected candidate" 'face (funcall key-face discard-enabled)) "\n")
+        (insert (propertize "  x extract pattern proposal (manual)" 'face (funcall key-face extract-enabled)) "\n")
+        (insert (propertize "  p select proposal (minibuffer)" 'face (funcall key-face proposal-enabled)) "\n")
+        (insert (propertize "  v preview selected proposal" 'face (funcall key-face preview-enabled)) "\n")
+        (insert (propertize "  y approve selected proposal" 'face (funcall key-face approve-enabled)) "\n")
+        (insert (propertize "  n reject selected proposal" 'face (funcall key-face reject-enabled)) "\n")
+        (insert (propertize "  m apply selected proposal" 'face (funcall key-face proposal-apply-enabled)) "\n")
+        (insert (propertize "  M apply proposal to target skill file (confirm)" 'face (funcall key-face proposal-file-apply-enabled)) "\n")
         (insert (propertize "  r refresh" 'face (funcall key-face t)) "\n")
         (insert (propertize "  q close workspace" 'face (funcall key-face t)) "\n")
         (insert "\n")
@@ -3461,6 +3563,28 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
               (insert (org-ai-skills--ui-candidate-list-display
                        candidate idx preview-width selected-id)
                       "\n")
+              (setq idx (1+ idx)))))
+        (insert "\n")
+        (insert (format "Proposals (%d):\n" (length proposals)))
+        (if (null proposals)
+            (insert "  (none)\n")
+          (let ((idx 0))
+            (dolist (proposal proposals)
+              (let* ((proposal-id (or (plist-get proposal :proposal-id) ""))
+                     (status* (or (plist-get proposal :status) "proposed"))
+                     (status-mark (pcase status*
+                                    ("approved" "Y")
+                                    ("rejected" "N")
+                                    ("applied" "M")
+                                    (_ "P")))
+                     (selected-mark (if (equal proposal-id selected-proposal-id) "*" " "))
+                     (source-id (or (plist-get proposal :source-candidate-id) "")))
+                (insert (format " %s%02d [%s] %s (%s)\n"
+                                selected-mark
+                                (1+ idx)
+                                status-mark
+                                proposal-id
+                                source-id)))
               (setq idx (1+ idx)))))
         (goto-char (point-min))))))
 
@@ -4301,6 +4425,581 @@ Return nil when both checks pass."
 
 (org-ai-skills-core-provider-register-default-commands)
 
+(defun org-ai-skills--signal-proposal-store-error (message)
+  "Signal proposal store error with MESSAGE."
+  (signal 'org-ai-skills-proposal-store-error (list message)))
+
+(defun org-ai-skills--ensure-proposal-store-dir ()
+  "Ensure proposal artifact store directory exists."
+  (condition-case err
+      (progn
+        (make-directory org-ai-skills-proposal-store-dir t)
+        org-ai-skills-proposal-store-dir)
+    (error
+     (org-ai-skills--signal-proposal-store-error
+      (format "Failed to prepare proposal store dir: %s" (error-message-string err))))))
+
+(defun org-ai-skills--proposal-id ()
+  "Return a unique proposal artifact id."
+  (format "proposal-%s-%06x"
+          (format-time-string "%Y%m%d%H%M%S%3N")
+          (random #xFFFFFF)))
+
+(defun org-ai-skills--proposal-store-file (proposal-id)
+  "Return proposal store file path for PROPOSAL-ID."
+  (expand-file-name
+   (format "%s.json" proposal-id)
+   (org-ai-skills--ensure-proposal-store-dir)))
+
+(defun org-ai-skills--persist-proposal (proposal)
+  "Persist one PROPOSAL artifact as JSON."
+  (let* ((proposal-id (or (plist-get proposal :proposal-id)
+                          (org-ai-skills--signal-proposal-store-error
+                           "Proposal artifact missing proposal-id")))
+         (file (org-ai-skills--proposal-store-file proposal-id)))
+    (condition-case err
+        (let ((coding-system-for-write 'utf-8-unix))
+          (with-temp-buffer
+            (insert (json-serialize proposal))
+            (insert "\n")
+            (write-region (point-min) (point-max) file nil 'silent))
+          proposal)
+      (error
+       (org-ai-skills--signal-proposal-store-error
+        (format "Failed to write proposal artifact: %s" (error-message-string err)))))))
+
+(defun org-ai-skills--proposal-audit-file ()
+  "Return proposal audit log file path."
+  (expand-file-name
+   "audit-log.jsonl"
+   (org-ai-skills--ensure-proposal-store-dir)))
+
+(defun org-ai-skills--append-proposal-audit-event (proposal-id action &optional note)
+  "Append proposal audit event for PROPOSAL-ID ACTION and optional NOTE."
+  (let ((file (org-ai-skills--proposal-audit-file))
+        (entry (list :event-id (org-ai-skills--candidate-id)
+                     :proposal-id proposal-id
+                     :action action
+                     :note (or note "")
+                     :actor (or user-login-name "")
+                     :timestamp (format-time-string "%Y-%m-%dT%H:%M:%S%z")
+                     :run-id (or (org-ai-skills--ui-run-get :run-id) "")
+                     :slot-key (or (org-ai-skills--ui-run-get :slot-key) ""))))
+    (condition-case err
+        (let ((coding-system-for-write 'utf-8-unix))
+          (with-temp-buffer
+            (insert (json-serialize entry))
+            (insert "\n")
+            (write-region (point-min) (point-max) file t 'silent)))
+      (error
+       (org-ai-skills--signal-proposal-store-error
+        (format "Failed to append proposal audit event: %s"
+                (error-message-string err)))))))
+
+(defun org-ai-skills--load-proposal (proposal-id)
+  "Load persisted proposal artifact by PROPOSAL-ID."
+  (let ((file (org-ai-skills--proposal-store-file proposal-id)))
+    (unless (file-exists-p file)
+      (org-ai-skills--signal-proposal-store-error
+       (format "Proposal not found: %s" proposal-id)))
+    (condition-case err
+        (let ((coding-system-for-read 'utf-8-unix))
+          (json-parse-string
+           (with-temp-buffer
+             (insert-file-contents file)
+             (buffer-string))
+           :object-type 'plist
+           :array-type 'list
+           :null-object nil
+           :false-object nil))
+      (error
+       (org-ai-skills--signal-proposal-store-error
+        (format "Failed to read proposal artifact: %s" (error-message-string err)))))))
+
+(defun org-ai-skills--proposal-sort-key (proposal)
+  "Return sorting key for PROPOSAL."
+  (or (plist-get proposal :created-at) ""))
+
+(defun org-ai-skills--load-proposals (&optional slot-key)
+  "Load persisted proposal artifacts, optionally filtered by SLOT-KEY."
+  (let* ((dir (org-ai-skills--ensure-proposal-store-dir))
+         (files (sort (file-expand-wildcards (expand-file-name "proposal-*.json" dir) t)
+                      #'string<))
+         (items nil))
+    (dolist (file files)
+      (condition-case err
+          (let* ((coding-system-for-read 'utf-8-unix)
+                 (proposal (json-parse-string
+                            (with-temp-buffer
+                              (insert-file-contents file)
+                              (buffer-string))
+                            :object-type 'plist
+                            :array-type 'list
+                            :null-object nil
+                            :false-object nil)))
+            (when (or (null slot-key)
+                      (equal (plist-get proposal :source-slot-key) slot-key))
+              (push proposal items)))
+        (error
+         (org-ai-skills--signal-proposal-store-error
+          (format "Failed to read proposal artifact: %s" (error-message-string err))))))
+    (sort items
+          (lambda (a b)
+            (string< (org-ai-skills--proposal-sort-key b)
+                     (org-ai-skills--proposal-sort-key a))))))
+
+(defun org-ai-skills--proposal-display (proposal)
+  "Return minibuffer display string for PROPOSAL."
+  (format "[%s] %s | %s | %s"
+          (or (plist-get proposal :status) "proposed")
+          (or (plist-get proposal :created-at) "")
+          (or (plist-get proposal :proposal-id) "")
+          (or (plist-get proposal :source-candidate-id) "")))
+
+(defun org-ai-skills--read-proposal (&optional slot-key)
+  "Read one proposal, filtered by SLOT-KEY when non-nil."
+  (let* ((items (org-ai-skills--load-proposals slot-key))
+         (pairs (mapcar (lambda (item)
+                          (cons (org-ai-skills--proposal-display item) item))
+                        items))
+         (_ (unless pairs
+              (org-ai-skills--signal-proposal-store-error
+               "No proposals available for current slot")))
+         (choice (completing-read "Proposal: "
+                                  (mapcar #'car pairs)
+                                  nil t nil
+                                  'org-ai-skills--proposal-selection-history)))
+    (cdr (assoc choice pairs))))
+
+(defun org-ai-skills--proposal-transition-allowed-p (current-status next-status)
+  "Return non-nil when CURRENT-STATUS can transition to NEXT-STATUS."
+  (member next-status
+          (pcase current-status
+            ("proposed" '("approved" "rejected"))
+            ("approved" '("applied" "rejected"))
+            ("rejected" '("approved"))
+            (_ nil))))
+
+(defun org-ai-skills--proposal-skill-path-p (path)
+  "Return non-nil when PATH is under `org-ai-skills-skill-dir'."
+  (and (stringp path)
+       (file-in-directory-p (expand-file-name path)
+                            (expand-file-name org-ai-skills-skill-dir))))
+
+(defun org-ai-skills--assert-proposal-safe-apply (proposal)
+  "Signal when PROPOSAL implies runtime mutation under skill spec directory."
+  (let* ((target-skill-file (plist-get proposal :target-skill-file))
+         (raw-files (plist-get proposal :proposed-files))
+         (files (cond
+                 ((vectorp raw-files) (append raw-files nil))
+                 ((listp raw-files) raw-files)
+                 (t nil)))
+         (unsafe-files (seq-filter #'org-ai-skills--proposal-skill-path-p files)))
+    (when (or (org-ai-skills--proposal-skill-path-p target-skill-file)
+              (and (listp unsafe-files) (> (length unsafe-files) 0)))
+      (signal 'org-ai-skills-safety-error
+              (list "Runtime apply cannot mutate files under skills/; proposal must remain artifact-only")))))
+
+(defun org-ai-skills--proposal-build-skill-file-patch-block (proposal)
+  "Build org text block appended to target skill file for PROPOSAL."
+  (let* ((proposal-id (or (plist-get proposal :proposal-id) ""))
+         (target-skill-id (or (plist-get proposal :target-skill-id) ""))
+         (source-candidate-id (or (plist-get proposal :source-candidate-id) ""))
+         (rationale (or (plist-get proposal :rationale) ""))
+         (patterns (plist-get proposal :patterns))
+         (steps (org-ai-skills--proposal-seq->list (plist-get patterns :steps)))
+         (checks (org-ai-skills--proposal-seq->list (plist-get patterns :checks)))
+         (failure (org-ai-skills--proposal-seq->list (plist-get patterns :failure-handling)))
+         (heuristics (org-ai-skills--proposal-seq->list (plist-get patterns :heuristics))))
+    (with-temp-buffer
+      (insert "\n** Extracted Pattern Proposal: " proposal-id "\n")
+      (insert ":PROPERTIES:\n")
+      (insert ":TARGET_SKILL_ID: " target-skill-id "\n")
+      (insert ":SOURCE_PROPOSAL_ID: " proposal-id "\n")
+      (insert ":SOURCE_CANDIDATE_ID: " source-candidate-id "\n")
+      (insert ":CAPTURED_AT: " (format-time-string "%Y-%m-%dT%H:%M:%S%z") "\n")
+      (insert ":END:\n\n")
+      (insert "Rationale:\n")
+      (insert "- " rationale "\n\n")
+      (insert "Steps:\n")
+      (if steps
+          (dolist (item steps) (insert "- " item "\n"))
+        (insert "- (none)\n"))
+      (insert "\nChecks:\n")
+      (if checks
+          (dolist (item checks) (insert "- " item "\n"))
+        (insert "- (none)\n"))
+      (insert "\nFailure handling:\n")
+      (if failure
+          (dolist (item failure) (insert "- " item "\n"))
+        (insert "- (none)\n"))
+      (insert "\nHeuristics:\n")
+      (if heuristics
+          (dolist (item heuristics) (insert "- " item "\n"))
+        (insert "- (none)\n"))
+      (buffer-string))))
+
+(defun org-ai-skills--append-proposal-to-target-skill-file (proposal)
+  "Append PROPOSAL-derived patch block to its bound target skill file."
+  (let* ((proposal-id (or (plist-get proposal :proposal-id) ""))
+         (target-file (or (plist-get proposal :target-skill-file) "")))
+    (unless (and (stringp target-file) (not (string-empty-p target-file)))
+      (org-ai-skills--signal-proposal-store-error
+       "Proposal does not specify target skill file"))
+    (unless (org-ai-skills--proposal-skill-path-p target-file)
+      (org-ai-skills--signal-proposal-store-error
+       (format "Target skill file is outside skills directory: %s" target-file)))
+    (unless (file-exists-p target-file)
+      (org-ai-skills--signal-proposal-store-error
+       (format "Target skill file does not exist: %s" target-file)))
+    (let ((marker (format ":SOURCE_PROPOSAL_ID: %s" proposal-id)))
+      (with-temp-buffer
+        (insert-file-contents target-file)
+        (goto-char (point-min))
+        (when (re-search-forward (regexp-quote marker) nil t)
+          (org-ai-skills--signal-proposal-store-error
+           (format "Proposal already applied to target skill file: %s" proposal-id)))))
+    (let ((block (org-ai-skills--proposal-build-skill-file-patch-block proposal)))
+      (condition-case err
+          (let ((coding-system-for-write 'utf-8-unix))
+            (with-temp-buffer
+              (insert-file-contents target-file)
+              (goto-char (point-max))
+              (unless (bolp) (insert "\n"))
+              (insert block)
+              (write-region (point-min) (point-max) target-file nil 'silent)))
+        (error
+         (org-ai-skills--signal-proposal-store-error
+          (format "Failed to apply proposal to target skill file: %s"
+                  (error-message-string err))))))))
+
+(defun org-ai-skills--proposal-transition (proposal next-status &optional note apply-mode)
+  "Transition PROPOSAL to NEXT-STATUS with NOTE and APPLY-MODE when applied."
+  (let* ((proposal-id (or (plist-get proposal :proposal-id)
+                          (org-ai-skills--signal-proposal-store-error
+                           "Proposal artifact missing proposal-id")))
+         (current-status (or (plist-get proposal :status) "proposed")))
+    (unless (org-ai-skills--proposal-transition-allowed-p current-status next-status)
+      (org-ai-skills--signal-proposal-store-error
+       (format "Invalid proposal transition: %s -> %s" current-status next-status)))
+    (when (and (equal next-status "applied")
+               (or (null apply-mode) (equal apply-mode "artifact-only")))
+      (org-ai-skills--assert-proposal-safe-apply proposal))
+    (let* ((updated (copy-sequence proposal))
+           (timestamp (format-time-string "%Y-%m-%dT%H:%M:%S%z")))
+      (setq updated (plist-put updated :status next-status))
+      (pcase next-status
+        ((or "approved" "rejected")
+         (setq updated
+               (plist-put updated :review
+                          (list :decision next-status
+                                :reviewed-at timestamp
+                                :reviewed-by (or user-login-name "")
+                                :note (or note "")))))
+        ("applied"
+         (setq updated
+               (plist-put updated :application
+                          (list :mode (or apply-mode "artifact-only")
+                                :applied-at timestamp
+                                :applied-by (or user-login-name "")
+                                :note (or note ""))))))
+      (org-ai-skills--persist-proposal updated)
+      (org-ai-skills--append-proposal-audit-event proposal-id next-status note)
+      updated)))
+
+(defun org-ai-skills--ui-effective-proposal ()
+  "Return selected proposal, or latest slot proposal when none selected."
+  (or (org-ai-skills--ui-run-get :selected-proposal)
+      (car (org-ai-skills--load-proposals (org-ai-skills--ui-run-get :slot-key)))))
+
+(defun org-ai-skills--proposal-seq->list (value)
+  "Return VALUE as a list when it is a sequence, else nil."
+  (cond
+   ((vectorp value) (append value nil))
+   ((listp value) value)
+   (t nil)))
+
+(defun org-ai-skills--ui-proposal-preview-buffer ()
+  "Return proposal preview buffer."
+  (get-buffer-create org-ai-skills-proposal-preview-buffer-name))
+
+(defun org-ai-skills--insert-proposal-pattern-section (title items)
+  "Insert proposal pattern section TITLE for sequence ITEMS."
+  (insert (format "%s:\n" title))
+  (if (null items)
+      (insert "  (none)\n")
+    (dolist (item items)
+      (insert (format "  - %s\n" item)))))
+
+(defun org-ai-skills--normalize-pattern-line (line)
+  "Normalize extracted LINE for proposal pattern artifacts."
+  (string-trim
+   (replace-regexp-in-string "^[ \t]*[-+*0-9.()]+[ \t]*" "" (or line ""))))
+
+(defun org-ai-skills--collect-pattern-lines (text regexp &optional limit)
+  "Collect normalized lines from TEXT matching REGEXP up to LIMIT."
+  (let ((max-lines (or limit 5))
+        (results nil))
+    (dolist (raw-line (split-string (or text "") "\n"))
+      (let ((line (string-trim raw-line)))
+        (when (and (not (string-empty-p line))
+                   (string-match-p regexp line)
+                   (< (length results) max-lines))
+          (push (org-ai-skills--normalize-pattern-line line) results))))
+    (nreverse results)))
+
+(defun org-ai-skills--extract-pattern-groups (text)
+  "Extract reusable pattern groups from candidate TEXT."
+  (list
+   :steps (vconcat (org-ai-skills--collect-pattern-lines text "^[ \t]*\\(?:[-+*]\\|[0-9]+[.)]\\)" 6))
+   :checks (vconcat (org-ai-skills--collect-pattern-lines text
+                                                          "\\b\\(check\\|verify\\|validate\\|assert\\|ensure\\|must\\)\\b"
+                                                          5))
+   :failure-handling (vconcat (org-ai-skills--collect-pattern-lines text
+                                                                    "\\b\\(fail\\|error\\|retry\\|fallback\\|recover\\|rollback\\)\\b"
+                                                                    5))
+   :heuristics (vconcat (org-ai-skills--collect-pattern-lines text
+                                                              "\\b\\(prefer\\|avoid\\|if\\b.*\\bthen\\|when\\|unless\\)\\b"
+                                                              5))))
+
+(defun org-ai-skills--proposal-confidence (patterns)
+  "Return extraction confidence float from PATTERNS."
+  (let* ((groups (list (plist-get patterns :steps)
+                       (plist-get patterns :checks)
+                       (plist-get patterns :failure-handling)
+                       (plist-get patterns :heuristics)))
+         (non-empty (seq-count (lambda (group) (and (sequencep group) (> (length group) 0)))
+                               groups)))
+    (/ non-empty 4.0)))
+
+(defun org-ai-skills--proposal-risk-level (patterns)
+  "Return risk level string inferred from extracted PATTERNS."
+  (cond
+   ((and (= (length (plist-get patterns :steps)) 0)
+         (= (length (plist-get patterns :checks)) 0)
+         (= (length (plist-get patterns :failure-handling)) 0)
+         (= (length (plist-get patterns :heuristics)) 0))
+    "high")
+   ((and (> (length (plist-get patterns :checks)) 0)
+         (> (length (plist-get patterns :failure-handling)) 0))
+    "low")
+   (t "medium")))
+
+(defun org-ai-skills--extract-pattern-proposal-from-candidate (candidate run-state)
+  "Build and persist one pattern proposal artifact from CANDIDATE and RUN-STATE."
+  (let* ((proposal-id (org-ai-skills--proposal-id))
+         (output-text (or (plist-get candidate :output-text) ""))
+         (target-skill (org-ai-skills--resolve-target-skill-from-ui-run-state run-state))
+         (target-skill-id (and (consp target-skill) (plist-get target-skill :skill-id)))
+         (target-skill-file (and (consp target-skill) (plist-get target-skill :skill-file)))
+         (_ (unless (stringp target-skill-id)
+              (org-ai-skills--signal-proposal-store-error
+               "Cannot extract proposal: target skill is missing in previous run context")))
+         (patterns (org-ai-skills--extract-pattern-groups output-text))
+         (confidence (org-ai-skills--proposal-confidence patterns))
+         (risk (org-ai-skills--proposal-risk-level patterns))
+         (rationale
+                  (format "Manual extraction from candidate %s (%s groups, confidence %.2f)."
+                  (or (plist-get candidate :candidate-id) "unknown")
+                  (seq-count (lambda (group) (and (sequencep group) (> (length group) 0)))
+                             (list (plist-get patterns :steps)
+                                   (plist-get patterns :checks)
+                                   (plist-get patterns :failure-handling)
+                                   (plist-get patterns :heuristics)))
+                  confidence))
+         (proposal
+          (list :proposal-id proposal-id
+                :created-at (format-time-string "%Y-%m-%dT%H:%M:%S%z")
+                :type "skill-pattern-proposal"
+                :status "proposed"
+                :extraction-mode "manual-control-panel"
+                :source-run-id (or (plist-get run-state :run-id) "")
+                :source-run-type (if (plist-get run-state :run-type)
+                                     (format "%s" (plist-get run-state :run-type))
+                                   "")
+                :source-task (or (plist-get run-state :task) "")
+                :source-slot-key (or (plist-get candidate :slot-key) "")
+                :source-slot-id (or (plist-get candidate :slot-id) "")
+                :source-slot-file (or (plist-get candidate :slot-file) "")
+                :source-slot-heading (or (plist-get candidate :slot-heading) "")
+                :source-candidate-id (or (plist-get candidate :candidate-id) "")
+                :source-candidate-created-at (or (plist-get candidate :created-at) "")
+                :prompt-digest (or (plist-get candidate :prompt-digest) "")
+                :target-skill-id target-skill-id
+                :target-skill-file (or target-skill-file "")
+                :target-skill-source (or (plist-get target-skill :source) "")
+                :application-mode "artifact-only"
+                :proposed-files []
+                :patterns patterns
+                :rationale rationale
+                :confidence confidence
+                :risk risk
+                :review nil)))
+    (org-ai-skills--persist-proposal proposal)))
+
+(defun org-ai-skills--ui-effective-candidate-for-extraction ()
+  "Return selected candidate, or latest slot candidate when none selected."
+  (or (org-ai-skills--ui-run-get :selected-candidate)
+      (let* ((slot-key (org-ai-skills--ui-run-get :slot-key))
+             (items (and (stringp slot-key)
+                         (org-ai-skills--load-slot-candidates slot-key))))
+        (car items))))
+
+(defun org-ai-skills-ui-extract-pattern-proposal ()
+  "Extract reusable patterns manually and persist a proposal artifact."
+  (interactive)
+  (if (eq (org-ai-skills--ui-run-get :status) 'running)
+      (message "org-ai-skills: extract unavailable while running")
+    (let ((candidate (org-ai-skills--ui-effective-candidate-for-extraction)))
+      (unless candidate
+        (org-ai-skills--signal-version-store-error
+         "No candidate available for manual pattern extraction"))
+      (let ((proposal (org-ai-skills--extract-pattern-proposal-from-candidate
+                       candidate
+                       org-ai-skills--ui-run-state)))
+        (org-ai-skills--ui-run-set :selected-candidate candidate)
+        (org-ai-skills--ui-run-set :selected-proposal proposal)
+        (org-ai-skills--ui-clear-overlay)
+        (org-ai-skills--ui-set-status 'ready "pattern-proposal-extracted")
+        (message "org-ai-skills proposal extracted: %s"
+                 (plist-get proposal :proposal-id))))))
+
+(defun org-ai-skills-ui-select-proposal ()
+  "Select one proposal in minibuffer and cache it in UI state."
+  (interactive)
+  (let* ((slot-key (org-ai-skills--ui-run-get :slot-key))
+         (proposal (org-ai-skills--read-proposal slot-key)))
+    (org-ai-skills--ui-run-set :selected-proposal proposal)
+    (org-ai-skills--ui-set-status 'ready "proposal-selected")
+    proposal))
+
+(defun org-ai-skills-ui-approve-selected-proposal ()
+  "Approve selected proposal from UI state."
+  (interactive)
+  (if (eq (org-ai-skills--ui-run-get :status) 'running)
+      (message "org-ai-skills: proposal approve unavailable while running")
+    (let* ((proposal (or (org-ai-skills--ui-run-get :selected-proposal)
+                         (org-ai-skills-ui-select-proposal)))
+           (updated (org-ai-skills--proposal-transition proposal "approved")))
+      (org-ai-skills--ui-run-set :selected-proposal updated)
+      (org-ai-skills--ui-set-status 'ready "proposal-approved")
+      (message "org-ai-skills proposal approved: %s"
+               (plist-get updated :proposal-id)))))
+
+(defun org-ai-skills-ui-reject-selected-proposal ()
+  "Reject selected proposal from UI state."
+  (interactive)
+  (if (eq (org-ai-skills--ui-run-get :status) 'running)
+      (message "org-ai-skills: proposal reject unavailable while running")
+    (let* ((proposal (or (org-ai-skills--ui-run-get :selected-proposal)
+                         (org-ai-skills-ui-select-proposal)))
+           (updated (org-ai-skills--proposal-transition proposal "rejected")))
+      (org-ai-skills--ui-run-set :selected-proposal updated)
+      (org-ai-skills--ui-set-status 'ready "proposal-rejected")
+      (message "org-ai-skills proposal rejected: %s"
+               (plist-get updated :proposal-id)))))
+
+(defun org-ai-skills-ui-apply-selected-proposal ()
+  "Apply selected approved proposal from UI state."
+  (interactive)
+  (if (eq (org-ai-skills--ui-run-get :status) 'running)
+      (message "org-ai-skills: proposal apply unavailable while running")
+    (let* ((proposal (or (org-ai-skills--ui-run-get :selected-proposal)
+                         (org-ai-skills-ui-select-proposal)))
+           (updated (org-ai-skills--proposal-transition proposal "applied")))
+      (org-ai-skills--ui-run-set :selected-proposal updated)
+      (org-ai-skills--ui-set-status 'ready "proposal-applied")
+      (message "org-ai-skills proposal applied (artifact-only): %s"
+               (plist-get updated :proposal-id)))))
+
+(defun org-ai-skills-ui-apply-selected-proposal-to-skill-file ()
+  "Apply selected approved proposal to bound target skill file with confirmation."
+  (interactive)
+  (if (eq (org-ai-skills--ui-run-get :status) 'running)
+      (message "org-ai-skills: skill-file apply unavailable while running")
+    (let* ((proposal (or (org-ai-skills--ui-run-get :selected-proposal)
+                         (org-ai-skills-ui-select-proposal)))
+           (proposal-id (or (plist-get proposal :proposal-id) ""))
+           (target-file (or (plist-get proposal :target-skill-file) ""))
+           (status* (or (plist-get proposal :status) "proposed")))
+      (unless (equal status* "approved")
+        (org-ai-skills--signal-proposal-store-error
+         (format "Proposal must be approved before skill-file apply (current: %s)" status*)))
+      (unless (yes-or-no-p
+               (format "Apply proposal %s to skill file %s? "
+                       proposal-id target-file))
+        (org-ai-skills--signal-proposal-store-error "Skill-file apply canceled"))
+      (org-ai-skills--append-proposal-to-target-skill-file proposal)
+      (let ((updated (org-ai-skills--proposal-transition
+                      proposal
+                      "applied"
+                      "applied-to-skill-file"
+                      "skill-file-append")))
+        (org-ai-skills--ui-run-set :selected-proposal updated)
+        (org-ai-skills--ui-set-status 'ready "proposal-applied-skill-file")
+        (message "org-ai-skills proposal applied to skill file: %s"
+                 (plist-get updated :proposal-id))))))
+
+(defun org-ai-skills-ui-preview-selected-proposal ()
+  "Preview selected proposal details in a read-only buffer."
+  (interactive)
+  (if (eq (org-ai-skills--ui-run-get :status) 'running)
+      (message "org-ai-skills: proposal preview unavailable while running")
+    (let* ((proposal (or (org-ai-skills--ui-run-get :selected-proposal)
+                         (org-ai-skills-ui-select-proposal)))
+           (patterns (plist-get proposal :patterns))
+           (review (plist-get proposal :review))
+           (application (plist-get proposal :application))
+           (buffer (org-ai-skills--ui-proposal-preview-buffer)))
+      (org-ai-skills--ui-run-set :selected-proposal proposal)
+      (with-current-buffer buffer
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert "org-ai-skills proposal preview\n\n")
+          (insert (format "Proposal ID: %s\n" (or (plist-get proposal :proposal-id) "")))
+          (insert (format "Status: %s\n" (or (plist-get proposal :status) "")))
+          (insert (format "Type: %s\n" (or (plist-get proposal :type) "")))
+          (insert (format "Created: %s\n" (or (plist-get proposal :created-at) "")))
+          (insert (format "Target skill: %s\n" (or (plist-get proposal :target-skill-id) "")))
+          (insert (format "Target skill file: %s\n" (or (plist-get proposal :target-skill-file) "")))
+          (insert (format "Target source: %s\n" (or (plist-get proposal :target-skill-source) "")))
+          (insert (format "Source candidate: %s\n" (or (plist-get proposal :source-candidate-id) "")))
+          (insert (format "Slot: %s\n" (or (plist-get proposal :source-slot-key) "")))
+          (insert (format "Confidence: %s\n" (or (plist-get proposal :confidence) "")))
+          (insert (format "Risk: %s\n\n" (or (plist-get proposal :risk) "")))
+          (insert "Rationale:\n")
+          (insert (format "  %s\n\n" (or (plist-get proposal :rationale) "")))
+          (org-ai-skills--insert-proposal-pattern-section
+           "Steps"
+           (org-ai-skills--proposal-seq->list (plist-get patterns :steps)))
+          (insert "\n")
+          (org-ai-skills--insert-proposal-pattern-section
+           "Checks"
+           (org-ai-skills--proposal-seq->list (plist-get patterns :checks)))
+          (insert "\n")
+          (org-ai-skills--insert-proposal-pattern-section
+           "Failure handling"
+           (org-ai-skills--proposal-seq->list (plist-get patterns :failure-handling)))
+          (insert "\n")
+          (org-ai-skills--insert-proposal-pattern-section
+           "Heuristics"
+           (org-ai-skills--proposal-seq->list (plist-get patterns :heuristics)))
+          (insert "\nReview metadata:\n")
+          (if (consp review)
+              (insert (format "%s\n" (pp-to-string review)))
+            (insert "  (none)\n"))
+          (insert "\nApplication metadata:\n")
+          (if (consp application)
+              (insert (format "%s\n" (pp-to-string application)))
+            (insert "  (none)\n"))
+          (insert "\nRaw proposal:\n")
+          (insert (pp-to-string proposal))
+          (goto-char (point-min))
+          (special-mode)))
+      (display-buffer buffer)
+      (org-ai-skills--ui-set-status 'ready "proposal-previewed")
+      proposal)))
+
 (defun org-ai-skills--parse-function-arg-names (arg-spec)
   "Parse ARG-SPEC string like \"(query date)\" into argument names."
   (let* ((raw (or arg-spec ""))
@@ -4713,6 +5412,8 @@ When TARGET is nil, resolve current subtree."
            :heading (plist-get slot :heading)
            :slot-key (plist-get slot :slot-key)
            :slot-id (plist-get slot :slot-id)
+           :target-skill-id (plist-get skill :skill-id)
+           :target-skill-file (plist-get skill :file)
            :skill skill
            :instruction instruction
            :working-directory working-directory
@@ -4859,6 +5560,8 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
            :heading (plist-get slot :heading)
            :slot-key (plist-get slot :slot-key)
            :slot-id (plist-get slot :slot-id)
+           :target-skill-id nil
+           :target-skill-file nil
            :skill nil
            :instruction nil
            :task task
@@ -4897,14 +5600,20 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
                                 (org-ai-skills--enforce-rewrite-constraints
                                  rewritten slot planner-constraints)))
                     (apply-target (or (org-ai-skills--resolve-subtree-from-slot slot buffer)
-                                      (and (markerp begin)
-                                           (marker-buffer begin)
-                                           (markerp end)
-                                           (marker-buffer end)
-                                           (list :begin begin
-                                                 :end end
-                                                 :context-mode (plist-get slot :context-mode))))))
+                                    (and (markerp begin)
+                                         (marker-buffer begin)
+                                         (markerp end)
+                                         (marker-buffer end)
+                                         (list :begin begin
+                                               :end end
+                                               :context-mode (plist-get slot :context-mode))))))
                (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                 (let* ((target-skill-id (org-ai-skills--planner-run-state-target-skill-id run-state))
+                        (target-skill-file (and (stringp target-skill-id)
+                                                (org-ai-skills--planner-run-state-skill-file
+                                                 run-state target-skill-id))))
+                   (org-ai-skills--ui-run-set :target-skill-id target-skill-id)
+                   (org-ai-skills--ui-run-set :target-skill-file target-skill-file))
                  (org-ai-skills--ui-run-set :planner-run-state run-state)
                  (org-ai-skills--ui-run-set :selected-candidate candidate)
                  (org-ai-skills--ui-set-status 'ready "candidate-ready"))
