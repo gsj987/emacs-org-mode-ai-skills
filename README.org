@@ -246,6 +246,13 @@ Control workspace keys (in =*org-ai-skills-control*=):
 - =c=: open minibuffer candidate selector
 - =a=: apply currently selected candidate (unavailable while running)
 - =d=: mark selected candidate as discarded (unavailable while running)
+- =x=: manually extract reusable patterns from selected/latest candidate into proposal artifact (unavailable while running)
+- =p=: select proposal from current slot (minibuffer)
+- =v=: preview selected proposal details in =*org-ai-skills-proposal*=
+- =y=: approve selected proposal (unavailable while running; only =proposed= proposals)
+- =n=: reject selected proposal (unavailable while running; supports =proposed= or =approved= proposals)
+- =m=: apply selected proposal (artifact-only apply; requires =approved=)
+- =M=: apply selected proposal to target skill file (confirmed; requires =approved=; unavailable while running)
 - =q=: close workspace (run continues in background; use =s= to stop)
 - =r=: refresh control buffer
 
@@ -289,7 +296,23 @@ Output handling:
   - Org file keywords fallback: =#+PURPOSE:=, =#+SOURCE_FILE_PATH:=
 - Each run persists one candidate version under:
   - =~/.emacs.d/skills/versions/=
+- Pattern extraction is manual (not auto-triggered per run):
+  - Use =x= in control panel to create one proposal artifact from current candidate state.
+- Each extracted proposal is bound to one target skill inferred from previous run context:
+  - rewrite run: current rewrite skill
+  - planner run: last completed step skill in planner run-state
+  - extraction fails if target skill cannot be resolved
+- Proposal artifacts are persisted under:
+  - =~/.emacs.d/skills/proposals/=
+- Proposal audit log is appended at:
+  - =~/.emacs.d/skills/proposals/audit-log.jsonl=
 - Candidate store read/write uses UTF-8 by default.
+- Runtime safety gate:
+  - proposal apply refuses runtime mutation under =skills/= (artifact-only apply path).
+- Confirmed skill-file apply workflow:
+  - Approve proposal first (=y=), then run =M=.
+  - System asks confirmation and appends an extracted-pattern block to =:target-skill-file=.
+  - Proposal status transitions to =applied= with application mode =skill-file-append=.
 - If headline =:ID:= is missing, runtime auto-generates and writes it back before candidate persistence.
 - Overlay behavior:
   - running: highlight target region as processing
