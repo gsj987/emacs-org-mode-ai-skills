@@ -1,0 +1,47 @@
+#+TITLE: PRD 016 - Skill Self-Boosting with Human-in-the-Loop Review
+#+STARTUP: overview
+
+* Problem
+The runtime does not currently learn systematically from completed runs. Useful patterns are lost, and skill quality evolves slowly without structured extraction, proposal, and review.
+
+* Scope
+- In scope:
+  - Capture run outcomes and candidate reusable patterns.
+  - Generate proposed skill updates from extracted patterns.
+  - Add human review and explicit apply/reject workflow before any skill change.
+  - Keep immutable audit trail of proposals and review decisions.
+- Out of scope:
+  - Automatic direct mutation of active skill specs without approval.
+  - Fully autonomous policy changes.
+  - Cross-project skill sharing infrastructure.
+
+* Constraints
+- Technical constraints:
+  - Preserve strict separation: proposal artifacts vs active skill specs.
+  - Ensure reproducible extraction prompts and deterministic proposal metadata.
+  - Prevent runtime mutation of skill spec files.
+- Process constraints:
+  - Human approval is mandatory before application.
+  - All accepted/rejected proposals must be traceable.
+
+* Expected Behavior
+- Behavior 1:
+  - After a run, system can extract candidate patterns (steps, checks, failure handling, heuristics) into proposal artifacts.
+- Behavior 2:
+  - A reviewer can inspect a proposal diff, rationale, confidence, and risk before decision.
+- Behavior 3:
+  - Only approved proposals are applied via explicit workflow; rejected proposals remain archived.
+- Behavior 4:
+  - Extraction and proposal quality are testable with fixture-based evaluation.
+
+* Tasks
+- [ ] Define proposal artifact schema and storage location.
+- [ ] Implement pattern extraction pipeline from run traces.
+- [ ] Implement proposal generator for skill updates (draft patch + rationale).
+- [ ] Implement review/apply/reject workflow with audit log.
+- [ ] Add safety checks preventing direct runtime skill mutation.
+- [ ] Add ERT tests for extraction quality gates, proposal generation, and review control flow.
+- [ ] Update README with self-boosting lifecycle and operator workflow.
+
+* Worklog
+- 2026-02-22 :: PRD created for skill self-boosting with mandatory human review and proposal-based updates. Test status: not run.

@@ -1,0 +1,46 @@
+#+TITLE: PRD 017 - Org Skill Code Block Support and Debug Workflow
+#+STARTUP: overview
+
+* Problem
+Org skill flows need first-class support for code blocks and debugging in-place. Current flow is not explicit enough for code-block execution lifecycle, failure diagnosis, and iterative repair.
+
+* Scope
+- In scope:
+  - Parse and identify executable code blocks within org skill contexts.
+  - Execute supported code blocks with captured stdout/stderr/exit status.
+  - Add debug workflow for rerun, inspect artifacts, and patch suggestions.
+  - Surface execution metadata in org buffers for traceability.
+- Out of scope:
+  - Full replacement of Org Babel behavior.
+  - Unbounded language runtime provisioning.
+  - Remote/containerized execution orchestration.
+
+* Constraints
+- Technical constraints:
+  - Execution must be explicit, sandbox-aware, and language-scoped.
+  - Preserve reproducibility: inputs, env, and outputs should be recordable.
+  - Debug flow must not silently mutate unrelated org content.
+- Process constraints:
+  - New execution/debug behavior requires ERT coverage.
+  - Any supported language additions must include validation and tests.
+
+* Expected Behavior
+- Behavior 1:
+  - Users can run an org skill code block and receive structured result output.
+- Behavior 2:
+  - On failure, debug view shows error context, command/runtime metadata, and rerun controls.
+- Behavior 3:
+  - Users can iterate with explicit rerun and optional patch proposal workflow.
+- Behavior 4:
+  - Execution and debug events are logged for observability and later analysis.
+
+* Tasks
+- [ ] Define code block execution contract (language, args, env, artifacts).
+- [ ] Implement parser/integration for org skill code block discovery.
+- [ ] Implement execution engine adapters with structured output capture.
+- [ ] Implement debug flow for failed blocks (inspect, rerun, propose fix).
+- [ ] Add ERT tests for success/failure/debug rerun scenarios.
+- [ ] Update README with org code block execution and debugging usage.
+
+* Worklog
+- 2026-02-22 :: PRD created for org skill code block execution and debugging lifecycle. Test status: not run.

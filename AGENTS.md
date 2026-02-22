@@ -109,3 +109,58 @@ All implementations should preserve:
 - Spec vs Run separation
 - Proposal-based evolution
 - Governance layer
+
+## 7. Parallel Feature Development Strategy (Git Worktree + Multi-Codex)
+
+When multiple features are developed in parallel, all agents must follow this protocol.
+
+### 7.1 Branch and Worktree Setup
+
+- Use one feature branch per PRD from the same baseline commit (usually `main`).
+- Use one worktree per feature branch.
+- Naming convention:
+  - Branch: `feat/<prd-id>-<short-name>`
+  - Worktree folder: `../org-ai-skills-<prd-id>`
+- Example:
+  - `git worktree add ../org-ai-skills-014 -b feat/014-observability main`
+
+### 7.2 Ownership and File Boundaries
+
+- Each branch must have a primary ownership area declared in its PRD.
+- Avoid cross-branch edits to the same files unless explicitly planned.
+- Shared foundational changes must be isolated into a dedicated foundation PR first.
+- If overlap is unavoidable, document expected conflict points in each PRD.
+
+### 7.3 PRD-First Enforcement Per Branch
+
+- Each branch must create/update its own PRD before implementation.
+- PRD must include:
+  - Scope boundary
+  - Constraints
+  - Expected behavior
+  - Task checklist
+  - Worklog entries
+- Do not start coding until PRD exists in that branch.
+
+### 7.4 Test Isolation and Safety
+
+- Every branch adds/updates only tests required by its own PRD scope.
+- Tests must pass in the feature branch before opening PR.
+- Do not delete or weaken existing tests to reduce merge friction.
+
+### 7.5 Merge and Rebase Strategy
+
+- Merge order:
+  - Foundation/shared-infra branch first (if any).
+  - Then features with lowest dependency depth.
+- After each merge to `main`, remaining feature branches must rebase on latest `main`.
+- Resolve conflicts with root-cause fixes, not temporary bypasses.
+
+### 7.6 Required PR Checklist (Per Feature Branch)
+
+- [ ] PRD exists and is up to date.
+- [ ] Implementation matches PRD scope.
+- [ ] ERT tests added/updated and passing.
+- [ ] README updated when behavior changes.
+- [ ] PRD worklog appended with implementation and test status.
+- [ ] No unplanned edits outside declared ownership area.

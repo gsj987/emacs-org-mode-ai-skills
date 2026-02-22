@@ -1,0 +1,48 @@
+#+TITLE: PRD 014 - Planning & Execution Performance and Observability
+#+STARTUP: overview
+
+* Problem
+Planning and execution currently lack consistent performance telemetry and runtime visibility. This makes it hard to identify slow paths, control LLM usage cost, and debug multi-step workflows.
+
+* Scope
+- In scope:
+  - Add timing instrumentation for major planning and execution phases.
+  - Add token and estimated cost accounting per run and per stage.
+  - Add a visual DAG view for plan and execution graph, including node status.
+  - Add structured run artifacts for later analysis and debugging.
+- Out of scope:
+  - Provider-side billing reconciliation.
+  - External tracing backend integration.
+  - Full UI redesign beyond observability surfaces needed for this PRD.
+
+* Constraints
+- Technical constraints:
+  - Keep instrumentation overhead low and bounded.
+  - Preserve spec vs run-state separation.
+  - DAG rendering must degrade gracefully when graph metadata is partial.
+  - Cost/token data must tolerate provider fields missing or inconsistent.
+- Process constraints:
+  - No implementation before PRD approval.
+  - Behavior changes require tests and README updates.
+
+* Expected Behavior
+- Behavior 1:
+  - Each run records stage-level time cost (start/end/duration), token usage, and estimated monetary cost.
+- Behavior 2:
+  - Users can inspect an execution DAG with node state (pending/running/success/failure/skipped), dependencies, and per-node metrics.
+- Behavior 3:
+  - Failures include observability metadata needed for root-cause analysis.
+- Behavior 4:
+  - Metrics are deterministic enough for tests via injectable clocks/fixtures.
+
+* Tasks
+- [ ] Define run metrics schema for timing/token/cost and DAG node metadata.
+- [ ] Instrument planning pipeline phases with stable event emission.
+- [ ] Instrument execution pipeline phases with stable event emission.
+- [ ] Implement provider-normalized token/cost adapter layer.
+- [ ] Implement DAG rendering interface and minimal view in org workflow.
+- [ ] Add ERT tests for timing, token aggregation, and DAG state transitions.
+- [ ] Update README with observability and performance inspection usage.
+
+* Worklog
+- 2026-02-22 :: PRD created for planning/execution performance + observability with timing/token/cost and DAG requirements. Test status: not run.

@@ -1,0 +1,46 @@
+#+TITLE: PRD 015 - Core Layer Provider Commands for Complex Tasks
+#+STARTUP: overview
+
+* Problem
+The system lacks a clearly defined core command layer that exposes basic Emacs capabilities to the LLM in a safe, composable way. Without this layer, complex tasks become brittle and hard to test.
+
+* Scope
+- In scope:
+  - Define a core command catalog for fundamental editor/project operations.
+  - Add a provider abstraction that maps command intents to Emacs implementations.
+  - Add capability boundaries, argument validation, and structured result schema.
+  - Support command composition to enable multi-step higher-level tasks.
+- Out of scope:
+  - Arbitrary shell command execution by default.
+  - Domain-specific skill logic outside the core command layer.
+  - Replacing existing skill governance flows.
+
+* Constraints
+- Technical constraints:
+  - Commands must be deterministic/testable with clear input/output contracts.
+  - Avoid hidden global state mutation; side effects must be explicit.
+  - Must support future provider extensions without breaking compatibility.
+- Process constraints:
+  - No behavior changes without ERT coverage.
+  - Any breaking contract proposal must be documented before implementation.
+
+* Expected Behavior
+- Behavior 1:
+  - LLM-facing core commands expose stable interfaces for navigation, read/write, search, and structured edits.
+- Behavior 2:
+  - Every command returns normalized success/error payloads with actionable diagnostics.
+- Behavior 3:
+  - Command permissions and preconditions are validated before execution.
+- Behavior 4:
+  - Complex tasks can chain core commands with predictable intermediate state.
+
+* Tasks
+- [ ] Define command taxonomy and contract (inputs, outputs, errors, side effects).
+- [ ] Implement provider abstraction and command registry in `elisp/`.
+- [ ] Implement initial command set for core editing and project operations.
+- [ ] Add guardrails for permission checks and argument validation.
+- [ ] Add ERT tests for command correctness, validation failures, and composition.
+- [ ] Update README with core layer purpose and extension pattern.
+
+* Worklog
+- 2026-02-22 :: PRD created for core provider command layer and composable command execution contracts. Test status: not run.
