@@ -20,6 +20,15 @@
 (require 'pp)
 (require 'json)
 
+;; Forward declarations for dynamically bound gptel variables.
+;; These are defined by gptel at runtime; declaring here avoids lexical
+;; fallback behavior when tests stub `gptel-request' without loading gptel.
+(defvar gptel-model nil)
+(defvar gptel-temperature nil)
+(defvar gptel-max-tokens nil)
+(defvar gptel-tools nil)
+(defvar gptel-use-tools nil)
+
 (defgroup org-ai-skills nil
   "Experimental cognitive runtime for Org-based AI skills."
   :group 'tools
@@ -45,6 +54,23 @@ Requires `org-ai-skills-debug-enabled' to be non-nil."
 (defcustom org-ai-skills-debug-buffer-name "*org-ai-skills-debug*"
   "Buffer name used for org-ai-skills debug logs."
   :type 'string
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-debug-filter-level nil
+  "Optional log level filter for debug inspection commands.
+When nil, include all levels."
+  :type '(choice (const :tag "All levels" nil)
+                 (const :tag "Debug" debug)
+                 (const :tag "Info" info)
+                 (const :tag "Warn" warn)
+                 (const :tag "Error" error))
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-debug-filter-step nil
+  "Optional step/stage filter for debug inspection commands.
+When nil, include all steps and stages."
+  :type '(choice (const :tag "All steps/stages" nil)
+                 (string :tag "Step or stage id"))
   :group 'org-ai-skills)
 
 (defcustom org-ai-skills-planner-max-steps 6
@@ -182,6 +208,23 @@ Set to nil to use gptel/backend default."
                  (integer :tag "Max tokens"))
   :group 'org-ai-skills)
 
+(defcustom org-ai-skills-observability-now-function #'current-time
+  "Function used to read current time for observability metrics."
+  :type 'function
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-observability-cost-per-1k-input-tokens nil
+  "Optional estimated USD cost per 1k input tokens when provider omits cost."
+  :type '(choice (const :tag "No local estimate" nil)
+                 (number :tag "USD per 1k input tokens"))
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-observability-cost-per-1k-output-tokens nil
+  "Optional estimated USD cost per 1k output tokens when provider omits cost."
+  :type '(choice (const :tag "No local estimate" nil)
+                 (number :tag "USD per 1k output tokens"))
+  :group 'org-ai-skills)
+
 (defconst org-ai-skills--default-system-prompt-planner
   (string-join
    '("You are the planner for org-ai-skills."
@@ -261,6 +304,11 @@ When set to an empty string, dispatch falls back to the default execution system
 (defvar org-ai-skills--last-debug-entry nil
   "Last debug entry captured for gptel dispatch.")
 
+(defvar org-ai-skills--debug-events nil
+  "Raw debug events, newest first.
+Each entry is a plist with at least :timestamp, :event-type, :log-level,
+:step-id, :stage-id, :request, and :entry.")
+
 (defvar org-ai-skills--last-planner-task nil
   "Last task string used by planner run commands.")
 
@@ -285,6 +333,9 @@ When set to an empty string, dispatch falls back to the default execution system
 (defconst org-ai-skills-control-buffer-name "*org-ai-skills-control*"
   "Buffer name for runtime control panel.")
 
+(defconst org-ai-skills-dag-buffer-name "*org-ai-skills-dag*"
+  "Buffer name for execution DAG view.")
+
 (defvar org-ai-skills--ui-window-configuration nil
   "Window configuration captured before opening control workspace.")
 
@@ -296,6 +347,7 @@ When set to an empty string, dispatch falls back to the default execution system
     (define-key map (kbd "s") #'org-ai-skills-ui-stop-run)
     (define-key map (kbd "g") #'org-ai-skills-ui-rerun)
     (define-key map (kbd "t") #'org-ai-skills-ui-adjust-task-or-instruction)
+    (define-key map (kbd "v") #'org-ai-skills-ui-show-dag)
     (define-key map (kbd "c") #'org-ai-skills-ui-select-candidate)
     (define-key map (kbd "a") #'org-ai-skills-ui-apply-selected-candidate)
     (define-key map (kbd "d") #'org-ai-skills-ui-discard-selected-candidate)
@@ -687,13 +739,140 @@ This parser intentionally avoids extracting full context sections."
               (list "Planner response does not contain a JSON object")))
     (substring cleaned start end)))
 
+(defun org-ai-skills--container-values (container)
+  "Return child values from CONTAINER for recursive scans."
+  (cond
+   ((hash-table-p container)
+    (let ((vals nil))
+      (maphash (lambda (_k v) (push v vals)) container)
+      vals))
+   ((and (listp container)
+         (or (null container) (listp (cdr container)))
+         (consp (car container))
+         (not (keywordp (caar container))))
+    (mapcar #'cdr container))
+   ((and (listp container)
+         (or (null container) (listp (cdr container)))
+         (keywordp (car container)))
+    (let ((vals nil)
+          (tail (cdr container)))
+      (while tail
+        (push (car tail) vals)
+        (setq tail (cddr tail)))
+      (nreverse vals)))
+   ((and (listp container)
+         (or (null container) (listp (cdr container))))
+    container)
+   (t nil)))
+
+(defun org-ai-skills--key-variants (key)
+  "Return likely key variants for KEY across plist/alist/json forms."
+  (let* ((name (cond
+                ((keywordp key) (substring (symbol-name key) 1))
+                ((symbolp key) (symbol-name key))
+                (t (format "%s" key))))
+         (dash (replace-regexp-in-string "_" "-" name))
+         (under (replace-regexp-in-string "-" "_" name))
+         (camel (let ((parts (split-string under "_" t)))
+                  (if (null parts)
+                      name
+                    (concat (downcase (car parts))
+                            (mapconcat (lambda (part)
+                                         (if (string-empty-p part)
+                                             ""
+                                           (concat (upcase (substring part 0 1))
+                                                   (downcase (substring part 1)))))
+                                       (cdr parts)
+                                       "")))))
+         (variants nil))
+    (dolist (raw (delete-dups (list name dash under camel)))
+      (push raw variants)
+      (push (intern raw) variants)
+      (push (intern (concat ":" raw)) variants))
+    (delete-dups (nreverse variants))))
+
+(defun org-ai-skills--lookup-key (container key)
+  "Lookup KEY in CONTAINER across plist/alist/hash-table key variants."
+  (let ((miss (make-symbol "miss")))
+    (catch 'found
+      (dolist (variant (org-ai-skills--key-variants key))
+        (let ((value
+               (cond
+                ((hash-table-p container)
+                 (gethash variant container miss))
+                ((and (listp container)
+                      (consp (car container))
+                      (not (keywordp (caar container))))
+                 (let ((pair (assoc variant container)))
+                   (if pair (cdr pair) miss)))
+                ((and (listp container)
+                      (or (keywordp variant) (symbolp variant)))
+                 (let ((pv (plist-get container variant)))
+                   (if (null pv) miss pv)))
+                (t miss))))
+          (unless (eq value miss)
+            (throw 'found value))))
+      nil)))
+
 (defun org-ai-skills--plist-value (plist &rest keys)
-  "Return first non-nil value in PLIST matching KEYS."
+  "Return first non-nil value in PLIST-like structure matching KEYS."
   (let ((value nil))
     (while (and keys (null value))
-      (setq value (plist-get plist (car keys)))
+      (setq value (org-ai-skills--lookup-key plist (car keys)))
       (setq keys (cdr keys)))
     value))
+
+(defun org-ai-skills--find-first-value-recursive (object keys &optional depth)
+  "Return first value in OBJECT matching KEYS via bounded recursive scan."
+  (let ((depth (or depth 4)))
+    (when (>= depth 0)
+      (or (apply #'org-ai-skills--plist-value object keys)
+          (let ((found nil)
+                (children (org-ai-skills--container-values object)))
+            (while (and children (null found))
+              (setq found
+                    (org-ai-skills--find-first-value-recursive
+                     (car children)
+                     keys
+                     (1- depth)))
+              (setq children (cdr children)))
+            found)))))
+
+(defun org-ai-skills--usage-observed-p (usage)
+  "Return non-nil when normalized USAGE includes any numeric signal."
+  (or (numberp (plist-get usage :input-tokens))
+      (numberp (plist-get usage :output-tokens))
+      (numberp (plist-get usage :total-tokens))
+      (numberp (plist-get usage :estimated-cost-usd))))
+
+(defun org-ai-skills--usage-score (usage)
+  "Return completeness score for normalized USAGE."
+  (+ (if (numberp (plist-get usage :input-tokens)) 1 0)
+     (if (numberp (plist-get usage :output-tokens)) 1 0)
+     (if (numberp (plist-get usage :total-tokens)) 2 0)
+     (if (numberp (plist-get usage :estimated-cost-usd)) 1 0)))
+
+(defun org-ai-skills--select-provider-usage-source (first info current-source)
+  "Return best provider-usage source from callback FIRST/INFO/CURRENT-SOURCE."
+  (let* ((candidates (list (and (listp info) (plist-get info :data))
+                           (and (listp info) (plist-get info :usage))
+                           info
+                           first
+                           current-source))
+         (best current-source)
+         (best-usage (org-ai-skills--normalize-provider-usage current-source))
+         (best-score (org-ai-skills--usage-score best-usage)))
+    (dolist (candidate candidates)
+      (let ((usage (org-ai-skills--normalize-provider-usage candidate)))
+        (when (and candidate (org-ai-skills--usage-observed-p usage))
+          (let ((score (org-ai-skills--usage-score usage)))
+            (when (> score best-score)
+              (setq best candidate
+                    best-usage usage
+                    best-score score))))))
+    (if (org-ai-skills--usage-observed-p best-usage)
+        best
+      current-source)))
 
 (defun org-ai-skills--chunk-list (items size)
   "Split ITEMS into chunks of SIZE."
@@ -1154,6 +1333,343 @@ INSTRUCTION overrides the default rewrite goal."
         (when steps
           (plist-get (car (last steps)) :output)))))
 
+(defun org-ai-skills--observability-now-ms ()
+  "Return current timestamp in milliseconds for observability events."
+  (let ((now (funcall org-ai-skills-observability-now-function)))
+    (truncate
+     (* 1000.0
+        (cond
+         ((numberp now) now)
+         ((listp now) (float-time now))
+         (t (float-time (current-time))))))))
+
+(defun org-ai-skills--run-state-append-timing-event (run-state stage-id start-ms end-ms
+                                                               &optional extra-fields)
+  "Append timing event to RUN-STATE for STAGE-ID from START-MS to END-MS.
+EXTRA-FIELDS is a plist merged into the event."
+  (let* ((events (or (plist-get run-state :events) nil))
+         (event (append (list :stage-id stage-id
+                              :start-ms start-ms
+                              :end-ms end-ms
+                              :duration-ms (max 0 (- end-ms start-ms)))
+                        extra-fields)))
+    (plist-put (copy-sequence run-state) :events (append events (list event)))))
+
+(defun org-ai-skills--run-state-record-plan (run-state plan &optional revision source)
+  "Record PLAN snapshot into RUN-STATE with REVISION and SOURCE."
+  (let* ((rev (or revision (or (plist-get run-state :plan-revision) 1)))
+         (entry (list :plan-revision rev
+                      :source (or source 'planner)
+                      :plan plan))
+         (history (or (plist-get run-state :plan-revisions) nil))
+         (last-entry (car (last history)))
+         (same-as-last
+          (and last-entry
+               (= (or (plist-get last-entry :plan-revision) 0) rev)
+               (equal (plist-get last-entry :source) (plist-get entry :source))
+               (equal (plist-get last-entry :plan) plan))))
+    (plist-put
+     (plist-put (plist-put run-state :active-plan plan)
+                :latest-plan plan)
+     :plan-revisions
+     (if same-as-last
+         history
+       (append history (list entry))))))
+
+(defun org-ai-skills-build-execution-dag (run-state &optional plan include-events)
+  "Build execution DAG model from RUN-STATE and optional PLAN.
+When INCLUDE-EVENTS is non-nil, render one node per timing event occurrence."
+  (let* ((plan (or plan
+                   (plist-get run-state :active-plan)
+                   (plist-get run-state :latest-plan)
+                   nil))
+         (steps (or (plist-get run-state :steps) nil))
+         (events (or (plist-get run-state :events) nil))
+         (step-table (make-hash-table :test #'equal))
+         (metric-table (make-hash-table :test #'equal))
+         (plan-step-ids (mapcar (lambda (step)
+                                  (format "%s" (or (plist-get step :step-id) "")))
+                                plan))
+         (nodes nil)
+         (edges nil))
+    (dolist (step steps)
+      (puthash (format "%s" (or (plist-get step :step-id) "")) step step-table))
+    (dolist (event events)
+      (when (and (eq (plist-get event :stage-id) 'execution.step)
+                 (plist-get event :step-id))
+        (let* ((step-id (format "%s" (plist-get event :step-id)))
+               (prev (or (gethash step-id metric-table)
+                         (list :duration-ms 0
+                               :input-tokens 0
+                               :output-tokens 0
+                               :total-tokens 0
+                               :estimated-cost-usd 0.0)))
+               (usage (or (plist-get event :usage) nil)))
+          (puthash
+           step-id
+           (list :duration-ms (+ (or (plist-get prev :duration-ms) 0)
+                                 (or (plist-get event :duration-ms) 0))
+                 :input-tokens (+ (or (plist-get prev :input-tokens) 0)
+                                  (or (plist-get usage :input-tokens) 0))
+                 :output-tokens (+ (or (plist-get prev :output-tokens) 0)
+                                   (or (plist-get usage :output-tokens) 0))
+                 :total-tokens (+ (or (plist-get prev :total-tokens) 0)
+                                  (or (plist-get usage :total-tokens) 0))
+                 :estimated-cost-usd (+ (or (plist-get prev :estimated-cost-usd) 0.0)
+                                        (or (plist-get event :estimated-cost-usd) 0.0)))
+           metric-table))))
+    (if include-events
+        (let ((occurrence-table (make-hash-table :test #'equal))
+              (prev-node-id nil))
+          (dolist (event events)
+            (let* ((stage-id (or (plist-get event :stage-id) 'unknown))
+                   (stage-name (format "%s" stage-id))
+                   (count (1+ (or (gethash stage-name occurrence-table) 0)))
+                   (raw-step-id (plist-get event :step-id))
+                   (step-id (and raw-step-id (format "%s" raw-step-id)))
+                   (event-node-id
+                    (format "%s%s#%d"
+                            stage-name
+                            (if step-id (format ":%s" step-id) "")
+                            count))
+                   (usage (or (plist-get event :usage) nil))
+                   (resolved-step (and step-id (gethash step-id step-table)))
+                   (status (cond
+                            ((eq (plist-get event :status) 'error) 'failure)
+                            ((eq (plist-get event :status) 'failed) 'failure)
+                            ((eq (plist-get event :status) 'running) 'running)
+                            (t 'success)))
+                   (skills (or (plist-get event :skill-ids)
+                               (plist-get resolved-step :skills)
+                               nil))
+                   (goal (or (plist-get resolved-step :goal) ""))
+                   (metrics (list :duration-ms (or (plist-get event :duration-ms) 0)
+                                  :input-tokens (or (plist-get usage :input-tokens) 0)
+                                  :output-tokens (or (plist-get usage :output-tokens) 0)
+                                  :total-tokens (or (plist-get usage :total-tokens) 0)
+                                  :estimated-cost-usd
+                                  (or (plist-get event :estimated-cost-usd) 0.0))))
+              (puthash stage-name count occurrence-table)
+              (push (list :id event-node-id
+                          :goal goal
+                          :skills skills
+                          :status status
+                          :dependencies (if prev-node-id (list prev-node-id) nil)
+                          :metrics metrics)
+                    nodes)
+              (when prev-node-id
+                (push (list :from prev-node-id :to event-node-id) edges))
+              (setq prev-node-id event-node-id))))
+      (let ((seen-step-ids nil))
+        (dolist (step plan)
+          (let* ((step-id (format "%s" (or (plist-get step :step-id) "")))
+                 (done (gethash step-id step-table))
+                 (status (cond
+                          ((null done) 'pending)
+                          ((memq (plist-get done :status) '(done success)) 'success)
+                          ((eq (plist-get done :status) 'failed) 'failure)
+                          (t 'running)))
+                 (deps (seq-filter
+                        (lambda (dep)
+                          (member dep plan-step-ids))
+                        (mapcar #'format
+                                (or (plist-get step :input-from) nil))))
+                 (metrics (or (gethash step-id metric-table)
+                              (list :duration-ms 0
+                                    :input-tokens 0
+                                    :output-tokens 0
+                                    :total-tokens 0
+                                    :estimated-cost-usd 0.0))))
+            (unless (member step-id seen-step-ids)
+              (push step-id seen-step-ids)
+              (push (list :id step-id
+                          :goal (or (plist-get step :goal) "")
+                          :skills (or (plist-get step :skills) nil)
+                          :status status
+                          :dependencies deps
+                          :metrics metrics)
+                    nodes)
+              (dolist (dep deps)
+                (push (list :from dep :to step-id) edges)))))
+        (dolist (step steps)
+          (let ((step-id (format "%s" (or (plist-get step :step-id) ""))))
+            (unless (member step-id plan-step-ids)
+              (push (list :id step-id
+                          :goal (or (plist-get step :goal) "")
+                          :skills (or (plist-get step :skills) nil)
+                          :status (if (memq (plist-get step :status) '(done success))
+                                      'success
+                                    'failure)
+                          :dependencies nil
+                          :metrics (or (gethash step-id metric-table)
+                                       (list :duration-ms 0
+                                             :input-tokens 0
+                                             :output-tokens 0
+                                             :total-tokens 0
+                                             :estimated-cost-usd 0.0)))
+                    nodes))))))
+    (list :nodes (nreverse nodes)
+          :edges (nreverse edges))))
+
+(defun org-ai-skills-render-execution-dag-text (dag)
+  "Render DAG model as compact human-readable text."
+  (let ((nodes (or (plist-get dag :nodes) nil))
+        (edges (or (plist-get dag :edges) nil)))
+    (concat
+     (format "Execution DAG\nNodes: %d  Edges: %d\n\n"
+             (length nodes) (length edges))
+     (if (null nodes)
+         "No DAG nodes available.\n"
+       (mapconcat
+        (lambda (node)
+          (let* ((id (plist-get node :id))
+                 (status (plist-get node :status))
+                 (deps (or (plist-get node :dependencies) nil))
+                 (skills (or (plist-get node :skills) nil))
+                 (metrics (or (plist-get node :metrics) nil)))
+            (format "- [%s] %s\n  deps: %s\n  skills: %s\n  metrics: %dms, in:%d out:%d total:%d cost:$%.6f\n"
+                    status
+                    id
+                    (if deps (string-join deps ", ") "-")
+                    (if skills (string-join skills ", ") "-")
+                    (or (plist-get metrics :duration-ms) 0)
+                    (or (plist-get metrics :input-tokens) 0)
+                    (or (plist-get metrics :output-tokens) 0)
+                    (or (plist-get metrics :total-tokens) 0)
+                    (or (plist-get metrics :estimated-cost-usd) 0.0))))
+        nodes
+        "\n")))))
+
+(defun org-ai-skills-ui-show-dag (&optional run-state)
+  "Show execution DAG for RUN-STATE or current UI planner run."
+  (interactive)
+  (let* ((state (or run-state
+                    (org-ai-skills--ui-run-get :planner-run-state)
+                    org-ai-skills--ui-run-state))
+         (plan (or (plist-get state :active-plan)
+                   (plist-get state :latest-plan)
+                   nil))
+         (dag (org-ai-skills-build-execution-dag state plan (and (plist-get state :events) t)))
+         (buffer (get-buffer-create org-ai-skills-dag-buffer-name)))
+    (if (and (null (plist-get dag :nodes))
+             (null (plist-get dag :edges)))
+        (message "No execution DAG available for current run")
+      (with-current-buffer buffer
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (format "Run id: %s\nPlan revision: %s\n\n"
+                          (or (plist-get state :run-id) "")
+                          (or (plist-get state :plan-revision) "")))
+          (insert (org-ai-skills-render-execution-dag-text dag))
+          (goto-char (point-min))
+          (special-mode))
+        (pop-to-buffer buffer)))))
+
+(defun org-ai-skills--normalize-provider-usage (provider-data)
+  "Normalize PROVIDER-DATA into usage plist with token/cost fields.
+Returns plist with keys:
+- :input-tokens
+- :output-tokens
+- :total-tokens
+- :estimated-cost-usd"
+  (let* ((provider-data
+          (cond
+           ((stringp provider-data)
+            (condition-case nil
+                (json-parse-string provider-data :object-type 'plist :array-type 'list)
+              (error provider-data)))
+           (t provider-data)))
+         (usage (or (org-ai-skills--find-first-value-recursive
+                     provider-data
+                     '(:usage :usage-metadata :usage_metadata :token-usage :token_usage)
+                     4)
+                    provider-data))
+         (input (or (org-ai-skills--find-first-value-recursive
+                     usage
+                     '(:input-tokens :prompt-tokens :input_tokens :prompt_tokens
+                       :prompt-eval-count :prompt_eval_count
+                       :input-token-count :input_token_count
+                       :prompt-token-count :prompt_token_count)
+                     3)
+                    (org-ai-skills--find-first-value-recursive
+                     provider-data
+                     '(:input-tokens :prompt-tokens :input_tokens :prompt_tokens
+                       :prompt-eval-count :prompt_eval_count
+                       :input-token-count :input_token_count
+                       :prompt-token-count :prompt_token_count)
+                     4)))
+         (output (or (org-ai-skills--find-first-value-recursive
+                      usage
+                      '(:output-tokens :completion-tokens :output_tokens :completion_tokens
+                        :eval-count :eval_count
+                        :output-token-count :output_token_count
+                        :completion-token-count :completion_token_count)
+                      3)
+                     (org-ai-skills--find-first-value-recursive
+                      provider-data
+                      '(:output-tokens :completion-tokens :output_tokens :completion_tokens
+                        :eval-count :eval_count
+                        :output-token-count :output_token_count
+                        :completion-token-count :completion_token_count)
+                      4)))
+         (total (or (org-ai-skills--find-first-value-recursive
+                     usage
+                     '(:total-tokens :total_tokens :tokens
+                       :total-token-count :total_token_count)
+                     3)
+                    (org-ai-skills--find-first-value-recursive
+                     provider-data
+                     '(:total-tokens :total_tokens :tokens
+                       :total-token-count :total_token_count)
+                     4)))
+         (cost (or (org-ai-skills--find-first-value-recursive
+                    usage
+                    '(:estimated-cost-usd :cost-usd :total-cost
+                      :estimated_cost :total_cost :cost)
+                    3)
+                   (org-ai-skills--find-first-value-recursive
+                    provider-data
+                    '(:estimated-cost-usd :cost-usd :total-cost
+                      :estimated_cost :total_cost :cost)
+                    4)))
+         (input-n (and (numberp input) input))
+         (output-n (and (numberp output) output))
+         (total-n (cond
+                   ((numberp total) total)
+                   ((or input-n output-n) (+ (or input-n 0) (or output-n 0)))
+                   (t nil)))
+         (estimated-cost
+          (cond
+           ((numberp cost) cost)
+           ((and (numberp org-ai-skills-observability-cost-per-1k-input-tokens)
+                 (numberp org-ai-skills-observability-cost-per-1k-output-tokens)
+                 input-n output-n)
+            (+ (* (/ input-n 1000.0) org-ai-skills-observability-cost-per-1k-input-tokens)
+               (* (/ output-n 1000.0) org-ai-skills-observability-cost-per-1k-output-tokens)))
+           (t nil))))
+    (list :input-tokens input-n
+          :output-tokens output-n
+          :total-tokens total-n
+          :estimated-cost-usd estimated-cost)))
+
+(defun org-ai-skills--run-state-accumulate-usage (run-state usage)
+  "Accumulate normalized USAGE into RUN-STATE aggregate metrics."
+  (let* ((metrics (or (plist-get run-state :metrics) nil))
+         (usage-totals (or (plist-get metrics :usage-totals) nil))
+         (prev-input (or (plist-get usage-totals :input-tokens) 0))
+         (prev-output (or (plist-get usage-totals :output-tokens) 0))
+         (prev-total (or (plist-get usage-totals :total-tokens) 0))
+         (prev-cost (or (plist-get usage-totals :estimated-cost-usd) 0.0))
+         (next-input (+ prev-input (or (plist-get usage :input-tokens) 0)))
+         (next-output (+ prev-output (or (plist-get usage :output-tokens) 0)))
+         (next-total (+ prev-total (or (plist-get usage :total-tokens) 0)))
+         (next-cost (+ prev-cost (or (plist-get usage :estimated-cost-usd) 0.0)))
+         (next-totals (list :input-tokens next-input
+                            :output-tokens next-output
+                            :total-tokens next-total
+                            :estimated-cost-usd next-cost)))
+    (plist-put run-state :metrics (plist-put metrics :usage-totals next-totals))))
+
 (defun org-ai-skills-build-step-request (step run-state loaded-skills)
   "Build one execution request from STEP, RUN-STATE, and LOADED-SKILLS."
   (let* ((task (or (plist-get run-state :task) ""))
@@ -1259,6 +1775,7 @@ INSTRUCTION overrides the default rewrite goal."
   "Execute one planner STEP with RUN-STATE, then invoke CALLBACK.
 Only skills referenced by STEP are loaded from DIRECTORY."
   (let* ((skill-ids (or (plist-get step :skills) nil))
+         (stage-start-ms (org-ai-skills--observability-now-ms))
          (loaded-skills (mapcar (lambda (skill-id)
                                   (org-ai-skills-load-skill-by-id skill-id directory))
                                 skill-ids))
@@ -1277,14 +1794,59 @@ Only skills referenced by STEP are loaded from DIRECTORY."
                  (unless failed
                    (condition-case err
                        (let ((raw (apply #'org-ai-skills--extract-gptel-response-text-if-ready response)))
+                         (let ((first (car response))
+                               (info (cadr response)))
+                           (setq request
+                                 (plist-put
+                                  request
+                                  :provider-data
+                                  (org-ai-skills--select-provider-usage-source
+                                   first info (plist-get request :provider-data)))))
                          (when raw
                            (let* ((output (org-ai-skills--extract-subtree-body raw))
-                                  (updated-run-state (org-ai-skills--record-run-step run-state step output)))
-                             (funcall callback updated-run-state output))))
+                                  (usage (org-ai-skills--normalize-provider-usage
+                                          (plist-get request :provider-data)))
+                                  (updated-run-state (org-ai-skills--record-run-step run-state step output))
+                                  (stage-end-ms (org-ai-skills--observability-now-ms))
+                                  (timed-run-state
+                                   (org-ai-skills--run-state-append-timing-event
+                                    updated-run-state
+                                    'execution.step
+                                    stage-start-ms
+                                    stage-end-ms
+                                    (list :status 'success
+                                          :step-id (plist-get step :step-id)
+                                          :skill-ids (plist-get step :skills)
+                                          :plan-revision (or (plist-get run-state :plan-revision) 1)
+                                          :usage usage
+                                          :estimated-cost-usd
+                                          (plist-get usage :estimated-cost-usd))))
+                                  (metered-run-state
+                                   (org-ai-skills--run-state-accumulate-usage timed-run-state usage)))
+                             (funcall callback metered-run-state output))))
                      (org-ai-skills-gptel-error
                       (setq failed t)
-                      (let ((message (error-message-string err)))
-                        (funcall callback (plist-put run-state :fatal-error message) nil)))))
+                      (let* ((message (error-message-string err))
+                             (stage-end-ms (org-ai-skills--observability-now-ms))
+                             (usage (org-ai-skills--normalize-provider-usage
+                                     (plist-get request :provider-data)))
+                             (timed-run-state
+                              (org-ai-skills--run-state-append-timing-event
+                               run-state
+                               'execution.step
+                               stage-start-ms
+                               stage-end-ms
+                               (list :status 'error
+                                     :step-id (plist-get step :step-id)
+                                     :skill-ids (plist-get step :skills)
+                                     :plan-revision (or (plist-get run-state :plan-revision) 1)
+                                     :usage usage
+                                     :estimated-cost-usd
+                                     (plist-get usage :estimated-cost-usd)
+                                     :error message)))
+                             (metered-run-state
+                              (org-ai-skills--run-state-accumulate-usage timed-run-state usage)))
+                        (funcall callback (plist-put metered-run-state :fatal-error message) nil)))))
                (dolist (skill loaded-skills)
                  (org-ai-skills-exclude-skill-function-calls skill)))))
           (setq dispatched t))
@@ -1319,16 +1881,23 @@ Only skills referenced by STEP are loaded from DIRECTORY."
      plan)))
 
 (defun org-ai-skills--request-planner-plan (task metadata run-state callback)
-  "Request planner plan using TASK, METADATA, and RUN-STATE, then CALLBACK."
+  "Request planner plan using TASK, METADATA, and RUN-STATE.
+CALLBACK receives (PLANNER-RESPONSE UPDATED-RUN-STATE)."
   (let ((request (org-ai-skills-build-planner-request task metadata run-state))
+        (request-start-ms (org-ai-skills--observability-now-ms))
         (planner-text "")
+        (provider-data nil)
         (done nil))
     (org-ai-skills-gptel-dispatch-rewrite
      request
      (lambda (&rest response)
        (unless done
          (let ((first (car response))
+               (info (cadr response))
                (text (apply #'org-ai-skills--extract-gptel-response-text-if-ready response)))
+           (setq provider-data
+                 (org-ai-skills--select-provider-usage-source
+                  first info provider-data))
            (when (and (eq first t)
                       (not done)
                       (not (string-empty-p planner-text)))
@@ -1337,25 +1906,72 @@ Only skills referenced by STEP are loaded from DIRECTORY."
                       "Planner response ended before complete JSON payload was received")))
            (when text
              (setq planner-text (concat planner-text text))
-             (condition-case err
-                 (let ((parsed (org-ai-skills-parse-planner-response
-                                planner-text metadata
-                                (and (listp (plist-get run-state :steps))
-                                     (plist-get run-state :steps)))))
-                   (setq done t)
-                   (funcall callback parsed))
-               (org-ai-skills-planner-error
-                (let ((msg (error-message-string err)))
-                  ;; Some backends emit chunked planner text even when stream is off.
-                  ;; Keep accumulating until JSON is complete.
-                  (unless (or (string-match-p "End of file while parsing JSON" msg)
-                              (string-match-p "does not contain a JSON object" msg))
-                    (signal (car err) (cdr err)))))))))))))
+             (let ((parse-start-ms (org-ai-skills--observability-now-ms)))
+               (condition-case err
+                   (let* ((parsed (org-ai-skills-parse-planner-response
+                                   planner-text metadata
+                                   (and (listp (plist-get run-state :steps))
+                                        (plist-get run-state :steps))))
+                           (parse-end-ms (org-ai-skills--observability-now-ms))
+                           (usage (org-ai-skills--normalize-provider-usage provider-data))
+                           (timed-run-state
+                            (org-ai-skills--run-state-append-timing-event
+                             (org-ai-skills--run-state-append-timing-event
+                              run-state
+                              'planning.parse
+                              parse-start-ms
+                              parse-end-ms
+                              (list :status 'success
+                                    :plan-revision (or (plist-get run-state :plan-revision) 1)
+                                    :usage usage
+                                    :estimated-cost-usd
+                                    (plist-get usage :estimated-cost-usd)))
+                             'planning.request
+                             request-start-ms
+                             parse-end-ms
+                             (list :status 'success
+                                   :plan-revision (or (plist-get run-state :plan-revision) 1)
+                                   :usage usage
+                                   :estimated-cost-usd
+                                   (plist-get usage :estimated-cost-usd))))
+                           (metered-run-state
+                            (org-ai-skills--run-state-accumulate-usage timed-run-state usage)))
+                     (setq done t
+                           run-state metered-run-state)
+                     (funcall callback parsed metered-run-state))
+                  (org-ai-skills-planner-error
+                   (let ((msg (error-message-string err)))
+                    ;; Some backends emit chunked planner text even when stream is off.
+                    ;; Keep accumulating until JSON is complete.
+                    (unless (or (string-match-p "End of file while parsing JSON" msg)
+                                (string-match-p "does not contain a JSON object" msg))
+                       (let* ((error-end-ms (org-ai-skills--observability-now-ms))
+                              (usage (org-ai-skills--normalize-provider-usage provider-data))
+                              (timed-run-state
+                               (org-ai-skills--run-state-append-timing-event
+                                run-state
+                                'planning.request
+                                request-start-ms
+                                error-end-ms
+                                (list :status 'error
+                                      :plan-revision (or (plist-get run-state :plan-revision) 1)
+                                      :usage usage
+                                      :estimated-cost-usd
+                                      (plist-get usage :estimated-cost-usd)
+                                      :error msg))))
+                         (setq run-state (org-ai-skills--run-state-accumulate-usage
+                                          timed-run-state usage)))
+                       (signal (car err) (cdr err))))))))))))))
 
 (defun org-ai-skills--run-plan-steps (task metadata run-state plan callback &optional directory)
   "Run PLAN steps recursively for TASK and METADATA.
 Invoke CALLBACK with final run-state when done."
-  (let ((pending (org-ai-skills--filter-pending-steps plan run-state)))
+  (let* ((run-state (org-ai-skills--run-state-record-plan
+                     run-state
+                     plan
+                     (or (plist-get run-state :plan-revision) 1)
+                     'active))
+         (pending (org-ai-skills--filter-pending-steps plan run-state)))
     (if (null pending)
         (funcall callback
                  (plist-put run-state :final-output
@@ -1364,31 +1980,38 @@ Invoke CALLBACK with final run-state when done."
        (car pending)
        run-state
        (lambda (updated-run-state _output)
-         (if (plist-get updated-run-state :fatal-error)
-             (funcall callback updated-run-state)
-           (if (not org-ai-skills-planner-auto-replan)
-             (org-ai-skills--run-plan-steps
-              task metadata updated-run-state (cdr pending) callback directory)
-             (org-ai-skills--request-planner-plan
-              task
-              metadata
-              updated-run-state
-              (lambda (planner-response)
-                (let ((revised-plan
-                       (org-ai-skills-maybe-replan updated-run-state planner-response)))
-                  (if revised-plan
-                      (let ((next-state
-                             (plist-put
-                              (plist-put updated-run-state
-                                         :plan-revision
-                                         (1+ (or (plist-get updated-run-state
+         (cond
+          ((plist-get updated-run-state :fatal-error)
+           (funcall callback updated-run-state))
+          ((not org-ai-skills-planner-auto-replan)
+           (org-ai-skills--run-plan-steps
+            task metadata updated-run-state (cdr pending) callback directory))
+          (t
+           (org-ai-skills--request-planner-plan
+            task
+            metadata
+            updated-run-state
+            (lambda (planner-response replanned-run-state)
+              (let ((revised-plan
+                     (org-ai-skills-maybe-replan replanned-run-state planner-response)))
+                (if revised-plan
+                    (let* ((next-revision (1+ (or (plist-get replanned-run-state
                                                              :plan-revision)
                                                  1)))
-                              :replans (1+ (or (plist-get updated-run-state :replans) 0)))))
-                        (org-ai-skills--run-plan-steps
-                         task metadata next-state revised-plan callback directory))
-                    (org-ai-skills--run-plan-steps
-                     task metadata updated-run-state (cdr pending) callback directory))))))))
+                           (next-state
+                            (org-ai-skills--run-state-record-plan
+                             (plist-put
+                              (plist-put replanned-run-state
+                                         :plan-revision
+                                         next-revision)
+                              :replans (1+ (or (plist-get replanned-run-state :replans) 0)))
+                             revised-plan
+                             next-revision
+                             'replan)))
+                      (org-ai-skills--run-plan-steps
+                       task metadata next-state revised-plan callback directory))
+                  (org-ai-skills--run-plan-steps
+                   task metadata replanned-run-state (cdr pending) callback directory))))))))
        directory))))
 
 (defun org-ai-skills-run-task-with-planner (task subtree &optional options callback)
@@ -1408,15 +2031,25 @@ OPTIONS is a plist; CALLBACK receives final run-state."
                           :steps nil
                           :latest-output nil
                           :final-output nil
+                          :metrics (list :usage-totals
+                                         (list :input-tokens 0
+                                               :output-tokens 0
+                                               :total-tokens 0
+                                               :estimated-cost-usd 0.0))
                           :events nil))
          (final-callback (or callback (lambda (_state) nil))))
     (org-ai-skills--request-planner-plan
      task
      metadata
      run-state
-     (lambda (planner-response)
-       (let ((plan (plist-get planner-response :plan)))
-         (org-ai-skills--run-plan-steps task metadata run-state plan final-callback directory))))
+     (lambda (planner-response planned-run-state)
+       (let* ((plan (plist-get planner-response :plan))
+              (planned-state (org-ai-skills--run-state-record-plan
+                              planned-run-state
+                              plan
+                              (or (plist-get planned-run-state :plan-revision) 1)
+                              'initial)))
+         (org-ai-skills--run-plan-steps task metadata planned-state plan final-callback directory))))
     run-state))
 
 (defun org-ai-skills--append-debug-entry (request)
@@ -1425,13 +2058,22 @@ OPTIONS is a plist; CALLBACK receives final run-state."
     (let* ((timestamp (format-time-string "%Y-%m-%d %H:%M:%S %z"))
            (source (plist-get (plist-get request :skill-context) :source-subtree))
            (event-type (or (plist-get request :event-type) 'rewrite))
+           (log-level (org-ai-skills--normalize-debug-log-level
+                       (or (plist-get request :log-level)
+                           (org-ai-skills--default-debug-log-level event-type))))
+           (stage-id (format "%s"
+                             (or (plist-get request :stage-id)
+                                 (symbol-name event-type))))
+           (step-id (format "%s" (or (plist-get request :step-id) "")))
            (request-role (or (plist-get request :request-role) ""))
            (effective-model (or (plist-get request :effective-model) ""))
            (system-fingerprint (or (plist-get request :effective-system-prompt-fingerprint) ""))
            (entry
             (concat
              (format "=== org-ai-skills gptel dispatch @ %s ===\n" timestamp)
+             (format "Log level: %s\n" log-level)
              (format "Event: %s\n" event-type)
+             (format "Stage id: %s\n" stage-id)
              (format "Request role: %s\n" request-role)
              (format "Effective model: %s\n" effective-model)
              (format "System prompt fingerprint: %s\n" system-fingerprint)
@@ -1442,7 +2084,7 @@ OPTIONS is a plist; CALLBACK receives final run-state."
              (format "Context mode: %s\n" (or (plist-get request :context-mode) ""))
              (format "Levels up: %s\n" (or (plist-get request :levels-up) ""))
              (format "Metadata count: %s\n" (or (plist-get request :metadata-count) ""))
-             (format "Step id: %s\n" (or (plist-get request :step-id) ""))
+             (format "Step id: %s\n" step-id)
              (format "Skill ids: %s\n" (or (plist-get request :skill-ids) ""))
              (format "Composition reason: %s\n" (or (plist-get request :composition-reason) ""))
              "Prompt:\n"
@@ -1450,10 +2092,84 @@ OPTIONS is a plist; CALLBACK receives final run-state."
              "\n\nRequest plist:\n"
              (pp-to-string request)
              "\n")))
+      (push (list :timestamp timestamp
+                  :event-type event-type
+                  :log-level log-level
+                  :step-id step-id
+                  :stage-id stage-id
+                  :request request
+                  :entry entry)
+            org-ai-skills--debug-events)
       (setq org-ai-skills--last-debug-entry entry)
       (with-current-buffer (get-buffer-create org-ai-skills-debug-buffer-name)
         (goto-char (point-max))
         (insert entry)))))
+
+(defun org-ai-skills--default-debug-log-level (event-type)
+  "Return default log level symbol for EVENT-TYPE."
+  (pcase event-type
+    ((or 'callback-error 'planner-error 'execution-error) 'error)
+    ((or 'planner-warning 'execution-warning) 'warn)
+    ((or 'property-retention 'gptel-request-data 'tool-call 'tool-result) 'debug)
+    (_ 'info)))
+
+(defun org-ai-skills--normalize-debug-log-level (level)
+  "Return normalized debug log LEVEL symbol."
+  (cond
+   ((memq level '(debug info warn error)) level)
+   ((stringp level)
+    (let ((parsed (intern-soft (downcase level))))
+      (if (memq parsed '(debug info warn error))
+          parsed
+        'info)))
+   (t 'info)))
+
+(defun org-ai-skills-debug-filter-events (&optional level step-or-stage)
+  "Return debug events filtered by LEVEL and STEP-OR-STAGE.
+LEVEL is one of `debug', `info', `warn', `error', or nil for all.
+STEP-OR-STAGE matches event :step-id or :stage-id when non-nil."
+  (let* ((level (and level (org-ai-skills--normalize-debug-log-level level)))
+         (needle (and step-or-stage (format "%s" step-or-stage))))
+    (seq-filter
+     (lambda (event)
+       (and (or (null level)
+                (eq level (plist-get event :log-level)))
+            (or (null needle)
+                (string= needle (format "%s" (or (plist-get event :step-id) "")))
+                (string= needle (format "%s" (or (plist-get event :stage-id) ""))))))
+     (nreverse (copy-sequence org-ai-skills--debug-events)))))
+
+(defun org-ai-skills-debug-show-filtered (&optional level step-or-stage)
+  "Show debug entries filtered by LEVEL and STEP-OR-STAGE.
+When LEVEL or STEP-OR-STAGE are nil, use configured filter variables."
+  (interactive)
+  (let* ((level (or level org-ai-skills-debug-filter-level))
+         (step-or-stage (or step-or-stage org-ai-skills-debug-filter-step))
+         (events (org-ai-skills-debug-filter-events level step-or-stage)))
+    (if (null events)
+        (message "No org-ai-skills debug entries match level=%s step/stage=%s"
+                 (or level "all")
+                 (or step-or-stage "all"))
+      (with-current-buffer (get-buffer-create org-ai-skills-debug-buffer-name)
+        (erase-buffer)
+        (insert (format "Filtered debug entries: level=%s step/stage=%s count=%d\n\n"
+                        (or level "all")
+                        (or step-or-stage "all")
+                        (length events)))
+        (dolist (event events)
+          (insert (plist-get event :entry)))
+        (goto-char (point-min))
+        (pop-to-buffer (current-buffer))))))
+
+(defun org-ai-skills-debug-set-filter (&optional level step-or-stage)
+  "Set debug inspection filters to LEVEL and STEP-OR-STAGE.
+Passing nil clears each corresponding filter."
+  (interactive)
+  (setq org-ai-skills-debug-filter-level level
+        org-ai-skills-debug-filter-step step-or-stage)
+  (message "org-ai-skills debug filter level=%s step/stage=%s"
+           (or org-ai-skills-debug-filter-level "all")
+           (or org-ai-skills-debug-filter-step "all")))
 
 (defun org-ai-skills--append-property-retention-debug (phase payload)
   "Append property-retention debug entry with PHASE and PAYLOAD."
@@ -1461,6 +2177,8 @@ OPTIONS is a plist; CALLBACK receives final run-state."
              org-ai-skills-debug-property-retention)
     (org-ai-skills--append-debug-entry
      (list :event-type 'property-retention
+           :log-level 'debug
+           :stage-id 'property-retention
            :request-role 'execution
            :prompt (format "property-retention %s" phase)
            :phase phase
@@ -2014,6 +2732,33 @@ Keep valid non-indented drawers intact."
               (org-entry-put (point) "ID" (org-id-new)))
             (outline-next-heading)))))))
 
+(defun org-ai-skills--consume-leading-property-drawers ()
+  "Consume leading blank lines/property drawers and return collected properties.
+Return value is an alist of (KEY . VALUE) extracted from consumed drawers."
+  (let ((continue t))
+    (let ((props nil))
+      (while continue
+        (while (and (not (eobp))
+                    (looking-at-p "^[ \t]*$"))
+          (forward-line 1))
+        (if (and (not (eobp))
+                 (looking-at-p "^[ \t]*:PROPERTIES:[ \t]*$"))
+            (progn
+              (forward-line 1)
+              (while (and (not (eobp))
+                          (not (looking-at-p "^[ \t]*:END:[ \t]*$")))
+                (when (looking-at "^[ \t]*:\\([^:\n]+\\):[ \t]*\\(.*\\)$")
+                  (let* ((key (match-string 1))
+                         (value (string-trim (or (match-string 2) ""))))
+                    (when (and (stringp key) (not (string-empty-p key)))
+                      (setq props (assq-delete-all key props))
+                      (push (cons key value) props))))
+                (forward-line 1))
+              (when (looking-at-p "^[ \t]*:END:[ \t]*$")
+                (forward-line 1)))
+          (setq continue nil)))
+      (nreverse props))))
+
 (defun org-ai-skills-org-apply-rewrite-result (subtree rewritten-text)
   "Replace SUBTREE region with REWRITTEN-TEXT.
 Preserve target heading and property drawer by replacing subtree body."
@@ -2060,6 +2805,7 @@ Preserve target heading and property drawer by replacing subtree body."
         (let ((new-body "")
               (existing-heading-line "")
               (existing-drawer "")
+              (generated-leading-props nil)
               (preserve-keys '("PURPOSE" "SOURCE_FILE_PATH"))
               (saved-props nil)
               (new-end nil))
@@ -2070,9 +2816,8 @@ Preserve target heading and property drawer by replacing subtree body."
                 (progn
                   (beginning-of-line)
                   (forward-line 1)
-                  (when (looking-at-p "^[ \t]*:PROPERTIES:[ \t]*$")
-                    (when (re-search-forward "^[ \t]*:END:[ \t]*$" nil t)
-                      (forward-line 1)))
+                  (setq generated-leading-props
+                        (org-ai-skills--consume-leading-property-drawers))
                   (setq new-body (buffer-substring-no-properties (point) (point-max))))
               (setq new-body cleaned-text)))
           (setq new-body (replace-regexp-in-string "\\`\n+" "" (or new-body "")))
@@ -2102,6 +2847,15 @@ Preserve target heading and property drawer by replacing subtree body."
              (goto-char begin)
              (unless (org-at-heading-p)
                (org-back-to-heading t))
+             ;; Preserve extra generated properties without duplicating drawers.
+             (dolist (pair generated-leading-props)
+               (let ((key (car pair))
+                     (value (cdr pair)))
+                 (when (and (stringp key)
+                            (stringp value)
+                            (not (string-empty-p value))
+                            (string-empty-p (or (org-entry-get (point) key nil) "")))
+                   (org-entry-put (point) key value))))
              (org-end-of-subtree t t)
              (setq new-end (point))
              (org-ai-skills--restore-subtree-explicit-properties
@@ -2172,6 +2926,17 @@ Return an alist where each item is (DISPLAY . SUBTREE-PLIST)."
 (define-derived-mode org-ai-skills-control-mode special-mode "Org-AI-Control"
   "Major mode for org-ai-skills control workspace."
   (setq-local truncate-lines t))
+
+;; Ensure key bindings are refreshed even when map already exists in a live session.
+(define-key org-ai-skills-control-mode-map (kbd "s") #'org-ai-skills-ui-stop-run)
+(define-key org-ai-skills-control-mode-map (kbd "g") #'org-ai-skills-ui-rerun)
+(define-key org-ai-skills-control-mode-map (kbd "t") #'org-ai-skills-ui-adjust-task-or-instruction)
+(define-key org-ai-skills-control-mode-map (kbd "v") #'org-ai-skills-ui-show-dag)
+(define-key org-ai-skills-control-mode-map (kbd "c") #'org-ai-skills-ui-select-candidate)
+(define-key org-ai-skills-control-mode-map (kbd "a") #'org-ai-skills-ui-apply-selected-candidate)
+(define-key org-ai-skills-control-mode-map (kbd "d") #'org-ai-skills-ui-discard-selected-candidate)
+(define-key org-ai-skills-control-mode-map (kbd "q") #'org-ai-skills-ui-close-workspace)
+(define-key org-ai-skills-control-mode-map (kbd "r") #'org-ai-skills-ui-refresh-control-buffer)
 
 (defun org-ai-skills--ui-control-buffer ()
   "Return control buffer."
@@ -2264,6 +3029,14 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
          (candidate-enabled (and (listp candidates) (> (length candidates) 0)))
          (apply-enabled (and candidate-enabled (not running)))
          (discard-enabled (and candidate-enabled (not running)))
+         (dag-state (or (org-ai-skills--ui-run-get :planner-run-state)
+                        org-ai-skills--ui-run-state))
+         (dag-enabled
+          (or (plist-get dag-state :active-plan)
+              (plist-get dag-state :latest-plan)
+              (plist-get dag-state :plan-revisions)
+              (plist-get dag-state :steps)
+              (plist-get dag-state :events)))
          (stop-enabled running)
          (key-face (lambda (enabled)
                      (if enabled
@@ -2291,6 +3064,7 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
         (insert (propertize "  s stop run" 'face (funcall key-face stop-enabled)) "\n")
         (insert (propertize "  g rerun" 'face (funcall key-face rerun-enabled)) "\n")
         (insert (propertize "  t adjust task/instruction" 'face (funcall key-face adjust-enabled)) "\n")
+        (insert (propertize "  v view DAG" 'face (funcall key-face dag-enabled)) "\n")
         (insert (propertize "  c select candidate (minibuffer)" 'face (funcall key-face candidate-enabled)) "\n")
         (insert (propertize "  a apply selected candidate" 'face (funcall key-face apply-enabled)) "\n")
         (insert (propertize "  d discard selected candidate" 'face (funcall key-face discard-enabled)) "\n")
@@ -3324,8 +4098,10 @@ When ROLE is `planner', return nil because planner must not use tools."
 
 (defun org-ai-skills--request-gptel-tools (request &optional role)
   "Build gptel tool list from REQUEST and ROLE."
-  (mapcar #'org-ai-skills--function-call-to-gptel-tool
-          (org-ai-skills--request-function-calls request role)))
+  (let ((calls (org-ai-skills--request-function-calls request role)))
+    (if (or (null calls) (fboundp 'gptel-make-tool))
+        (delq nil (mapcar #'org-ai-skills--function-call-to-gptel-tool calls))
+      nil)))
 
 (defun org-ai-skills--resolve-request-role (request)
   "Return normalized request role symbol from REQUEST."
@@ -3727,6 +4503,7 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
                (progn
                  (message "%s" fatal-error)
                  (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                   (org-ai-skills--ui-run-set :planner-run-state run-state)
                    (org-ai-skills--ui-clear-overlay)
                    (org-ai-skills--ui-set-failure "tool-error" fatal-error)))
              (let* ((raw (or (plist-get run-state :final-output) ""))
@@ -3748,6 +4525,7 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
                                                  :end end
                                                  :context-mode (plist-get slot :context-mode))))))
                (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                 (org-ai-skills--ui-run-set :planner-run-state run-state)
                  (org-ai-skills--ui-run-set :selected-candidate candidate)
                  (org-ai-skills--ui-set-status 'ready "candidate-ready"))
                (with-current-buffer buffer
