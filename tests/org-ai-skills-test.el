@@ -583,6 +583,7 @@
   "Dispatch should append debug entry when enabled."
   (let ((org-ai-skills-debug-enabled t)
         (org-ai-skills-debug-buffer-name "*org-ai-skills-debug-test*")
+        (org-ai-skills--debug-events nil)
         (org-ai-skills--last-debug-entry nil)
         (orig-featurep (symbol-function 'featurep))
         (orig-fboundp (symbol-function 'fboundp)))
@@ -609,6 +610,51 @@
     (should (string-match-p "Leaf" org-ai-skills--last-debug-entry))
     (with-current-buffer org-ai-skills-debug-buffer-name
       (should (string-match-p "Request plist" (buffer-string))))
+    (kill-buffer org-ai-skills-debug-buffer-name)))
+
+(ert-deftest org-ai-skills-debug-filter-events-by-level ()
+  "Debug filter should support exact level matching."
+  (let ((org-ai-skills-debug-enabled t)
+        (org-ai-skills--debug-events nil)
+        (org-ai-skills-debug-buffer-name "*org-ai-skills-debug-test*"))
+    (when (get-buffer org-ai-skills-debug-buffer-name)
+      (kill-buffer org-ai-skills-debug-buffer-name))
+    (org-ai-skills--append-debug-entry
+     '(:event-type rewrite :step-id "s1" :prompt "rewrite"))
+    (org-ai-skills--append-debug-entry
+     '(:event-type tool-call :step-id "s1" :prompt "tool"))
+    (org-ai-skills--append-debug-entry
+     '(:event-type callback-error :step-id "s2" :prompt "error"))
+    (let ((error-events (org-ai-skills-debug-filter-events 'error nil))
+          (debug-events (org-ai-skills-debug-filter-events 'debug nil))
+          (all-events (org-ai-skills-debug-filter-events nil nil)))
+      (should (= (length all-events) 3))
+      (should (= (length error-events) 1))
+      (should (= (length debug-events) 1))
+      (should (eq (plist-get (car error-events) :event-type) 'callback-error))
+      (should (eq (plist-get (car debug-events) :event-type) 'tool-call)))
+    (kill-buffer org-ai-skills-debug-buffer-name)))
+
+(ert-deftest org-ai-skills-debug-filter-events-by-step-or-stage ()
+  "Debug filter should match by step-id and stage-id."
+  (let ((org-ai-skills-debug-enabled t)
+        (org-ai-skills--debug-events nil)
+        (org-ai-skills-debug-buffer-name "*org-ai-skills-debug-test*"))
+    (when (get-buffer org-ai-skills-debug-buffer-name)
+      (kill-buffer org-ai-skills-debug-buffer-name))
+    (org-ai-skills--append-debug-entry
+     '(:event-type step-execution :step-id "s1" :log-level info :prompt "step 1"))
+    (org-ai-skills--append-debug-entry
+     '(:event-type planner :stage-id "planning" :log-level info :prompt "plan"))
+    (org-ai-skills--append-debug-entry
+     '(:event-type step-execution :step-id "s2" :log-level warn :prompt "step 2"))
+    (let ((s1-events (org-ai-skills-debug-filter-events nil "s1"))
+          (planning-events (org-ai-skills-debug-filter-events nil "planning"))
+          (warn-s2-events (org-ai-skills-debug-filter-events 'warn "s2")))
+      (should (= (length s1-events) 1))
+      (should (= (length planning-events) 1))
+      (should (= (length warn-s2-events) 1))
+      (should (eq (plist-get (car planning-events) :event-type) 'planner)))
     (kill-buffer org-ai-skills-debug-buffer-name)))
 
 (ert-deftest org-ai-skills-org-context-candidates-show-path-preview ()
@@ -999,6 +1045,32 @@
     (should (string= (org-entry-get (point) "PURPOSE" nil) "keep me"))
     (should (= 0 (how-many "^[ \t]+:PROPERTIES:[ \t]*$" (point-min) (point-max))))))
 
+(ert-deftest org-ai-skills-org-apply-rewrite-result-strips-leading-generated-drawers ()
+  "Subtree apply should strip generated top drawers to avoid duplicate property blocks."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* News Daily Report\n"
+            ":PROPERTIES:\n"
+            ":ID:       36872c24-3a5b-4e09-9791-8148d5d997a2\n"
+            ":PURPOSE: 生成今天(2026-02-22)的金融新闻日报\n"
+            ":END:\n"
+            "Old body.\n")
+    (goto-char (point-min))
+    (let ((target (org-ai-skills-org-resolve-subtree 'current)))
+      (org-ai-skills-org-apply-rewrite-result
+       target
+       (concat "* News Daily Report\n"
+               "\n"
+               ":PROPERTIES:\n"
+               ":ID: 36872c24-3a5b-4e09-9791-8148d5d997a2\n"
+               ":REPORT_DATE: 2026-02-22\n"
+               ":END:\n"
+               "Updated body.\n")))
+    (goto-char (point-min))
+    (should (= (how-many "^:PROPERTIES:$" (point-min) (point-max)) 1))
+    (should (re-search-forward "^:REPORT_DATE: 2026-02-22$" nil t))
+    (should (re-search-forward "Updated body\\." nil t))))
+
 (ert-deftest org-ai-skills-org-apply-rewrite-result-subtree-assigns-heading-ids ()
   "Subtree apply should ensure resulting headings have :ID:."
   (with-temp-buffer
@@ -1253,6 +1325,11 @@
         (org-ai-skills-ui-close-workspace)
         (should (= (length (window-list)) 1))))))
 
+(ert-deftest org-ai-skills-control-mode-map-includes-dag-key ()
+  "Control mode map should bind `v` to DAG view command."
+  (should (eq (lookup-key org-ai-skills-control-mode-map (kbd "v"))
+              #'org-ai-skills-ui-show-dag)))
+
 (ert-deftest org-ai-skills-ui-overlay-lifecycle-running-ready-stop ()
   "Overlay should support running/ready states and clear on stop."
   (with-temp-buffer
@@ -1352,6 +1429,8 @@
               (org-ai-skills-ui-refresh-control-buffer)
               (with-current-buffer (get-buffer org-ai-skills-control-buffer-name)
                 (goto-char (point-min))
+                (should (re-search-forward "v view DAG" nil t))
+                (goto-char (point-min))
                 (should (re-search-forward "Candidates (2):" nil t))
                 (should-not (re-search-forward
                              (regexp-quote (plist-get candidate-a :candidate-id))
@@ -1359,6 +1438,128 @@
                 (goto-char (point-min))
                 (should (re-search-forward " \\*01 \\[G\\] " nil t))))))
       (delete-directory store-dir t))))
+
+(ert-deftest org-ai-skills-ui-control-buffer-disables-dag-key-when-empty ()
+  "Control buffer should dim DAG key when no DAG data is available yet."
+  (let ((org-ai-skills--ui-run-state
+         (list :run-id "run-empty-dag"
+               :status 'running
+               :progress "planning"
+               :run-type 'planner
+               :heading "Leaf"
+               :task "task"
+               :selected-candidate nil
+               :planner-run-state nil)))
+    (org-ai-skills-ui-refresh-control-buffer)
+    (with-current-buffer (get-buffer org-ai-skills-control-buffer-name)
+      (goto-char (point-min))
+      (re-search-forward "v view DAG")
+      (should (eq (get-text-property (line-beginning-position) 'face) 'shadow)))))
+
+(ert-deftest org-ai-skills-build-execution-dag-derives-deps-status-and-metrics ()
+  "DAG builder should derive node dependencies, status, and metrics from run-state."
+  (let* ((run-state
+          '(:active-plan ((:step-id "s1"
+                           :goal "g1"
+                           :skills ("a")
+                           :input-from ("task"))
+                          (:step-id "s2"
+                           :goal "g2"
+                           :skills ("b")
+                           :input-from ("s1")))
+            :steps ((:step-id "s1" :status done :skills ("a") :goal "g1"))
+            :events ((:stage-id execution.step
+                      :step-id "s1"
+                      :duration-ms 7
+                      :usage (:input-tokens 4 :output-tokens 3 :total-tokens 7)
+                      :estimated-cost-usd 0.0012))))
+         (dag (org-ai-skills-build-execution-dag run-state))
+         (nodes (plist-get dag :nodes))
+         (edges (plist-get dag :edges))
+         (node-s1 (seq-find (lambda (n) (equal (plist-get n :id) "s1")) nodes))
+         (node-s2 (seq-find (lambda (n) (equal (plist-get n :id) "s2")) nodes)))
+    (should (= (length nodes) 2))
+    (should (= (length edges) 1))
+    (should (eq (plist-get node-s1 :status) 'success))
+    (should (eq (plist-get node-s2 :status) 'pending))
+    (should (equal (plist-get (car edges) :from) "s1"))
+    (should (equal (plist-get (car edges) :to) "s2"))
+    (should (= (plist-get (plist-get node-s1 :metrics) :duration-ms) 7))
+    (should (= (plist-get (plist-get node-s1 :metrics) :total-tokens) 7))))
+
+(ert-deftest org-ai-skills-build-execution-dag-dedupes-duplicate-step-ids ()
+  "DAG builder should render each step id once even if plan repeats it."
+  (let* ((run-state
+          '(:active-plan ((:step-id "polish-report" :goal "g1" :skills ("article-polish-editorial") :input-from ("task"))
+                          (:step-id "polish-report" :goal "g2" :skills ("article-polish-editorial") :input-from ("task")))
+            :steps ((:step-id "polish-report" :status done :skills ("article-polish-editorial")))
+            :events ((:stage-id execution.step
+                      :step-id "polish-report"
+                      :duration-ms 10
+                      :usage (:input-tokens 5 :output-tokens 3 :total-tokens 8)))))
+         (dag (org-ai-skills-build-execution-dag run-state))
+         (nodes (plist-get dag :nodes)))
+    (should (= (length nodes) 1))
+    (should (equal (plist-get (car nodes) :id) "polish-report"))))
+
+(ert-deftest org-ai-skills-build-execution-dag-includes-planning-events-chronologically ()
+  "Event DAG mode should include planning/execution events per occurrence."
+  (let* ((run-state
+          '(:steps ((:step-id "s1" :status done :skills ("fin-news-daily-report") :goal "draft"))
+            :events ((:stage-id planning.request
+                      :status success
+                      :duration-ms 30
+                      :plan-revision 1
+                      :usage (:input-tokens 10 :output-tokens 5 :total-tokens 15))
+                     (:stage-id planning.parse
+                      :status success
+                      :duration-ms 5
+                      :plan-revision 1
+                      :usage (:input-tokens 10 :output-tokens 5 :total-tokens 15))
+                     (:stage-id execution.step
+                      :status success
+                      :duration-ms 20
+                      :step-id "s1"
+                      :skill-ids ("fin-news-daily-report")
+                      :usage (:input-tokens 8 :output-tokens 12 :total-tokens 20))
+                     (:stage-id planning.request
+                      :status success
+                      :duration-ms 25
+                      :plan-revision 2
+                      :usage (:input-tokens 9 :output-tokens 4 :total-tokens 13)))))
+         (dag (org-ai-skills-build-execution-dag run-state nil t))
+         (nodes (plist-get dag :nodes))
+         (edges (plist-get dag :edges)))
+    (should (= (length nodes) 4))
+    (should (= (length edges) 3))
+    (should (equal (plist-get (nth 0 nodes) :id) "planning.request#1"))
+    (should (equal (plist-get (nth 1 nodes) :id) "planning.parse#1"))
+    (should (equal (plist-get (nth 2 nodes) :id) "execution.step:s1#1"))
+    (should (equal (plist-get (nth 3 nodes) :id) "planning.request#2"))
+    (should (equal (plist-get (plist-get (nth 2 nodes) :metrics) :total-tokens) 20))
+    (should (equal (plist-get (car edges) :from) "planning.request#1"))
+    (should (equal (plist-get (car edges) :to) "planning.parse#1"))))
+
+(ert-deftest org-ai-skills-ui-show-dag-renders-current-planner-run ()
+  "DAG view command should render from current planner run-state."
+  (let ((org-ai-skills--ui-run-state
+         '(:planner-run-state
+           (:run-id "run-1"
+            :plan-revision 1
+            :active-plan ((:step-id "s1" :goal "g1" :skills ("a") :input-from ("task")))
+            :steps ((:step-id "s1" :status done :skills ("a") :goal "g1"))
+            :events ((:stage-id execution.step
+                      :step-id "s1"
+                      :duration-ms 5
+                      :usage (:input-tokens 2 :output-tokens 1 :total-tokens 3)
+                      :estimated-cost-usd 0.0003))))))
+    (cl-letf (((symbol-function 'pop-to-buffer)
+               (lambda (buffer &rest _args) buffer)))
+      (org-ai-skills-ui-show-dag))
+    (with-current-buffer (get-buffer org-ai-skills-dag-buffer-name)
+      (goto-char (point-min))
+      (should (re-search-forward "Execution DAG" nil t))
+      (should (re-search-forward "\\[success\\] execution.step:s1#1" nil t)))))
 
 (ert-deftest org-ai-skills-rewrite-interactive-auto-opens-control-workspace ()
   "Interactive rewrite should auto-open control workspace when enabled."
@@ -1661,7 +1862,7 @@
        "task"
        metadata
        '(:task "task" :steps nil :plan-revision 1)
-       (lambda (parsed) (setq callback-result parsed))))
+       (lambda (parsed _run-state) (setq callback-result parsed))))
     (should (listp callback-result))
     (should (= (length (plist-get callback-result :plan)) 1))))
 
@@ -1682,9 +1883,165 @@
        "task"
        metadata
        '(:task "task" :steps nil :plan-revision 1)
-       (lambda (parsed) (setq callback-result parsed))))
+       (lambda (parsed _run-state) (setq callback-result parsed))))
     (should (listp callback-result))
     (should (= (length (plist-get callback-result :plan)) 1))))
+
+(ert-deftest org-ai-skills-request-planner-plan-records-timing-events ()
+  "Planner request should append planning timing events into run-state."
+  (let ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
+        (valid "{\"candidates\":[{\"skill_id\":\"gen-notes\",\"why\":\"fit\",\"score\":0.9}],\"plan\":[{\"step_id\":\"s1\",\"goal\":\"g\",\"skills\":[\"gen-notes\"],\"input_from\":[\"task\"],\"expected_output\":\"o\",\"composition_reason\":\"r\"}],\"replan_signal\":{\"enabled\":false,\"condition\":\"\"}}")
+        callback-run-state
+        (ticks '(0.001 0.002 0.004))
+        (org-ai-skills-observability-now-function nil))
+    (setq org-ai-skills-observability-now-function
+          (lambda ()
+            (prog1 (or (car ticks) 0.004)
+              (setq ticks (cdr ticks)))))
+    (cl-letf (((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback
+                          valid
+                          '(:data (:usage (:prompt_tokens 12
+                                           :completion_tokens 8
+                                           :total_tokens 20))))))
+              ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
+               (lambda (&rest response) (car response))))
+      (org-ai-skills--request-planner-plan
+       "task"
+       metadata
+       '(:task "task" :steps nil :plan-revision 1 :events nil)
+       (lambda (_parsed run-state) (setq callback-run-state run-state))))
+    (let* ((events (plist-get callback-run-state :events))
+           (parse-event (car events))
+           (request-event (cadr events)))
+      (should (= (length events) 2))
+      (should (eq (plist-get parse-event :stage-id) 'planning.parse))
+      (should (eq (plist-get request-event :stage-id) 'planning.request))
+      (should (= (plist-get parse-event :duration-ms) 2))
+      (should (= (plist-get request-event :duration-ms) 3))
+      (should (equal (plist-get (plist-get parse-event :usage) :input-tokens) 12))
+      (should (equal (plist-get (plist-get parse-event :usage) :output-tokens) 8))
+      (should (equal (plist-get (plist-get parse-event :usage) :total-tokens) 20))
+      (should (equal
+               (plist-get
+                (plist-get (plist-get callback-run-state :metrics) :usage-totals)
+                :total-tokens)
+               20)))))
+
+(ert-deftest org-ai-skills-execute-plan-step-records-timing-event ()
+  "Step execution should append execution timing event into run-state."
+  (let ((ticks '(0.010 0.015))
+        callback-run-state
+        (org-ai-skills-observability-now-function nil))
+    (setq org-ai-skills-observability-now-function
+          (lambda ()
+            (prog1 (or (car ticks) 0.015)
+              (setq ticks (cdr ticks)))))
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (&rest _args) '(:skill-id "gen-notes" :title "Notes")))
+              ((symbol-function 'org-ai-skills-apply-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-exclude-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-build-step-request)
+               (lambda (&rest _args)
+                 '(:event-type step-execution :request-role execution :step-id "s1" :prompt "p")))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback
+                          "* H\nBody\n"
+                          '(:data (:usage (:input_tokens 4 :output_tokens 3))))))
+              ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
+               (lambda (&rest response) (car response))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :skills ("gen-notes") :goal "g")
+       '(:task "task" :subtree (:text "* H\n") :plan-revision 1 :events nil)
+       (lambda (run-state _output) (setq callback-run-state run-state))))
+    (let ((events (plist-get callback-run-state :events)))
+      (should (= (length events) 1))
+      (should (eq (plist-get (car events) :stage-id) 'execution.step))
+      (should (equal (plist-get (car events) :step-id) "s1"))
+      (should (= (plist-get (car events) :duration-ms) 5))
+      (should (equal
+               (plist-get
+                (plist-get (plist-get callback-run-state :metrics) :usage-totals)
+                :total-tokens)
+               7)))))
+
+(ert-deftest org-ai-skills-normalize-provider-usage-supports-multiple-key-shapes ()
+  "Usage adapter should normalize common provider usage key variants."
+  (let* ((shape-a (org-ai-skills--normalize-provider-usage
+                   '(:usage (:prompt_tokens 10 :completion_tokens 4 :total_tokens 14 :cost 0.0025))))
+         (shape-b (org-ai-skills--normalize-provider-usage
+                   '(:input-tokens 3 :output-tokens 2)))
+         (shape-c (org-ai-skills--normalize-provider-usage
+                   '(:usage (:input_tokens 6 :output_tokens 1)))))
+    (should (= (plist-get shape-a :input-tokens) 10))
+    (should (= (plist-get shape-a :output-tokens) 4))
+    (should (= (plist-get shape-a :total-tokens) 14))
+    (should (= (plist-get shape-a :estimated-cost-usd) 0.0025))
+    (should (= (plist-get shape-b :total-tokens) 5))
+    (should (= (plist-get shape-c :total-tokens) 7))))
+
+(ert-deftest org-ai-skills-normalize-provider-usage-estimates-cost-from-rates ()
+  "Usage adapter should estimate cost when provider cost is missing."
+  (let ((org-ai-skills-observability-cost-per-1k-input-tokens 0.001)
+        (org-ai-skills-observability-cost-per-1k-output-tokens 0.002))
+    (let* ((usage (org-ai-skills--normalize-provider-usage
+                   '(:usage (:input_tokens 1000 :output_tokens 500))))
+           (cost (plist-get usage :estimated-cost-usd)))
+      (should (< (abs (- cost 0.002)) 0.000001)))))
+
+(ert-deftest org-ai-skills-normalize-provider-usage-handles-symbol-and-nested-keys ()
+  "Usage adapter should parse symbol-key and nested usage payload shapes."
+  (let* ((payload-a '((response . ((usage . ((prompt_tokens . 21)
+                                             (completion_tokens . 9)
+                                             (total_tokens . 30)))))))
+         (usage-a (org-ai-skills--normalize-provider-usage payload-a))
+         (payload-b '(:data (:usage_metadata (:input_tokens 11 :output_tokens 5))))
+         (usage-b (org-ai-skills--normalize-provider-usage payload-b))
+         (payload-c '(:data (:prompt_eval_count 14 :eval_count 6)))
+         (usage-c (org-ai-skills--normalize-provider-usage payload-c)))
+    (should (= (plist-get usage-a :input-tokens) 21))
+    (should (= (plist-get usage-a :output-tokens) 9))
+    (should (= (plist-get usage-a :total-tokens) 30))
+    (should (= (plist-get usage-b :total-tokens) 16))
+    (should (= (plist-get usage-c :input-tokens) 14))
+    (should (= (plist-get usage-c :output-tokens) 6))
+    (should (= (plist-get usage-c :total-tokens) 20))))
+
+(ert-deftest org-ai-skills-normalize-provider-usage-handles-camelcase-and-partial-totals ()
+  "Usage adapter should parse camelCase keys and infer totals from partial values."
+  (let* ((payload-a '(:usage (:promptTokens 21 :completionTokens 9)))
+         (usage-a (org-ai-skills--normalize-provider-usage payload-a))
+         (payload-b '(:usage (:completionTokens 17)))
+         (usage-b (org-ai-skills--normalize-provider-usage payload-b)))
+    (should (= (plist-get usage-a :input-tokens) 21))
+    (should (= (plist-get usage-a :output-tokens) 9))
+    (should (= (plist-get usage-a :total-tokens) 30))
+    (should (= (plist-get usage-b :output-tokens) 17))
+    (should (= (plist-get usage-b :total-tokens) 17))))
+
+(ert-deftest org-ai-skills-select-provider-usage-source-prefers-observed-usage ()
+  "Provider usage source selector should pick candidate with observable usage."
+  (let* ((first '(:content "ok"))
+         (info '(:data (:usage (:input_tokens 13 :output_tokens 7))))
+         (selected (org-ai-skills--select-provider-usage-source first info nil))
+         (usage (org-ai-skills--normalize-provider-usage selected)))
+    (should (= (plist-get usage :input-tokens) 13))
+    (should (= (plist-get usage :output-tokens) 7))
+    (should (= (plist-get usage :total-tokens) 20))))
+
+(ert-deftest org-ai-skills-select-provider-usage-source-prefers-more-complete-signal ()
+  "Provider usage source selector should keep the most complete usage payload."
+  (let* ((first '(:usage (:completion_tokens 50)))
+         (info '(:data (:usage (:prompt_tokens 80 :completion_tokens 50 :total_tokens 130))))
+         (selected (org-ai-skills--select-provider-usage-source first info nil))
+         (usage (org-ai-skills--normalize-provider-usage selected)))
+    (should (= (plist-get usage :input-tokens) 80))
+    (should (= (plist-get usage :output-tokens) 50))
+    (should (= (plist-get usage :total-tokens) 130))))
 
 (ert-deftest org-ai-skills-parse-planner-response-allows-empty-plan-for-replan ()
   "Planner parser should allow empty plan in replan context."

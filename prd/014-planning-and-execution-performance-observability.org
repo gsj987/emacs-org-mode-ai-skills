@@ -10,6 +10,7 @@ Planning and execution currently lack consistent performance telemetry and runti
   - Add token and estimated cost accounting per run and per stage.
   - Add a visual DAG view for plan and execution graph, including node status.
   - Add structured run artifacts for later analysis and debugging.
+  - Add observability log filtering by level and step/stage identifier for focused inspection.
 - Out of scope:
   - Provider-side billing reconciliation.
   - External tracing backend integration.
@@ -21,6 +22,7 @@ Planning and execution currently lack consistent performance telemetry and runti
   - Preserve spec vs run-state separation.
   - DAG rendering must degrade gracefully when graph metadata is partial.
   - Cost/token data must tolerate provider fields missing or inconsistent.
+  - Log filtering must be deterministic and non-destructive (never mutates stored raw run events).
 - Process constraints:
   - No implementation before PRD approval.
   - Behavior changes require tests and README updates.
@@ -34,15 +36,30 @@ Planning and execution currently lack consistent performance telemetry and runti
   - Failures include observability metadata needed for root-cause analysis.
 - Behavior 4:
   - Metrics are deterministic enough for tests via injectable clocks/fixtures.
+- Behavior 5:
+  - Users can filter observability logs by level (`debug`, `info`, `warn`, `error`) and optionally narrow to one step/stage to inspect a specific workflow segment.
 
 * Tasks
-- [ ] Define run metrics schema for timing/token/cost and DAG node metadata.
-- [ ] Instrument planning pipeline phases with stable event emission.
-- [ ] Instrument execution pipeline phases with stable event emission.
-- [ ] Implement provider-normalized token/cost adapter layer.
-- [ ] Implement DAG rendering interface and minimal view in org workflow.
-- [ ] Add ERT tests for timing, token aggregation, and DAG state transitions.
-- [ ] Update README with observability and performance inspection usage.
+- [X] Define run metrics schema for timing/token/cost and DAG node metadata.
+- [X] Instrument planning pipeline phases with stable event emission.
+- [X] Instrument execution pipeline phases with stable event emission.
+- [X] Implement provider-normalized token/cost adapter layer.
+- [X] Implement DAG rendering interface and minimal view in org workflow.
+- [X] Define log event schema fields for `level` and `step-id`/`stage-id`.
+- [X] Implement observability log filter API for level-only and level+step queries.
+- [X] Add ERT tests for timing, token aggregation, and DAG state transitions.
+- [X] Add ERT tests for log level filtering and step-scoped filtering behavior.
+- [X] Update README with observability and performance inspection usage.
 
 * Worklog
 - 2026-02-22 :: PRD created for planning/execution performance + observability with timing/token/cost and DAG requirements. Test status: not run.
+- 2026-02-22 :: PRD updated to add log-level + step/stage observability filtering requirements, constraints, expected behavior, and tests. Test status: not run.
+- 2026-02-22 :: Implemented observability log schema extension (`level`, `stage-id`, `step-id`) and non-destructive filter API (`org-ai-skills-debug-filter-events`) with filtered inspection command support. Added ERT coverage for level and step/stage filters, updated README debug observability docs, and validated with full batch ERT. Test status: pass (119/119, batch ERT).
+- 2026-02-22 :: Implemented deterministic timing instrumentation for planner/execution stages by appending structured run-state events (`planning.request`, `planning.parse`, `execution.step`) with `start-ms/end-ms/duration-ms/status`; added injectable observability clock (`org-ai-skills-observability-now-function`), added ERT timing regressions, and updated README timing observability notes. Test status: pass (121/121, batch ERT).
+- 2026-02-22 :: Implemented provider-normalized usage adapter for token/cost fields and integrated stage-level + run-level accumulation (`run-state :metrics :usage-totals`) across planner and execution paths; added optional local cost estimation defcustoms for missing provider cost; expanded ERT coverage for multi-shape provider usage normalization and cost estimation; updated README observability section. Test status: pass (123/123, batch ERT).
+- 2026-02-22 :: Implemented execution DAG interface and minimal org workflow view: added run-state plan snapshot tracking across initial plan/replan, DAG model builder (`org-ai-skills-build-execution-dag`), DAG text renderer (`org-ai-skills-render-execution-dag-text`), and interactive view command (`org-ai-skills-ui-show-dag`) with control-panel keybinding (`v`). Added ERT coverage for DAG dependency/status/metrics derivation and DAG buffer rendering; updated README control/workflow docs. Test status: pass (125/125, batch ERT).
+- 2026-02-22 :: Fixed subtree apply duplicate-drawer root cause by consuming leading generated property drawers and merging non-conflicting generated keys into existing heading properties (prevents duplicate drawers while preserving fields like `REPORT_DATE`); added regression ERT for duplicated drawer shape and reran full suite. Test status: pass (127/127, batch ERT).
+- 2026-02-22 :: Fixed zero-token/cost observability root cause by hardening provider usage normalization to support symbol-key payloads, nested usage objects, and ollama-style counters (`prompt_eval_count`/`eval_count`); expanded ERT coverage for nested/symbol usage payloads and reran full suite. Test status: pass (128/128, batch ERT).
+- 2026-02-22 :: Fixed control-buffer DAG key UX mismatch by dimming `v` when no DAG data exists yet (while preserving command fallback messaging); added ERT coverage for disabled DAG key rendering in empty planner state and reran full suite. Test status: pass (129/129, batch ERT).
+- 2026-02-22 :: Follow-up observability hardening: capture provider usage from multiple callback surfaces (`info`, `info:data`, `first` payload), parse JSON-string metadata payloads, and prefer sources with observed usage fields; added DAG node de-duplication by step id to avoid duplicate rows from repeated planner step ids; expanded ERT coverage for usage-source selection and DAG dedupe; reran full suite. Test status: pass (131/131, batch ERT).
+- 2026-02-22 :: Extended DAG observability to event-instance mode so planner/replan/execution timing events are rendered as per-occurrence nodes in chronological order; interactive DAG view now auto-uses event mode when timing events exist. Fixed usage source selection regression by scoring completeness (prevents rich usage being overwritten by partial payloads), added camelCase token key support, and inferred total tokens when only one side is reported. Added ERT coverage for event DAG rendering and usage source/normalization edge cases. Test status: pass (134/134, batch ERT).

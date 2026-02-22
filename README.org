@@ -243,6 +243,7 @@ Control workspace keys (in =*org-ai-skills-control*=):
 - =s=: stop current run (enabled only while status is =running=)
 - =g=: rerun with same context (dispatches a new run; unavailable while running)
 - =t=: adjust planner task / rewrite instruction, then rerun (unavailable while running)
+- =v=: view execution DAG for current planner run
 - =c=: open minibuffer candidate selector
 - =a=: apply currently selected candidate (unavailable while running)
 - =d=: mark selected candidate as discarded (unavailable while running)
@@ -359,19 +360,65 @@ Debug observability:
   - =M-x org-ai-skills-debug-toggle=
 - Show last debug capture:
   - =M-x org-ai-skills-debug-show-last=
+- Show filtered debug capture (uses configured filters):
+  - =M-x org-ai-skills-debug-show-filtered=
+- Set debug filters programmatically:
+  - =(setq org-ai-skills-debug-filter-level 'warn)=
+  - =(setq org-ai-skills-debug-filter-step "s2")=
 - Variables:
   - =org-ai-skills-debug-enabled=
   - =org-ai-skills-debug-property-retention=
   - =org-ai-skills-debug-buffer-name=
+  - =org-ai-skills-debug-filter-level= (=nil/debug/info/warn/error=)
+  - =org-ai-skills-debug-filter-step= (step id or stage id string, or =nil=)
 - Debug entry includes timestamp, request role, effective model, system prompt
-  fingerprint, buffer/file, target headline/path, final prompt, and full request
-  plist passed to =gptel-request=.
+  fingerprint, log level, stage id, buffer/file, target headline/path, final
+  prompt, and full request plist passed to =gptel-request=.
 - Additional debug events:
   - =gptel-request-data= includes request payload data captured from gptel callback info.
   - =tool-call= and =tool-result= events are logged when gptel emits tool-calling callbacks.
   - =property-retention= logs subtree property collect/restore diagnostics:
     matching strategy per heading (=path=, =exact-level-title=, =title=,
     =level-order=, =fuzzy-level-title=, or =unmatched=) and restored keys.
+
+Run-state timing observability:
+- Planner and execution flows append timing events to =run-state :events=.
+- Current stage ids:
+  - =planning.request=
+  - =planning.parse=
+  - =execution.step=
+- Each event records at least:
+  - =:stage-id=, =:start-ms=, =:end-ms=, =:duration-ms=, =:status=
+- Token/cost fields on stage events:
+  - =:usage= (normalized =:input-tokens=, =:output-tokens=, =:total-tokens=)
+  - =:estimated-cost-usd=
+- Usage normalization accepts common payload variants:
+  - keyword/symbol keys (=input_tokens=, =prompt_tokens=, =usage_metadata=, etc.)
+  - nested provider payloads (e.g., =response.usage=)
+  - ollama-style counts (=prompt_eval_count= / =eval_count=)
+- Run-level aggregate usage totals:
+  - =run-state :metrics :usage-totals=
+  - keys: =:input-tokens=, =:output-tokens=, =:total-tokens=, =:estimated-cost-usd=
+- Deterministic test clock:
+  - =org-ai-skills-observability-now-function= (defaults to =current-time=)
+- Optional local cost estimation when provider omits cost:
+  - =org-ai-skills-observability-cost-per-1k-input-tokens=
+  - =org-ai-skills-observability-cost-per-1k-output-tokens=
+
+Execution DAG observability:
+- Build DAG model from run-state:
+  - =(org-ai-skills-build-execution-dag run-state)=
+  - =(org-ai-skills-build-execution-dag run-state nil t)= (event-instance mode)
+- Render DAG text:
+  - =(org-ai-skills-render-execution-dag-text dag)=
+- View DAG interactively:
+  - =M-x org-ai-skills-ui-show-dag=
+  - In control panel: press =v=
+- DAG nodes include:
+  - =:id=, =:status=, =:dependencies=, =:skills=, =:metrics=
+  - Interactive view auto-switches to event-instance DAG when run-state has timing events,
+    so planner/replan calls appear as separate nodes (e.g., =planning.request#2=,
+    =execution.step:step-2#1=).
 
 Embark integration:
 - Requires Embark installed.
