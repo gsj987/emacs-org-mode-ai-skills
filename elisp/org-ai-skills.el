@@ -120,6 +120,40 @@ When nil, interactive flow asks user to select a candidate explicitly."
   :type 'integer
   :group 'org-ai-skills)
 
+(defcustom org-ai-skills-enable-core-provider-tools t
+  "When non-nil, expose phase-1 core provider command tools on execution requests."
+  :type 'boolean
+  :group 'org-ai-skills)
+
+(defun org-ai-skills--default-core-provider-allowed-paths ()
+  "Return nil-safe default allowed root list for core provider commands."
+  (let* ((anchor (or load-file-name
+                     (buffer-file-name)
+                     default-directory
+                     temporary-file-directory))
+         (base-dir (if (and (stringp anchor) (file-directory-p anchor))
+                       anchor
+                     (and (stringp anchor) (file-name-directory anchor))))
+         (fallback (or base-dir default-directory temporary-file-directory "/tmp/")))
+    (list (expand-file-name ".." fallback))))
+
+(defcustom org-ai-skills-core-provider-allowed-commands
+  '(file-read file-list file-search shell-exec python-exec org-babel-exec)
+  "Allowed phase-1 core provider command types."
+  :type '(repeat (choice (const file-read)
+                         (const file-list)
+                         (const file-search)
+                         (const shell-exec)
+                         (const python-exec)
+                         (const org-babel-exec)))
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-core-provider-allowed-paths
+  (org-ai-skills--default-core-provider-allowed-paths)
+  "Allowed directory roots for phase-1 core provider commands."
+  :type '(repeat string)
+  :group 'org-ai-skills)
+
 (defcustom org-ai-skills-model-planner nil
   "Model override for planner requests.
 When nil, planner requests use gptel default model selection."
@@ -238,6 +272,12 @@ When set to an empty string, dispatch falls back to the default execution system
 
 (defvar org-ai-skills--skill-defined-function-symbols nil
   "Alist mapping skill-id to function symbols defined from skill code blocks.")
+
+(defvar org-ai-skills-core-provider-command-registry nil
+  "Alist mapping phase-1 core provider command type symbols to handler functions.")
+
+(defvar org-ai-skills--core-provider-context-directory nil
+  "Current request-scoped default directory for phase-1 core provider commands.")
 
 (defvar org-ai-skills--candidate-selection-history nil
   "Minibuffer history for candidate selection prompts.")
@@ -890,8 +930,7 @@ Caller must ensure point is at a valid Org heading."
                      (org-ai-skills--file-keyword-value "PURPOSE")
                      ""))
         (source-file-path (or (org-entry-get (point) "SOURCE_FILE_PATH" t)
-                              (org-ai-skills--file-keyword-value "SOURCE_FILE_PATH")
-                              (buffer-file-name))))
+                              (org-ai-skills--file-keyword-value "SOURCE_FILE_PATH"))))
     (save-excursion
       (org-end-of-subtree t t)
       (list :begin begin
@@ -922,6 +961,40 @@ Caller must ensure point is at a valid Org heading."
          (first (car values)))
     (when (stringp first)
       (string-trim first))))
+
+(defun org-ai-skills--trim-path-punctuation (text)
+  "Trim common trailing punctuation from TEXT path token."
+  (replace-regexp-in-string "[),.;:!?，。；：！？）]+\\'" "" (or text "")))
+
+(defun org-ai-skills--normalize-existing-directory (path)
+  "Return existing directory for PATH, or nil when unavailable."
+  (when (and (stringp path) (not (string-empty-p path)))
+    (let ((abs (expand-file-name (org-ai-skills--trim-path-punctuation path))))
+      (cond
+       ((file-directory-p abs) abs)
+       ((file-exists-p abs) (file-name-directory abs))
+       (t nil)))))
+
+(defun org-ai-skills--extract-directory-from-purpose (purpose)
+  "Extract first existing directory path candidate from PURPOSE text."
+  (when (and (stringp purpose) (not (string-empty-p purpose)))
+    (let ((start 0)
+          (found nil))
+      (while (and (not found)
+                  (string-match "\\(?:~\\|/\\)[^ \t\n\"'“”‘’<>|]+" purpose start))
+        (setq found (org-ai-skills--normalize-existing-directory
+                     (match-string 0 purpose)))
+        (setq start (match-end 0)))
+      found)))
+
+(defun org-ai-skills--resolve-working-directory (subtree)
+  "Resolve preferred working directory from SUBTREE context.
+Priority: purpose path hint, explicit source path, then nil."
+  (let* ((purpose (plist-get subtree :purpose))
+         (source-file-path (plist-get subtree :source-file-path))
+         (from-purpose (org-ai-skills--extract-directory-from-purpose purpose))
+         (from-source (org-ai-skills--normalize-existing-directory source-file-path)))
+    (or from-purpose from-source nil)))
 
 (defun org-ai-skills-org-resolve-subtree (&optional context-mode levels-up)
   "Resolve target subtree at point.
@@ -982,6 +1055,7 @@ INSTRUCTION overrides the default rewrite goal."
          (levels-up (plist-get subtree :levels-up))
          (skill-id (plist-get skill :skill-id))
          (default-constraints (org-ai-skills--skill-default-rewrite-constraints skill-id))
+         (working-directory (org-ai-skills--resolve-working-directory subtree))
          (goal (if (string-empty-p (or instruction ""))
                    (format "Rewrite Org subtree for heading: %s" heading)
                  instruction))
@@ -1029,6 +1103,8 @@ INSTRUCTION overrides the default rewrite goal."
                   (or (plist-get subtree :purpose) "")
                   "\nSource file path: "
                   (or (plist-get subtree :source-file-path) "")
+                  "\nWorking directory hint: "
+                  (or working-directory "")
                   "\n\nSkill description:\n"
                   (or (plist-get skill :description) "")
                   "\n\n"
@@ -1065,6 +1141,7 @@ INSTRUCTION overrides the default rewrite goal."
           :context-mode mode
           :levels-up levels-up
           :source-file-path (plist-get subtree :source-file-path)
+          :working-directory working-directory
           :source-text (plist-get subtree :text)
           :rewrite-constraints default-constraints
           :skill-context skill-context
@@ -1081,6 +1158,8 @@ INSTRUCTION overrides the default rewrite goal."
   "Build one execution request from STEP, RUN-STATE, and LOADED-SKILLS."
   (let* ((task (or (plist-get run-state :task) ""))
          (subtree (plist-get run-state :subtree))
+         (working-directory (or (plist-get run-state :working-directory)
+                                (org-ai-skills--resolve-working-directory subtree)))
          (compose-step-p
           (seq-some (lambda (skill)
                       (string= (plist-get skill :skill-id) org-ai-skills--compose-skill-id))
@@ -1137,6 +1216,8 @@ INSTRUCTION overrides the default rewrite goal."
            (format "- composition_reason: %s\n\n" (or (plist-get step :composition-reason) ""))
            (format "Source file path: %s\n\n"
                    (or (plist-get subtree :source-file-path) ""))
+           (format "Working directory hint: %s\n\n"
+                   (or working-directory ""))
            (if compose-step-p
                (concat
                 "Strict compose constraints:\n"
@@ -1155,6 +1236,7 @@ INSTRUCTION overrides the default rewrite goal."
           :composition-reason (or (plist-get step :composition-reason) "")
           :plan-revision (or (plist-get run-state :plan-revision) 1)
           :source-file-path (plist-get subtree :source-file-path)
+          :working-directory working-directory
           :skill-contexts (mapcar
                            (lambda (skill)
                              (org-ai-skills-build-skill-context skill subtree))
@@ -1181,7 +1263,8 @@ Only skills referenced by STEP are loaded from DIRECTORY."
                                   (org-ai-skills-load-skill-by-id skill-id directory))
                                 skill-ids))
          (request nil)
-         (dispatched nil))
+         (dispatched nil)
+         (failed nil))
     (unwind-protect
         (progn
           (dolist (skill loaded-skills)
@@ -1191,11 +1274,17 @@ Only skills referenced by STEP are loaded from DIRECTORY."
            request
            (lambda (&rest response)
              (unwind-protect
-                 (let ((raw (apply #'org-ai-skills--extract-gptel-response-text-if-ready response)))
-                   (when raw
-                     (let* ((output (org-ai-skills--extract-subtree-body raw))
-                            (updated-run-state (org-ai-skills--record-run-step run-state step output)))
-                       (funcall callback updated-run-state output))))
+                 (unless failed
+                   (condition-case err
+                       (let ((raw (apply #'org-ai-skills--extract-gptel-response-text-if-ready response)))
+                         (when raw
+                           (let* ((output (org-ai-skills--extract-subtree-body raw))
+                                  (updated-run-state (org-ai-skills--record-run-step run-state step output)))
+                             (funcall callback updated-run-state output))))
+                     (org-ai-skills-gptel-error
+                      (setq failed t)
+                      (let ((message (error-message-string err)))
+                        (funcall callback (plist-put run-state :fatal-error message) nil)))))
                (dolist (skill loaded-skills)
                  (org-ai-skills-exclude-skill-function-calls skill)))))
           (setq dispatched t))
@@ -1275,39 +1364,44 @@ Invoke CALLBACK with final run-state when done."
        (car pending)
        run-state
        (lambda (updated-run-state _output)
-         (if (not org-ai-skills-planner-auto-replan)
+         (if (plist-get updated-run-state :fatal-error)
+             (funcall callback updated-run-state)
+           (if (not org-ai-skills-planner-auto-replan)
              (org-ai-skills--run-plan-steps
               task metadata updated-run-state (cdr pending) callback directory)
-           (org-ai-skills--request-planner-plan
-            task
-            metadata
-            updated-run-state
-            (lambda (planner-response)
-              (let ((revised-plan
-                     (org-ai-skills-maybe-replan updated-run-state planner-response)))
-                (if revised-plan
-                    (let ((next-state
-                           (plist-put
-                            (plist-put updated-run-state
-                                       :plan-revision
-                                       (1+ (or (plist-get updated-run-state
-                                                           :plan-revision)
-                                               1)))
-                            :replans (1+ (or (plist-get updated-run-state :replans) 0)))))
-                      (org-ai-skills--run-plan-steps
-                       task metadata next-state revised-plan callback directory))
-                  (org-ai-skills--run-plan-steps
-                   task metadata updated-run-state (cdr pending) callback directory)))))))
+             (org-ai-skills--request-planner-plan
+              task
+              metadata
+              updated-run-state
+              (lambda (planner-response)
+                (let ((revised-plan
+                       (org-ai-skills-maybe-replan updated-run-state planner-response)))
+                  (if revised-plan
+                      (let ((next-state
+                             (plist-put
+                              (plist-put updated-run-state
+                                         :plan-revision
+                                         (1+ (or (plist-get updated-run-state
+                                                             :plan-revision)
+                                                 1)))
+                              :replans (1+ (or (plist-get updated-run-state :replans) 0)))))
+                        (org-ai-skills--run-plan-steps
+                         task metadata next-state revised-plan callback directory))
+                    (org-ai-skills--run-plan-steps
+                     task metadata updated-run-state (cdr pending) callback directory))))))))
        directory))))
 
 (defun org-ai-skills-run-task-with-planner (task subtree &optional options callback)
   "Run TASK on SUBTREE using autonomous planner flow.
 OPTIONS is a plist; CALLBACK receives final run-state."
   (let* ((directory (or (plist-get options :directory) org-ai-skills-skill-dir))
+         (working-directory (or (plist-get options :working-directory)
+                                (org-ai-skills--resolve-working-directory subtree)))
          (metadata (org-ai-skills-load-skill-metadata directory))
          (run-state (list :run-id (format-time-string "%Y%m%d%H%M%S")
                           :task task
                           :subtree subtree
+                          :working-directory working-directory
                           :metadata-snapshot metadata
                           :plan-revision 1
                           :replans 0
@@ -1406,11 +1500,75 @@ If ENABLED is non-nil, set debug mode accordingly."
      (t (org-ai-skills--signal-gptel-error
          "gptel callback did not return text response")))))
 
+(defun org-ai-skills--parse-provider-tool-result (raw-result)
+  "Parse RAW-RESULT into provider plist when possible."
+  (cond
+   ((and (listp raw-result)
+         (plist-member raw-result :ok))
+    raw-result)
+   ((stringp raw-result)
+    (condition-case nil
+        (let ((parsed (car (read-from-string raw-result))))
+          (when (and (listp parsed)
+                     (plist-member parsed :ok))
+            parsed))
+      (error nil)))
+   (t nil)))
+
+(defun org-ai-skills--tool-name-from-result-item (item)
+  "Extract tool name string from one gptel tool result ITEM."
+  (let ((tool (car-safe item)))
+    (cond
+     ((and (listp tool)
+           (eq (car-safe tool) 'gptel-tool))
+      (or (cadr tool) "unknown-tool"))
+     (t
+      (let ((text (format "%S" tool)))
+        (if (string-match "#s(gptel-tool\\s-+\\([^[:space:])]+\\)" text)
+            (match-string 1 text)
+          "unknown-tool"))))))
+
+(defun org-ai-skills--extract-tool-result-errors (&rest response)
+  "Extract provider tool errors from gptel callback RESPONSE.
+Return list of error plists, each with :tool-name, :error-kind and :error-message."
+  (let ((first (car response))
+        (errors nil))
+    (when (and (consp first)
+               (eq (car first) 'tool-result))
+      (dolist (item (cdr first))
+        (let* ((raw-result (nth 2 item))
+               (parsed (org-ai-skills--parse-provider-tool-result raw-result))
+               (error-kind (and parsed (plist-get parsed :error-kind))))
+          (when (and parsed
+                     (plist-member parsed :ok)
+                     (null (plist-get parsed :ok))
+                     (stringp error-kind)
+                     (not (string-empty-p error-kind)))
+            (push (list :tool-name (org-ai-skills--tool-name-from-result-item item)
+                        :error-kind error-kind
+                        :error-message (or (plist-get parsed :error-message)
+                                           "Provider tool execution failed"))
+                  errors)))))
+    (nreverse errors)))
+
+(defun org-ai-skills--format-tool-result-error-message (tool-errors)
+  "Format TOOL-ERRORS list into one user-visible error message."
+  (let* ((first (car tool-errors))
+         (tool-name (or (plist-get first :tool-name) "unknown-tool"))
+         (error-kind (or (plist-get first :error-kind) "unknown-error"))
+         (error-message (or (plist-get first :error-message) "tool execution failed")))
+    (format "Provider tool failed (%s, %s): %s"
+            tool-name error-kind error-message)))
+
 (defun org-ai-skills--extract-gptel-response-text-if-ready (&rest response)
   "Return text when RESPONSE is a final text callback, else nil.
 Interim callback events such as tool-call, tool-result, reasoning chunks,
 or stream completion markers are ignored and return nil."
-  (let ((first (car response)))
+  (let ((first (car response))
+        (tool-errors (apply #'org-ai-skills--extract-tool-result-errors response)))
+    (when tool-errors
+      (org-ai-skills--signal-gptel-error
+       (org-ai-skills--format-tool-result-error-message tool-errors)))
     (if (or (eq first t)
             (and (consp first)
                  (memq (car first) '(tool-call tool-result reasoning))))
@@ -1951,14 +2109,14 @@ Preserve target heading and property drawer by replacing subtree body."
              (org-ai-skills--ensure-subtree-heading-ids begin new-end))))))))
 (defun org-ai-skills--buffer-scope-target ()
   "Return whole-buffer scope target plist."
-  (let ((source-file (or (org-ai-skills--file-keyword-value "SOURCE_FILE_PATH")
-                         (buffer-file-name)))
+  (let ((source-file (org-ai-skills--file-keyword-value "SOURCE_FILE_PATH"))
+        (buffer-file (buffer-file-name))
         (name (buffer-name)))
     (list :begin (point-min)
           :end (point-max)
           :level 0
-          :heading (or source-file name)
-          :path (or source-file name)
+          :heading (or source-file buffer-file name)
+          :path (or source-file buffer-file name)
           :purpose (or (org-ai-skills--file-keyword-value "PURPOSE") "")
           :source-file-path source-file
           :context-mode 'buffer
@@ -2084,6 +2242,10 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
   (let* ((buffer (org-ai-skills--ui-control-buffer))
          (status (or (org-ai-skills--ui-run-get :status) 'idle))
          (progress (or (org-ai-skills--ui-run-get :progress) "idle"))
+         (error-detail (org-ai-skills--ui-run-get :error-detail))
+         (error-text (when (and (stringp error-detail)
+                                (not (string-empty-p error-detail)))
+                       (replace-regexp-in-string "[\n\r\t]+" " " error-detail)))
          (running (eq status 'running))
          (run-type (org-ai-skills--ui-run-get :run-type))
          (task (or (org-ai-skills--ui-run-get :task) ""))
@@ -2114,6 +2276,8 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
         (insert "org-ai-skills control\n\n")
         (insert (format "Status: %s\n" status))
         (insert (format "Progress: %s\n" progress))
+        (when (and (eq status 'failed) error-text)
+          (insert (format "Error: %s\n" error-text)))
         (insert (format "Heading: %s\n" heading))
         (insert (format "Task/Preset: %s%s%s\n"
                         task
@@ -2150,7 +2314,18 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
   "Update STATUS and PROGRESS in UI state."
   (org-ai-skills--ui-run-set :status status)
   (org-ai-skills--ui-run-set :progress progress)
+  (unless (eq status 'failed)
+    (org-ai-skills--ui-run-set :error-detail nil))
   (org-ai-skills-ui-refresh-control-buffer))
+
+(defun org-ai-skills--ui-set-failure (progress error-detail)
+  "Set failed status PROGRESS with ERROR-DETAIL for control panel."
+  (org-ai-skills--ui-run-set :error-detail
+                             (if (and (stringp error-detail)
+                                      (not (string-empty-p error-detail)))
+                                 (string-trim error-detail)
+                               nil))
+  (org-ai-skills--ui-set-status 'failed progress))
 
 (defun org-ai-skills-ui-open-workspace (&optional source-buffer)
   "Open two-column workspace for SOURCE-BUFFER and control panel."
@@ -2196,7 +2371,7 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
 (defun org-ai-skills--ui-start-run (run-state)
   "Start new UI RUN-STATE and render workspace."
   (org-ai-skills--ui-clear-overlay)
-  (setq org-ai-skills--ui-run-state run-state)
+  (setq org-ai-skills--ui-run-state (plist-put run-state :error-detail nil))
   (when (and org-ai-skills-ui-auto-open
              (org-ai-skills--ui-run-get :interactive-run))
     (org-ai-skills-ui-open-workspace (org-ai-skills--ui-run-get :source-buffer)))
@@ -2225,54 +2400,74 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
   (interactive)
   (if (eq (org-ai-skills--ui-run-get :status) 'running)
       (message "org-ai-skills: rerun unavailable while running")
-    (let ((rerun-fn (org-ai-skills--ui-run-get :rerun-fn)))
+    (let ((rerun-fn (org-ai-skills--ui-run-get :rerun-fn))
+          (source-buffer (org-ai-skills--ui-source-buffer)))
       (unless (functionp rerun-fn)
         (org-ai-skills--signal-org-context-error "No rerun action available"))
+      (unless (buffer-live-p source-buffer)
+        (org-ai-skills--signal-org-context-error
+         "No source Org buffer is available for rerun"))
       (org-ai-skills--ui-set-status 'running "rerun-dispatched")
       (org-ai-skills--ui-set-overlay 'running)
       (message "org-ai-skills: rerun dispatched")
-      (funcall rerun-fn))))
+      (with-current-buffer source-buffer
+        (funcall rerun-fn)))))
 
 (defun org-ai-skills-ui-adjust-task-or-instruction ()
   "Adjust planner task or rewrite instruction, then rerun."
   (interactive)
   (if (eq (org-ai-skills--ui-run-get :status) 'running)
       (message "org-ai-skills: adjust unavailable while running")
-    (let ((run-type (org-ai-skills--ui-run-get :run-type)))
-    (pcase run-type
-      ('planner
-       (let* ((target (org-ai-skills--ui-current-target))
-              (current-task (or (org-ai-skills--ui-run-get :task) ""))
-              (task (read-string "Planner task: " current-task)))
-         (org-ai-skills--ui-run-set
-          :rerun-fn
-          (lambda ()
-            (interactive)
-            (org-ai-skills-plan-run target task t)))
-         (org-ai-skills-plan-run target task t)))
-      ('rewrite
-       (let* ((target (org-ai-skills--ui-current-target))
-              (skill (org-ai-skills--ui-run-get :skill))
-              (constraints (org-ai-skills--ui-run-get :rewrite-constraints))
-              (current-instruction (or (org-ai-skills--ui-run-get :instruction) ""))
-              (instruction (read-string "Rewrite instruction: " current-instruction)))
-         (org-ai-skills--ui-run-set :instruction instruction)
-         (org-ai-skills--ui-run-set
-          :rerun-fn
-          (lambda ()
-            (interactive)
-            (org-ai-skills-org-rewrite-subtree
-             target skill instruction t constraints)))
-         (org-ai-skills-org-rewrite-subtree
-          target skill instruction t constraints)))
-      (_
-       (org-ai-skills--signal-org-context-error "Unsupported run type"))))))
+    (let ((run-type (org-ai-skills--ui-run-get :run-type))
+          (source-buffer (org-ai-skills--ui-source-buffer)))
+      (unless (buffer-live-p source-buffer)
+        (org-ai-skills--signal-org-context-error
+         "No source Org buffer is available for adjustment"))
+      (pcase run-type
+        ('planner
+         (let* ((current-task (or (org-ai-skills--ui-run-get :task) ""))
+                (task (read-string "Planner task: " current-task)))
+           (org-ai-skills--ui-run-set
+            :rerun-fn
+            (lambda ()
+              (interactive)
+              (with-current-buffer source-buffer
+                (let ((target (org-ai-skills--ui-current-target)))
+                  (org-ai-skills-plan-run target task t)))))
+           (with-current-buffer source-buffer
+             (let ((target (org-ai-skills--ui-current-target)))
+               (org-ai-skills-plan-run target task t)))))
+        ('rewrite
+         (let* ((skill (org-ai-skills--ui-run-get :skill))
+                (constraints (org-ai-skills--ui-run-get :rewrite-constraints))
+                (current-instruction (or (org-ai-skills--ui-run-get :instruction) ""))
+                (instruction (read-string "Rewrite instruction: " current-instruction)))
+           (org-ai-skills--ui-run-set :instruction instruction)
+           (org-ai-skills--ui-run-set
+            :rerun-fn
+            (lambda ()
+              (interactive)
+              (with-current-buffer source-buffer
+                (let ((target (org-ai-skills--ui-current-target)))
+                  (org-ai-skills-org-rewrite-subtree
+                   target skill instruction t constraints)))))
+           (with-current-buffer source-buffer
+             (let ((target (org-ai-skills--ui-current-target)))
+               (org-ai-skills-org-rewrite-subtree
+                target skill instruction t constraints)))))
+        (_
+         (org-ai-skills--signal-org-context-error "Unsupported run type"))))))
 
 (defun org-ai-skills-ui-select-candidate ()
   "Select one candidate in minibuffer and cache it in UI state."
   (interactive)
   (let* ((slot-key (org-ai-skills--ui-run-get :slot-key))
-         (candidate (org-ai-skills--read-slot-candidate slot-key nil)))
+         (candidate nil))
+    (unless (and (stringp slot-key)
+                 (not (string-empty-p slot-key)))
+      (org-ai-skills--signal-version-store-error
+       "No candidate slot key in current run; generate or select a valid run target first"))
+    (setq candidate (org-ai-skills--read-slot-candidate slot-key nil))
     (org-ai-skills--ui-run-set :selected-candidate candidate)
     ;; Decision: ready overlay clears immediately after candidate switch.
     (org-ai-skills--ui-clear-overlay)
@@ -2286,21 +2481,39 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
       (message "org-ai-skills: apply unavailable while running")
     (let* ((candidate (or (org-ai-skills--ui-run-get :selected-candidate)
                           (org-ai-skills-ui-select-candidate)))
-           (source-buffer (or (org-ai-skills--ui-run-get :source-buffer)
-                              (current-buffer)))
-           (target (org-ai-skills--ui-current-target)))
+           (source-buffer (org-ai-skills--ui-source-buffer)))
       (unless candidate
         (org-ai-skills--signal-version-store-error "No selected candidate"))
       (unless (buffer-live-p source-buffer)
-        (org-ai-skills--signal-org-context-error "Source buffer is not available"))
+        (org-ai-skills--signal-org-context-error
+         "No source Org buffer is available for apply"))
       (with-current-buffer source-buffer
+        (let ((target (org-ai-skills--ui-current-target)))
         (unless target
           (org-ai-skills--signal-org-context-error "No apply target available"))
         (org-ai-skills-org-apply-candidate-to-subtree
          target
-         candidate))
+           candidate)))
       (org-ai-skills--ui-clear-overlay)
       (org-ai-skills--ui-set-status 'applied "applied"))))
+
+(defun org-ai-skills--ui-source-buffer ()
+  "Return source buffer for current UI run state, or nil when unavailable."
+  (let* ((source-buffer (org-ai-skills--ui-run-get :source-buffer))
+         (target (org-ai-skills--ui-current-target))
+         (begin (or (plist-get target :begin)
+                    (org-ai-skills--ui-run-get :begin)))
+         (end (or (plist-get target :end)
+                  (org-ai-skills--ui-run-get :end))))
+    (cond
+     ((buffer-live-p source-buffer) source-buffer)
+     ((and (markerp begin)
+           (buffer-live-p (marker-buffer begin)))
+      (marker-buffer begin))
+     ((and (markerp end)
+           (buffer-live-p (marker-buffer end)))
+      (marker-buffer end))
+     (t nil))))
 
 (defun org-ai-skills--ui-current-target ()
   "Return current UI target, reconstructing from runtime state when missing."
@@ -2381,6 +2594,62 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
      ((markerp begin) (marker-position begin))
      ((integerp begin) begin)
      (t nil))))
+
+(defun org-ai-skills--find-heading-by-id (slot-id)
+  "Return heading position for SLOT-ID in current Org buffer, or nil."
+  (when (and (derived-mode-p 'org-mode)
+             (stringp slot-id)
+             (not (string-empty-p slot-id)))
+    (save-excursion
+      (goto-char (point-min))
+      (let ((regexp (format "^[ \t]*:ID:[ \t]*%s[ \t]*$"
+                            (regexp-quote slot-id)))
+            (found nil))
+        (while (and (not found) (re-search-forward regexp nil t))
+          (condition-case nil
+              (progn
+                (org-back-to-heading t)
+                (setq found (point)))
+            (error nil)))
+        found))))
+
+(defun org-ai-skills--resolve-subtree-from-slot (slot source-buffer)
+  "Resolve latest subtree target from SLOT in SOURCE-BUFFER.
+Prefer slot-id based lookup, then fall back to marker range in SLOT."
+  (when (buffer-live-p source-buffer)
+    (with-current-buffer source-buffer
+      (let* ((context-mode (or (plist-get slot :context-mode) 'current))
+             (slot-id (plist-get slot :slot-id))
+             (heading-pos (and (not (eq context-mode 'buffer))
+                               (org-ai-skills--find-heading-by-id slot-id))))
+        (cond
+         ((eq context-mode 'buffer)
+          (append (org-ai-skills--buffer-scope-target)
+                  (list :slot-id slot-id
+                        :slot-file (plist-get slot :slot-file)
+                        :slot-key (plist-get slot :slot-key))))
+         (heading-pos
+          (goto-char heading-pos)
+          (append (org-ai-skills--subtree-at-heading-point)
+                  (list :context-mode context-mode
+                        :levels-up (or (plist-get slot :levels-up) 0)
+                        :path (mapconcat #'identity (org-ai-skills--heading-path-at-point) "/")
+                        :slot-id slot-id
+                        :slot-file (plist-get slot :slot-file)
+                        :slot-key (plist-get slot :slot-key))))
+         (t
+          (let ((begin (plist-get slot :begin))
+                (end (plist-get slot :end)))
+            (when (and (markerp begin) (marker-buffer begin)
+                       (markerp end) (marker-buffer end))
+              (list :begin begin
+                    :end end
+                    :context-mode context-mode
+                    :levels-up (or (plist-get slot :levels-up) 0)
+                    :heading (or (plist-get slot :heading) "")
+                    :slot-id slot-id
+                    :slot-file (plist-get slot :slot-file)
+                    :slot-key (plist-get slot :slot-key))))))))))
 
 (defun org-ai-skills--ensure-subtree-slot-id (subtree)
   "Ensure SUBTREE has stable slot id; write back Org =:ID:= when possible."
@@ -2546,11 +2815,18 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
 
 (defun org-ai-skills-org-apply-candidate-to-subtree (subtree candidate)
   "Apply CANDIDATE to SUBTREE and update persisted status."
-  (org-ai-skills-org-apply-rewrite-result subtree (plist-get candidate :output-text))
-  (org-ai-skills--update-candidate-status
-   (plist-get candidate :slot-key)
-   (plist-get candidate :candidate-id)
-   "applied")
+  (let ((slot-key (plist-get candidate :slot-key))
+        (candidate-id (plist-get candidate :candidate-id)))
+    (org-ai-skills-org-apply-rewrite-result subtree (plist-get candidate :output-text))
+    (if (and (stringp slot-key)
+             (not (string-empty-p slot-key))
+             (stringp candidate-id)
+             (not (string-empty-p candidate-id)))
+        (org-ai-skills--update-candidate-status
+         slot-key
+         candidate-id
+         "applied")
+      (message "org-ai-skills: apply succeeded but candidate status not persisted (missing slot metadata)")))
   (message "org-ai-skills candidate applied: %s"
            (plist-get candidate :candidate-id)))
 
@@ -2568,6 +2844,308 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
            :end (plist-get slot :end)
            :context-mode (plist-get slot :context-mode))
      candidate)))
+
+(defun org-ai-skills--core-provider-timestamp ()
+  "Return current timestamp string for core provider result metadata."
+  (format-time-string "%Y-%m-%dT%H:%M:%S%z"))
+
+(defun org-ai-skills--core-provider-result (command-type cwd ok &rest props)
+  "Build normalized core provider payload.
+COMMAND-TYPE identifies the command, CWD is command context, OK is boolean, and PROPS
+contains additional plist keys."
+  (append (list :ok ok
+                :command-type command-type
+                :cwd cwd
+                :timestamp (org-ai-skills--core-provider-timestamp))
+          props))
+
+(defun org-ai-skills--core-provider-normalize-max-count (n fallback)
+  "Coerce N to positive integer, defaulting to FALLBACK."
+  (let ((value (cond
+                ((integerp n) n)
+                ((and (stringp n) (string-match-p "^[0-9]+$" n))
+                 (string-to-number n))
+                (t fallback))))
+    (max 1 value)))
+
+(defun org-ai-skills--core-provider-allowed-command-p (command-type)
+  "Return non-nil when COMMAND-TYPE is allowed."
+  (memq command-type org-ai-skills-core-provider-allowed-commands))
+
+(defun org-ai-skills--core-provider-effective-allowed-paths ()
+  "Return effective allowed roots, including request-scoped working directory."
+  (let ((paths (copy-sequence org-ai-skills-core-provider-allowed-paths)))
+    (when (and (stringp org-ai-skills--core-provider-context-directory)
+               (file-directory-p org-ai-skills--core-provider-context-directory))
+      (push org-ai-skills--core-provider-context-directory paths))
+    (cl-remove-duplicates
+     (mapcar #'expand-file-name
+             (seq-filter (lambda (path)
+                           (and (stringp path)
+                                (not (string-empty-p path))))
+                         paths))
+     :test #'string=)))
+
+(defun org-ai-skills--core-provider-path-in-allowed-root-p (path)
+  "Return non-nil when PATH is within `org-ai-skills-core-provider-allowed-paths'."
+  (let ((abs (expand-file-name path)))
+    (seq-some
+     (lambda (root)
+       (let ((root-dir (file-name-as-directory (expand-file-name root))))
+         (or (string= abs (directory-file-name root-dir))
+             (file-in-directory-p abs root-dir))))
+     (org-ai-skills--core-provider-effective-allowed-paths))))
+
+(defun org-ai-skills--core-provider-check-access (command-type path)
+  "Return normalized failure payload when COMMAND-TYPE or PATH is disallowed.
+Return nil when both checks pass."
+  (let ((abs (expand-file-name path)))
+    (cond
+     ((not (org-ai-skills--core-provider-allowed-command-p command-type))
+      (org-ai-skills--core-provider-result
+       command-type abs nil
+       :error-kind "command-not-allowed"
+       :error-message (format "Command type is not allowed: %s" command-type)))
+     ((not (org-ai-skills--core-provider-path-in-allowed-root-p abs))
+      (org-ai-skills--core-provider-result
+       command-type abs nil
+       :error-kind "path-not-allowed"
+       :error-message (format "Path is outside allowed roots: %s" abs)
+       :allowed-paths (org-ai-skills--core-provider-effective-allowed-paths)))
+     (t nil))))
+
+(defun org-ai-skills--core-provider-run-process (program args cwd)
+  "Run PROGRAM with ARGS in CWD and return normalized process metadata plist."
+  (let ((stdout-buffer (generate-new-buffer " *org-ai-skills-core-provider-stdout*"))
+        (stderr-file (make-temp-file "org-ai-skills-core-provider-stderr-")))
+    (unwind-protect
+        (let ((default-directory cwd))
+          (condition-case err
+              (let ((exit-code (apply #'process-file
+                                      program
+                                      nil
+                                      (list stdout-buffer stderr-file)
+                                      nil
+                                      args)))
+                (list :ok (zerop exit-code)
+                      :exit-code exit-code
+                      :stdout (with-current-buffer stdout-buffer
+                                (buffer-string))
+                      :stderr (with-temp-buffer
+                                (insert-file-contents stderr-file)
+                                (buffer-string))))
+            (error
+             (list :ok nil
+                   :exit-code -1
+                   :stdout ""
+                   :stderr (error-message-string err)))))
+      (kill-buffer stdout-buffer)
+      (ignore-errors (delete-file stderr-file)))))
+
+(defun org-ai-skills-core-provider-register-command (command-type function-symbol)
+  "Register FUNCTION-SYMBOL as provider handler for COMMAND-TYPE."
+  (setq org-ai-skills-core-provider-command-registry
+        (assq-delete-all command-type org-ai-skills-core-provider-command-registry))
+  (push (cons command-type function-symbol) org-ai-skills-core-provider-command-registry))
+
+(defun org-ai-skills-core-provider-dispatch (command-type &rest args)
+  "Dispatch COMMAND-TYPE with ARGS through provider registry."
+  (let ((handler (cdr (assoc command-type org-ai-skills-core-provider-command-registry))))
+    (unless (and handler (fboundp handler))
+      (org-ai-skills--signal-function-call-error
+       (format "No registered core provider command for type: %s" command-type)))
+    (apply handler args)))
+
+(defun org-ai-skills-core-provider-read-file (file-path &optional max-chars)
+  "Read FILE-PATH under allowed roots and return normalized payload."
+  (unless (and (stringp file-path) (not (string-empty-p file-path)))
+    (org-ai-skills--signal-function-call-error
+     "file_path is required for org-ai-skills-core-provider-read-file"))
+  (let* ((abs (expand-file-name file-path))
+         (guard (org-ai-skills--core-provider-check-access 'file-read abs)))
+    (if guard
+        guard
+      (if (not (file-readable-p abs))
+          (org-ai-skills--core-provider-result
+           'file-read (file-name-directory abs) nil
+           :target-path abs
+           :error-kind "file-not-readable"
+           :error-message (format "Source file is not readable: %s" abs))
+        (let ((content (with-temp-buffer
+                         (insert-file-contents abs)
+                         (buffer-string))))
+          (org-ai-skills--core-provider-result
+           'file-read (file-name-directory abs) t
+           :target-path abs
+           :content (org-ai-skills--slice-string-by-chars content max-chars)))))))
+
+(defun org-ai-skills-core-provider-list-files (&optional directory max-results)
+  "List files under DIRECTORY with optional MAX-RESULTS."
+  (let* ((dir (expand-file-name (or directory
+                                    org-ai-skills--core-provider-context-directory
+                                    default-directory)))
+         (guard (org-ai-skills--core-provider-check-access 'file-list dir)))
+    (if guard
+        guard
+      (if (not (file-directory-p dir))
+          (org-ai-skills--core-provider-result
+           'file-list dir nil
+           :error-kind "directory-not-found"
+           :error-message (format "Directory does not exist: %s" dir))
+        (let* ((entries (directory-files dir nil directory-files-no-dot-files-regexp))
+               (limit (org-ai-skills--core-provider-normalize-max-count max-results 200))
+               (normalized
+                (mapcar (lambda (name)
+                          (let ((abs (expand-file-name name dir)))
+                            (if (file-directory-p abs)
+                                (concat name "/")
+                              name)))
+                        entries))
+               (limited (seq-take normalized limit)))
+          (org-ai-skills--core-provider-result
+           'file-list dir t
+           :entries limited
+           :entry-count (length limited)
+           :truncated (> (length normalized) limit)))))))
+
+(defun org-ai-skills-core-provider-search-files (query &optional directory max-results)
+  "Search QUERY in DIRECTORY and return normalized match payload."
+  (unless (and (stringp query) (not (string-empty-p query)))
+    (org-ai-skills--signal-function-call-error
+     "query is required for org-ai-skills-core-provider-search-files"))
+  (let* ((dir (expand-file-name (or directory
+                                    org-ai-skills--core-provider-context-directory
+                                    default-directory)))
+         (guard (org-ai-skills--core-provider-check-access 'file-search dir)))
+    (if guard
+        guard
+      (if (not (file-directory-p dir))
+          (org-ai-skills--core-provider-result
+           'file-search dir nil
+           :error-kind "directory-not-found"
+           :error-message (format "Directory does not exist: %s" dir))
+        (let* ((limit (org-ai-skills--core-provider-normalize-max-count max-results 100))
+               (rg (executable-find "rg"))
+               (proc (if rg
+                         (org-ai-skills--core-provider-run-process
+                          rg
+                          (list "--line-number" "--no-heading" "--color" "never" query)
+                          dir)
+                       (org-ai-skills--core-provider-run-process
+                        "grep"
+                        (list "-R" "-n" "-I" query ".")
+                        dir)))
+               (stdout (or (plist-get proc :stdout) ""))
+               (lines (split-string stdout "\n" t))
+               (matches (seq-take lines limit)))
+          (org-ai-skills--core-provider-result
+           'file-search dir (plist-get proc :ok)
+           :query query
+           :matches matches
+           :match-count (length matches)
+           :truncated (> (length lines) limit)
+           :exit-code (plist-get proc :exit-code)
+           :stdout stdout
+           :stderr (plist-get proc :stderr)))))))
+
+(defun org-ai-skills-core-provider-shell-exec (command &optional directory)
+  "Execute shell COMMAND in DIRECTORY and return normalized payload."
+  (unless (and (stringp command) (not (string-empty-p command)))
+    (org-ai-skills--signal-function-call-error
+     "command is required for org-ai-skills-core-provider-shell-exec"))
+  (let* ((cwd (expand-file-name (or directory
+                                    org-ai-skills--core-provider-context-directory
+                                    default-directory)))
+         (guard (org-ai-skills--core-provider-check-access 'shell-exec cwd)))
+    (if guard
+        guard
+      (let ((proc (org-ai-skills--core-provider-run-process
+                   shell-file-name
+                   (list shell-command-switch command)
+                   cwd)))
+        (org-ai-skills--core-provider-result
+         'shell-exec cwd (plist-get proc :ok)
+         :command command
+         :exit-code (plist-get proc :exit-code)
+         :stdout (plist-get proc :stdout)
+         :stderr (plist-get proc :stderr))))))
+
+(defun org-ai-skills-core-provider-python-exec (code &optional directory)
+  "Execute Python CODE in DIRECTORY and return normalized payload."
+  (unless (and (stringp code) (not (string-empty-p code)))
+    (org-ai-skills--signal-function-call-error
+     "code is required for org-ai-skills-core-provider-python-exec"))
+  (let* ((cwd (expand-file-name (or directory
+                                    org-ai-skills--core-provider-context-directory
+                                    default-directory)))
+         (guard (org-ai-skills--core-provider-check-access 'python-exec cwd)))
+    (if guard
+        guard
+      (let ((python (or (executable-find "python3")
+                        (executable-find "python"))))
+        (if (not python)
+            (org-ai-skills--core-provider-result
+             'python-exec cwd nil
+             :error-kind "python-not-found"
+             :error-message "python3/python executable not found")
+          (let ((proc (org-ai-skills--core-provider-run-process python (list "-c" code) cwd)))
+            (org-ai-skills--core-provider-result
+             'python-exec cwd (plist-get proc :ok)
+             :code code
+             :python python
+             :exit-code (plist-get proc :exit-code)
+             :stdout (plist-get proc :stdout)
+             :stderr (plist-get proc :stderr))))))))
+
+(defun org-ai-skills-core-provider-org-babel-exec (language body &optional directory)
+  "Execute Org Babel src block using LANGUAGE and BODY in DIRECTORY."
+  (unless (and (stringp language) (not (string-empty-p language)))
+    (org-ai-skills--signal-function-call-error
+     "language is required for org-ai-skills-core-provider-org-babel-exec"))
+  (unless (stringp body)
+    (org-ai-skills--signal-function-call-error
+     "body must be a string for org-ai-skills-core-provider-org-babel-exec"))
+  (let* ((cwd (expand-file-name (or directory
+                                    org-ai-skills--core-provider-context-directory
+                                    default-directory)))
+         (guard (org-ai-skills--core-provider-check-access 'org-babel-exec cwd)))
+    (if guard
+        guard
+      (let ((default-directory cwd))
+        (condition-case err
+            (let ((result
+                   (with-temp-buffer
+                     (org-mode)
+                     (insert (format "#+begin_src %s\n%s\n#+end_src\n" language body))
+                     (goto-char (point-min))
+                     (re-search-forward "^#\\+begin_src" nil t)
+                     (let ((org-confirm-babel-evaluate nil))
+                       (org-babel-execute-src-block)))))
+              (org-ai-skills--core-provider-result
+               'org-babel-exec cwd t
+               :language language
+               :result (if (stringp result)
+                           result
+                         (format "%S" result))))
+          (error
+           (org-ai-skills--core-provider-result
+            'org-babel-exec cwd nil
+            :language language
+            :error-kind "org-babel-execution-error"
+            :error-message (error-message-string err))))))))
+
+(defun org-ai-skills-core-provider-register-default-commands ()
+  "Register phase-1 default core provider command handlers."
+  (setq org-ai-skills-core-provider-command-registry nil)
+  (org-ai-skills-core-provider-register-command 'file-read #'org-ai-skills-core-provider-read-file)
+  (org-ai-skills-core-provider-register-command 'file-list #'org-ai-skills-core-provider-list-files)
+  (org-ai-skills-core-provider-register-command 'file-search #'org-ai-skills-core-provider-search-files)
+  (org-ai-skills-core-provider-register-command 'shell-exec #'org-ai-skills-core-provider-shell-exec)
+  (org-ai-skills-core-provider-register-command 'python-exec #'org-ai-skills-core-provider-python-exec)
+  (org-ai-skills-core-provider-register-command 'org-babel-exec #'org-ai-skills-core-provider-org-babel-exec)
+  org-ai-skills-core-provider-command-registry)
+
+(org-ai-skills-core-provider-register-default-commands)
 
 (defun org-ai-skills--parse-function-arg-names (arg-spec)
   "Parse ARG-SPEC string like \"(query date)\" into argument names."
@@ -2650,6 +3228,41 @@ START and END are 1-based positions and are clamped to buffer bounds."
      :max_chars "optional maximum characters to return"))
   "Core always-available read tool specs.")
 
+(defconst org-ai-skills--core-provider-function-calls
+  '((:name "org-ai-skills-core-provider-read-file"
+     :when "when file content is needed under allowed roots"
+     :args "(file_path max_chars)"
+     :file_path "absolute or relative file path"
+     :max_chars "optional maximum characters to return")
+    (:name "org-ai-skills-core-provider-list-files"
+     :when "when exploring entries under one folder"
+     :args "(directory max_results)"
+     :directory "absolute or relative directory path"
+     :max_results "optional max entry count")
+    (:name "org-ai-skills-core-provider-search-files"
+     :when "when locating functions/usages by text query"
+     :args "(query directory max_results)"
+     :query "search pattern text"
+     :directory "absolute or relative directory path"
+     :max_results "optional max match count")
+    (:name "org-ai-skills-core-provider-shell-exec"
+     :when "when command-line inspection or scripts are required"
+     :args "(command directory)"
+     :command "shell command string"
+     :directory "absolute or relative working directory path")
+    (:name "org-ai-skills-core-provider-python-exec"
+     :when "when quick Python experiments are required"
+     :args "(code directory)"
+     :code "python code string for python -c"
+     :directory "absolute or relative working directory path")
+    (:name "org-ai-skills-core-provider-org-babel-exec"
+     :when "when running Org Babel code blocks for experiments"
+     :args "(language body directory)"
+     :language "Org Babel language name (example: emacs-lisp)"
+     :body "source code body"
+     :directory "absolute or relative working directory path"))
+  "Core phase-1 provider tool specs.")
+
 (defun org-ai-skills--request-function-calls (request &optional role)
   "Collect function call specs from REQUEST contexts.
 When ROLE is `planner', return nil because planner must not use tools."
@@ -2661,6 +3274,8 @@ When ROLE is `planner', return nil because planner must not use tools."
             (skill-contexts (plist-get request :skill-contexts)))
         (when org-ai-skills-enable-core-read-tools
           (setq calls (append calls org-ai-skills--core-read-function-calls)))
+        (when org-ai-skills-enable-core-provider-tools
+          (setq calls (append calls org-ai-skills--core-provider-function-calls)))
         (when skill-context
           (setq calls (append calls (or (plist-get skill-context :function-calls) nil))))
         (dolist (ctx skill-contexts)
@@ -2779,6 +3394,7 @@ When ROLE is `planner', return nil because planner must not use tools."
          (effective-system-prompt (org-ai-skills--resolve-role-system-prompt role))
          (effective-schema (org-ai-skills--resolve-role-schema role))
          (generation-settings (org-ai-skills--resolve-role-generation-settings role))
+         (working-directory (plist-get request :working-directory))
          (tools (org-ai-skills--request-gptel-tools request role))
          (tool-names (mapcar (lambda (fn-spec) (plist-get fn-spec :name))
                              (org-ai-skills--request-function-calls request role)))
@@ -2786,6 +3402,7 @@ When ROLE is `planner', return nil because planner must not use tools."
                                  (list :request-role role
                                        :effective-model effective-model
                                        :effective-schema (if effective-schema t nil)
+                                       :effective-working-directory working-directory
                                        :effective-system-prompt-fingerprint
                                        (org-ai-skills--system-prompt-fingerprint
                                         effective-system-prompt))
@@ -2840,7 +3457,8 @@ When ROLE is `planner', return nil because planner must not use tools."
                         (truncate-string-to-width (format "%S" first) 260 nil nil t)))
                  (signal (car err) (cdr err))))))))
     (org-ai-skills--append-debug-entry logged-request)
-    (let ((gptel-tools tools)
+    (let ((org-ai-skills--core-provider-context-directory working-directory)
+          (gptel-tools tools)
           (gptel-use-tools (and tools t))
           (gptel-model (or effective-model gptel-model))
           (gptel-temperature (or (plist-get generation-settings :temperature)
@@ -2912,6 +3530,7 @@ When TARGET is nil, resolve current subtree."
                               (called-interactively-p 'interactive)))
          (subtree (or target (org-ai-skills-org-resolve-subtree 'current)))
          (slot (org-ai-skills--ensure-subtree-slot-id subtree))
+         (working-directory (org-ai-skills--resolve-working-directory slot))
          (effective-constraints
           (org-ai-skills--merge-rewrite-constraints
            (org-ai-skills--skill-default-rewrite-constraints
@@ -2920,8 +3539,8 @@ When TARGET is nil, resolve current subtree."
          (request nil)
          (buffer (current-buffer))
          (dispatched nil)
+         (failed nil)
          (run-id (org-ai-skills--candidate-id))
-         ;; Markers keep target positions stable for async callback.
          (begin (copy-marker (plist-get slot :begin)))
          (end (copy-marker (plist-get slot :end))))
     (org-ai-skills--ui-start-run
@@ -2930,7 +3549,7 @@ When TARGET is nil, resolve current subtree."
            :interactive-run interactive-run
            :status 'running
            :progress "generation"
-           :target target
+           :target slot
            :source-buffer buffer
            :begin begin
            :end end
@@ -2940,6 +3559,7 @@ When TARGET is nil, resolve current subtree."
            :slot-id (plist-get slot :slot-id)
            :skill skill
            :instruction instruction
+           :working-directory working-directory
            :rewrite-constraints effective-constraints
            :task (or instruction "rewrite")
            :preset-id nil
@@ -2947,8 +3567,10 @@ When TARGET is nil, resolve current subtree."
            :stop-requested nil
            :rerun-fn (lambda ()
                        (interactive)
-                       (org-ai-skills-org-rewrite-subtree
-                        target skill instruction t effective-constraints))))
+                       (let ((latest (or (org-ai-skills--resolve-subtree-from-slot slot buffer)
+                                         slot)))
+                         (org-ai-skills-org-rewrite-subtree
+                          latest skill instruction t effective-constraints)))))
     (unwind-protect
         (progn
           (org-ai-skills-apply-skill-function-calls skill)
@@ -2956,69 +3578,86 @@ When TARGET is nil, resolve current subtree."
                          skill slot instruction))
           (setq request (append request
                                 (list :buffer-name (buffer-name buffer)
-                                      :buffer-file (buffer-file-name buffer))))
+                                      :buffer-file (buffer-file-name buffer)
+                                      :working-directory working-directory)))
           (org-ai-skills-gptel-dispatch-rewrite
            request
            (lambda (&rest response)
              (unwind-protect
-                 (let ((raw (apply #'org-ai-skills--extract-gptel-response-text-if-ready response)))
-                   (when raw
-                     (if (org-ai-skills--ui-stop-requested-p run-id)
-                         (org-ai-skills--ui-set-status 'canceled "canceled")
-                     (let ((rewritten (org-ai-skills--sanitize-rewrite-output
-                                       raw
-                                       slot))
-                           (candidate nil))
-                       (setq rewritten
-                             (org-ai-skills--enforce-rewrite-constraints
-                              rewritten slot effective-constraints))
-                       (setq candidate
-                             (org-ai-skills--record-generated-candidate
-                              slot
-                              (or (plist-get request :goal) "rewrite")
-                              "rewrite"
-                              (plist-get request :prompt)
-                              rewritten))
-                       (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
-                         (org-ai-skills--ui-run-set :selected-candidate candidate))
-                       (with-current-buffer buffer
-                         (if (and interactive-run
-                                  (markerp begin)
-                                  (marker-buffer begin)
-                                  (markerp end)
-                                  (marker-buffer end))
-                             (if org-ai-skills-auto-apply-generated-candidate
-                                 (progn
-                                   (org-ai-skills-org-apply-candidate-to-subtree
-                                    (list :begin begin
-                                          :end end
-                                          :context-mode (plist-get slot :context-mode))
-                                    candidate)
-                                   (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
-                                     (org-ai-skills--ui-clear-overlay)
-                                     (org-ai-skills--ui-set-status 'applied "applied")))
-                               (let ((selected (org-ai-skills--read-slot-candidate
-                                                (plist-get slot :slot-key) t)))
-                                 (when selected
-                                   (org-ai-skills-org-apply-candidate-to-subtree
-                                    (list :begin begin
-                                          :end end
-                                          :context-mode (plist-get slot :context-mode))
-                                    selected))
-                                 (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
-                                   (org-ai-skills--ui-set-overlay 'ready)
-                                   (org-ai-skills--ui-set-status 'ready "candidate-ready"))))
-                           (message "org-ai-skills candidate saved for: %s"
-                                    (plist-get slot :heading))
+                 (unless failed
+                   (let (raw)
+                     (condition-case err
+                         (setq raw (apply #'org-ai-skills--extract-gptel-response-text-if-ready response))
+                       (org-ai-skills-gptel-error
+                        (setq failed t)
+                        (message "%s" (error-message-string err))
+                        (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                          (org-ai-skills--ui-clear-overlay)
+                          (org-ai-skills--ui-set-failure
+                           "tool-error"
+                           (error-message-string err)))))
+                     (when raw
+                       (if (org-ai-skills--ui-stop-requested-p run-id)
+                           (org-ai-skills--ui-set-status 'canceled "canceled")
+                         (let* ((rewritten (org-ai-skills--sanitize-rewrite-output raw slot))
+                                (candidate nil)
+                                (apply-target
+                                 (or (org-ai-skills--resolve-subtree-from-slot slot buffer)
+                                     (and (markerp begin)
+                                          (marker-buffer begin)
+                                          (markerp end)
+                                          (marker-buffer end)
+                                          (list :begin begin
+                                                :end end
+                                                :context-mode (plist-get slot :context-mode))))))
+                           (setq rewritten
+                                 (org-ai-skills--enforce-rewrite-constraints
+                                  rewritten slot effective-constraints))
+                           (setq candidate
+                                 (org-ai-skills--record-generated-candidate
+                                  slot
+                                  (or (plist-get request :goal) "rewrite")
+                                  "rewrite"
+                                  (plist-get request :prompt)
+                                  rewritten))
                            (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
-                             (org-ai-skills--ui-set-overlay 'ready)
-                             (org-ai-skills--ui-set-status 'ready "candidate-ready")))))))
+                             (org-ai-skills--ui-run-set :selected-candidate candidate))
+                           (with-current-buffer buffer
+                             (if apply-target
+                                 (if org-ai-skills-auto-apply-generated-candidate
+                                     (progn
+                                       (org-ai-skills-org-apply-candidate-to-subtree
+                                        apply-target
+                                        candidate)
+                                       (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                                         (org-ai-skills--ui-clear-overlay)
+                                         (org-ai-skills--ui-set-status 'applied "applied")))
+                                   (if interactive-run
+                                       (let ((selected (org-ai-skills--read-slot-candidate
+                                                        (plist-get slot :slot-key) t)))
+                                         (when selected
+                                           (org-ai-skills-org-apply-candidate-to-subtree
+                                            apply-target
+                                            selected))
+                                         (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                                           (org-ai-skills--ui-set-overlay 'ready)
+                                           (org-ai-skills--ui-set-status 'ready "candidate-ready")))
+                                     (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                                       (org-ai-skills--ui-set-overlay 'ready)
+                                       (org-ai-skills--ui-set-status 'ready "candidate-ready"))))
+                               (message "org-ai-skills candidate saved for: %s"
+                                        (plist-get slot :heading))
+                               (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                                 (org-ai-skills--ui-set-overlay 'ready)
+                                 (org-ai-skills--ui-set-status 'ready "candidate-ready"))))))))
                (org-ai-skills-exclude-skill-function-calls skill)))))
           (setq dispatched t))
       (unless dispatched
         (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
           (org-ai-skills--ui-clear-overlay)
-          (org-ai-skills--ui-set-status 'failed "dispatch-failed"))
+          (org-ai-skills--ui-set-failure
+           "dispatch-failed"
+           "Failed to dispatch rewrite request to gptel"))
         (org-ai-skills-exclude-skill-function-calls skill)))))
 
 (defun org-ai-skills-org-rewrite-subtree-strict
@@ -3045,9 +3684,9 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
                               (called-interactively-p 'interactive)))
          (subtree (or target (org-ai-skills-org-resolve-subtree 'current)))
          (slot (org-ai-skills--ensure-subtree-slot-id subtree))
+         (working-directory (org-ai-skills--resolve-working-directory slot))
          (buffer (current-buffer))
          (run-id (org-ai-skills--candidate-id))
-         ;; Markers keep target positions stable for async callback.
          (begin (copy-marker (plist-get slot :begin)))
          (end (copy-marker (plist-get slot :end))))
     (org-ai-skills--ui-start-run
@@ -3056,7 +3695,7 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
            :interactive-run interactive-run
            :status 'running
            :progress "planning"
-           :target target
+           :target slot
            :source-buffer buffer
            :begin begin
            :end end
@@ -3067,66 +3706,75 @@ When INTERACTIVE-ORIGIN is non-nil, treat invocation as interactive for auto-app
            :skill nil
            :instruction nil
            :task task
+           :working-directory working-directory
            :preset-id preset-id
            :selected-candidate nil
            :stop-requested nil
            :rerun-fn (lambda ()
                        (interactive)
-                       (org-ai-skills-plan-run target task t preset-id))))
+                       (let ((latest (or (org-ai-skills--resolve-subtree-from-slot slot buffer)
+                                         slot)))
+                         (org-ai-skills-plan-run latest task t preset-id)))))
     (org-ai-skills-run-task-with-planner
      task
      slot
-     nil
+     (list :working-directory working-directory)
      (lambda (run-state)
        (if (org-ai-skills--ui-stop-requested-p run-id)
            (org-ai-skills--ui-set-status 'canceled "canceled")
-         (let* ((raw (or (plist-get run-state :final-output) ""))
-                (planner-constraints
-                 (org-ai-skills--planner-constraints-for-run-state run-state))
-                (rewritten (org-ai-skills--sanitize-rewrite-output raw slot))
-                (candidate (org-ai-skills--record-generated-candidate
-                            slot
-                            task
-                            "planner"
-                            task
-                            (org-ai-skills--enforce-rewrite-constraints
-                             rewritten slot planner-constraints))))
-           (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
-             (org-ai-skills--ui-run-set :selected-candidate candidate)
-             (org-ai-skills--ui-set-status 'ready "candidate-ready"))
-           (with-current-buffer buffer
-             (if (and interactive-run
-                      (markerp begin)
-                      (marker-buffer begin)
-                      (markerp end)
-                      (marker-buffer end))
-                 (if org-ai-skills-auto-apply-generated-candidate
-                     (progn
-                       (org-ai-skills-org-apply-candidate-to-subtree
-                        (list :begin begin
-                              :end end
-                              :context-mode (plist-get slot :context-mode))
-                        candidate)
-                       (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
-                         (org-ai-skills--ui-clear-overlay)
-                         (org-ai-skills--ui-set-status 'applied "applied")))
-                   (let ((selected (org-ai-skills--read-slot-candidate
-                                    (plist-get slot :slot-key) t)))
-                     (when selected
-                       (org-ai-skills-org-apply-candidate-to-subtree
-                        (list :begin begin
-                              :end end
-                              :context-mode (plist-get slot :context-mode))
-                        selected))
-                     (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
-                       (org-ai-skills--ui-set-overlay 'ready)
-                       (org-ai-skills--ui-set-status 'ready "candidate-ready"))))
-               (message "org-ai-skills planner candidate saved for: %s (%s)"
-                        (plist-get slot :heading)
-                        (plist-get candidate :candidate-id))
+         (let ((fatal-error (plist-get run-state :fatal-error)))
+           (if (stringp fatal-error)
+               (progn
+                 (message "%s" fatal-error)
+                 (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                   (org-ai-skills--ui-clear-overlay)
+                   (org-ai-skills--ui-set-failure "tool-error" fatal-error)))
+             (let* ((raw (or (plist-get run-state :final-output) ""))
+                    (planner-constraints (org-ai-skills--planner-constraints-for-run-state run-state))
+                    (rewritten (org-ai-skills--sanitize-rewrite-output raw slot))
+                    (candidate (org-ai-skills--record-generated-candidate
+                                slot
+                                task
+                                "planner"
+                                task
+                                (org-ai-skills--enforce-rewrite-constraints
+                                 rewritten slot planner-constraints)))
+                    (apply-target (or (org-ai-skills--resolve-subtree-from-slot slot buffer)
+                                      (and (markerp begin)
+                                           (marker-buffer begin)
+                                           (markerp end)
+                                           (marker-buffer end)
+                                           (list :begin begin
+                                                 :end end
+                                                 :context-mode (plist-get slot :context-mode))))))
                (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
-                 (org-ai-skills--ui-set-overlay 'ready)
-                 (org-ai-skills--ui-set-status 'ready "candidate-ready"))))))))))
+                 (org-ai-skills--ui-run-set :selected-candidate candidate)
+                 (org-ai-skills--ui-set-status 'ready "candidate-ready"))
+               (with-current-buffer buffer
+                 (if apply-target
+                     (if org-ai-skills-auto-apply-generated-candidate
+                         (progn
+                           (org-ai-skills-org-apply-candidate-to-subtree apply-target candidate)
+                           (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                             (org-ai-skills--ui-clear-overlay)
+                             (org-ai-skills--ui-set-status 'applied "applied")))
+                       (if interactive-run
+                           (let ((selected (org-ai-skills--read-slot-candidate
+                                            (plist-get slot :slot-key) t)))
+                             (when selected
+                               (org-ai-skills-org-apply-candidate-to-subtree apply-target selected))
+                             (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                               (org-ai-skills--ui-set-overlay 'ready)
+                               (org-ai-skills--ui-set-status 'ready "candidate-ready")))
+                         (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                           (org-ai-skills--ui-set-overlay 'ready)
+                           (org-ai-skills--ui-set-status 'ready "candidate-ready"))))
+                   (message "org-ai-skills planner candidate saved for: %s (%s)"
+                            (plist-get slot :heading)
+                            (plist-get candidate :candidate-id))
+                   (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                     (org-ai-skills--ui-set-overlay 'ready)
+                     (org-ai-skills--ui-set-status 'ready "candidate-ready"))))))))))))
 
 (defun org-ai-skills-plan-repeat-task (target)
   "Run planner-driven rewrite on TARGET using last planner task."

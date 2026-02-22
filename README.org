@@ -229,7 +229,8 @@ Interactive flow:
 - Interactive runs auto-open a 2-column workspace:
   - left: =*org-ai-skills-control*= (run status + operation keys)
   - right: source Org buffer (target region overlay)
-- Interactive runs auto-apply the newly generated candidate by default.
+- Runs auto-apply the newly generated candidate by default when target markers are valid.
+- Apply target resolution uses stable slot ID first (then marker fallback) to reduce wrong-subtree replacement risk during async runs.
 - Disable auto-apply if needed:
   - =(setq org-ai-skills-auto-apply-generated-candidate nil)=
   - Then select/apply manually from candidate list.
@@ -252,6 +253,10 @@ Control workspace keys (in =*org-ai-skills-control*=):
 Control panel details:
 - On first workspace activation, focus moves to control panel for key-driven operation.
 - Key rows are highlighted when available and dimmed when unavailable.
+- Failed runs show explicit =Error:= detail in panel (for example provider tool
+  policy/runtime errors), not only status/progress markers.
+- Rerun/adjust/apply actions execute in recorded source Org buffer only; if
+  source context is missing, panel now reports explicit org-context error.
 - Candidate history list is rendered directly in control panel for long review flows.
   - Compact format: index + status + short preview (IDs/timestamps hidden in panel).
 
@@ -287,6 +292,7 @@ Output handling:
 - Purpose/source-path metadata resolution supports both:
   - headline property drawer keys: =:PURPOSE:=, =:SOURCE_FILE_PATH:=
   - Org file keywords fallback: =#+PURPOSE:=, =#+SOURCE_FILE_PATH:=
+  - =:SOURCE_FILE_PATH:= is explicit-only: runtime does not infer it from current Org file path.
 - Each run persists one candidate version under:
   - =~/.emacs.d/skills/versions/=
 - Candidate store read/write uses UTF-8 by default.
@@ -312,9 +318,26 @@ gptel tool registration behavior:
 - Core read tools are exposed by default on all requests:
   - =org-ai-skills-read-buffer= (buffer/range reads)
   - =org-ai-skills-read-file= (source file reads)
+- Optional phase-1 core provider tools can be enabled for complex task execution:
+  - =org-ai-skills-core-provider-read-file=
+  - =org-ai-skills-core-provider-list-files=
+  - =org-ai-skills-core-provider-search-files=
+  - =org-ai-skills-core-provider-shell-exec=
+  - =org-ai-skills-core-provider-python-exec=
+  - =org-ai-skills-core-provider-org-babel-exec=
 - Planner requests do not expose tools, to keep planner JSON schema output deterministic.
 - Toggle core read tools:
   - =org-ai-skills-enable-core-read-tools= (default =t=)
+- Toggle phase-1 core provider tools:
+  - =org-ai-skills-enable-core-provider-tools= (default =t=)
+- Phase-1 provider allowlists:
+  - =org-ai-skills-core-provider-allowed-commands=
+  - =org-ai-skills-core-provider-allowed-paths=
+- Provider directory resolution:
+  - If a tool call omits =directory=, runtime uses request =:working-directory= when available.
+  - Working directory is inferred from subtree context (priority: path in =:PURPOSE:= text, then =:SOURCE_FILE_PATH:=).
+- Provider error propagation:
+  - If provider tool-result returns =:ok nil= with =:error-kind= (for example =path-not-allowed=), rewrite/planner execution fails fast and does not auto-apply generated content.
 - Read cap for official file reads:
   - =org-ai-skills-core-read-max-chars= (default =20000=)
 - Per-argument hints can be declared in =Function Calls= (for example =query:=,

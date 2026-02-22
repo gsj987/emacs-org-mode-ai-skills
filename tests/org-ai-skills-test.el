@@ -239,6 +239,17 @@
       (should (equal (plist-get subtree :purpose) "File-level purpose"))
       (should (equal (plist-get subtree :source-file-path) "./docs/source.txt")))))
 
+(ert-deftest org-ai-skills-org-resolve-subtree-does-not-guess-source-file-path ()
+  "Resolved subtree should not infer SOURCE_FILE_PATH from current Org file."
+  (with-temp-buffer
+    (org-mode)
+    (let ((buffer-file-name "/tmp/current-note.org"))
+      (insert "* Child\nBody.\n")
+      (search-backward "Body.")
+      (let ((subtree (org-ai-skills-org-resolve-subtree 'current)))
+        (should (equal (plist-get subtree :purpose) ""))
+        (should-not (plist-get subtree :source-file-path))))))
+
 (ert-deftest org-ai-skills-org-resolve-subtree-errors-without-heading ()
   "Subtree resolution should fail when point is before first heading."
   (with-temp-buffer
@@ -326,8 +337,212 @@
 
 (ert-deftest org-ai-skills-core-read-tools-can-be-disabled ()
   "Core read tools should be omitted when feature flag is nil."
-  (let ((org-ai-skills-enable-core-read-tools nil))
-    (should-not (org-ai-skills--request-function-calls '()))))
+  (let* ((org-ai-skills-enable-core-read-tools nil)
+         (calls (org-ai-skills--request-function-calls '()))
+         (names (mapcar (lambda (entry) (plist-get entry :name)) calls)))
+    (should-not (member "org-ai-skills-read-buffer" names))
+    (should-not (member "org-ai-skills-read-file" names))))
+
+(ert-deftest org-ai-skills-core-provider-tools-enabled-by-default ()
+  "Core provider tools should be exposed by default."
+  (let* ((calls (org-ai-skills--request-function-calls '()))
+         (names (mapcar (lambda (entry) (plist-get entry :name)) calls)))
+    (should (member "org-ai-skills-core-provider-shell-exec" names))
+    (should (member "org-ai-skills-core-provider-python-exec" names))))
+
+(ert-deftest org-ai-skills-core-provider-allowed-paths-custom-type-is-repeat-string ()
+  "Allowed paths customize type should accept free-form path strings."
+  (should (equal (get 'org-ai-skills-core-provider-allowed-paths 'custom-type)
+                 '(repeat string))))
+
+(ert-deftest org-ai-skills-core-provider-effective-allowed-paths-ignores-invalid-entries ()
+  "Effective allowed path list should ignore nil/non-string entries."
+  (let ((org-ai-skills-core-provider-allowed-paths
+         (list nil "/tmp" 42 ""))
+        (org-ai-skills--core-provider-context-directory nil))
+    (let ((paths (org-ai-skills--core-provider-effective-allowed-paths)))
+      (should (member (expand-file-name "/tmp") paths))
+      (should-not (member nil paths))
+      (should (= (length paths) 1)))))
+
+(ert-deftest org-ai-skills-default-core-provider-allowed-paths-is-nil-safe ()
+  "Default allowed path initializer should never error when file vars are nil."
+  (with-temp-buffer
+    (let ((load-file-name nil)
+          (default-directory "/tmp/"))
+      (let ((paths (org-ai-skills--default-core-provider-allowed-paths)))
+        (should (listp paths))
+        (should (= (length paths) 1))
+        (should (stringp (car paths)))))))
+
+(ert-deftest org-ai-skills-core-provider-tools-can-be-disabled ()
+  "Core provider tools should be omitted when feature flag is nil."
+  (let* ((org-ai-skills-enable-core-provider-tools nil)
+         (calls (org-ai-skills--request-function-calls '()))
+         (names (mapcar (lambda (entry) (plist-get entry :name)) calls)))
+    (should-not (member "org-ai-skills-core-provider-read-file" names))
+    (should-not (member "org-ai-skills-core-provider-list-files" names))
+    (should-not (member "org-ai-skills-core-provider-search-files" names))
+    (should-not (member "org-ai-skills-core-provider-shell-exec" names))
+    (should-not (member "org-ai-skills-core-provider-python-exec" names))
+    (should-not (member "org-ai-skills-core-provider-org-babel-exec" names))))
+
+(ert-deftest org-ai-skills-core-provider-read-file-enforces-allowed-paths ()
+  "Provider read should deny paths outside allowed roots."
+  (let ((org-ai-skills-core-provider-allowed-paths (list default-directory)))
+    (let ((result (org-ai-skills-core-provider-read-file "/tmp/not-allowed.txt")))
+      (should-not (plist-get result :ok))
+      (should (equal (plist-get result :error-kind) "path-not-allowed")))))
+
+(ert-deftest org-ai-skills-core-provider-read-file-enforces-allowed-command ()
+  "Provider read should deny command types not in allowlist."
+  (let* ((file (make-temp-file "org-ai-skills-core-provider-read-")))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "abc"))
+          (let ((org-ai-skills-core-provider-allowed-commands '(file-list))
+                (org-ai-skills-core-provider-allowed-paths (list (file-name-directory file))))
+            (let ((result (org-ai-skills-core-provider-read-file file)))
+              (should-not (plist-get result :ok))
+              (should (equal (plist-get result :error-kind) "command-not-allowed")))))
+      (delete-file file))))
+
+(ert-deftest org-ai-skills-core-provider-shell-exec-returns-output ()
+  "Provider shell exec should return stdout and exit code metadata."
+  (let ((org-ai-skills-core-provider-allowed-paths (list default-directory))
+        (org-ai-skills-core-provider-allowed-commands '(shell-exec)))
+    (let ((result (org-ai-skills-core-provider-shell-exec "printf 'hello'" default-directory)))
+      (should (plist-get result :ok))
+      (should (= (plist-get result :exit-code) 0))
+      (should (equal (plist-get result :stdout) "hello")))))
+
+(ert-deftest org-ai-skills-core-provider-python-exec-returns-output ()
+  "Provider python exec should return stdout when Python exists."
+  (skip-unless (or (executable-find "python3") (executable-find "python")))
+  (let ((org-ai-skills-core-provider-allowed-paths (list default-directory))
+        (org-ai-skills-core-provider-allowed-commands '(python-exec)))
+    (let ((result (org-ai-skills-core-provider-python-exec "print('ok')" default-directory)))
+      (should (plist-get result :ok))
+      (should (= (plist-get result :exit-code) 0))
+      (should (equal (string-trim (plist-get result :stdout)) "ok")))))
+
+(ert-deftest org-ai-skills-core-provider-org-babel-exec-emacs-lisp ()
+  "Provider Org Babel exec should evaluate emacs-lisp block body."
+  (let ((org-ai-skills-core-provider-allowed-paths (list default-directory))
+        (org-ai-skills-core-provider-allowed-commands '(org-babel-exec)))
+    (let ((result (org-ai-skills-core-provider-org-babel-exec
+                   "emacs-lisp"
+                   "(+ 2 3)"
+                   default-directory)))
+      (should (plist-get result :ok))
+      (should (equal (string-trim (plist-get result :result)) "5")))))
+
+(ert-deftest org-ai-skills-core-provider-dispatch-routes-command ()
+  "Provider dispatch should route by registry command type."
+  (let ((result (org-ai-skills-core-provider-dispatch 'file-list default-directory 5)))
+    (should (plist-member result :command-type))
+    (should (eq (plist-get result :command-type) 'file-list))))
+
+(ert-deftest org-ai-skills-resolve-working-directory-prefers-purpose-path ()
+  "Working directory resolver should use existing path extracted from PURPOSE."
+  (let ((subtree (list :purpose "帮我研究一下 ~/Workspace/org-ai-skills-015/ 的项目结构"
+                       :source-file-path "/tmp/unknown-file.org")))
+    (should (equal (org-ai-skills--resolve-working-directory subtree)
+                   (expand-file-name "~/Workspace/org-ai-skills-015/")))))
+
+(ert-deftest org-ai-skills-core-provider-shell-exec-uses-context-directory-by-default ()
+  "Provider shell command should use request context directory when DIRECTORY is omitted."
+  (let* ((dir (make-temp-file "org-ai-skills-context-dir-" t))
+         (org-ai-skills-core-provider-allowed-paths nil)
+         (org-ai-skills--core-provider-context-directory dir)
+         (org-ai-skills-core-provider-allowed-commands '(shell-exec)))
+    (unwind-protect
+        (let ((result (org-ai-skills-core-provider-shell-exec "pwd")))
+          (should (plist-get result :ok))
+          (should (string= (string-trim (plist-get result :stdout))
+                           (directory-file-name dir))))
+      (delete-directory dir t))))
+
+(ert-deftest org-ai-skills-resolve-subtree-from-slot-prefers-slot-id-over-markers ()
+  "Target resolution should locate subtree by slot ID even if markers drift."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* A\nBody A\n* B\nBody B\n")
+    (goto-char (point-min))
+    (let* ((subtree-a (org-ai-skills-org-resolve-subtree 'current))
+           (slot-a (org-ai-skills--ensure-subtree-slot-id subtree-a)))
+      ;; Move to B and craft stale markers that point to B by mistake.
+      (re-search-forward "^\\* B$")
+      (let ((slot-stale (append slot-a
+                                (list :begin (copy-marker (line-beginning-position))
+                                      :end (copy-marker (point-max))))))
+        (let ((resolved (org-ai-skills--resolve-subtree-from-slot slot-stale (current-buffer))))
+          (should (equal (plist-get resolved :heading) "A"))
+          (should (string-match-p "^\\* A" (plist-get resolved :text))))))))
+
+(ert-deftest org-ai-skills-apply-candidate-uses-slot-id-to-avoid-wrong-subtree ()
+  "Auto-apply path should use slot-ID target resolution to avoid drift."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t))
+        (skill (org-ai-skills-parse-skill-file org-ai-skills-test--first-skill-file)))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir)
+              (org-ai-skills-auto-apply-generated-candidate t))
+          (with-temp-buffer
+            (org-mode)
+            (insert "* A\nBody A\n* B\nBody B\n")
+            (goto-char (point-min))
+            (let* ((subtree-a (org-ai-skills-org-resolve-subtree 'current))
+                   (slot-a (org-ai-skills--ensure-subtree-slot-id subtree-a)))
+              ;; Pass stale markers that point to B; slot-id should still resolve to A.
+              (re-search-forward "^\\* B$")
+              (let ((drifted (append slot-a
+                                     (list :begin (copy-marker (line-beginning-position))
+                                           :end (copy-marker (point-max))))))
+                (cl-letf (((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+                           (lambda (_request callback)
+                             (funcall callback "*** A\nNew A\n"))))
+                  (org-ai-skills-org-rewrite-subtree drifted skill "Rewrite A"))
+                (goto-char (point-min))
+                (re-search-forward "^\\* A$")
+                (re-search-forward "New A" nil t)
+                (re-search-forward "^\\* B$")
+                (forward-line 1)
+                (should (looking-at-p "Body B"))))))
+      (delete-directory store-dir t))))
+
+(ert-deftest org-ai-skills-core-provider-integration-explore-and-experiment ()
+  "Integration flow: explore project files, locate function, run experiments."
+  (let* ((dir (make-temp-file "org-ai-skills-core-provider-int-" t))
+         (py-file (expand-file-name "sample.py" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file py-file
+            (insert "def add_numbers(a, b):\n    return a + b\n"))
+          (let ((org-ai-skills-core-provider-allowed-paths (list dir))
+                (org-ai-skills-core-provider-allowed-commands
+                 '(file-list file-search python-exec org-babel-exec)))
+            (let* ((listed (org-ai-skills-core-provider-list-files dir 20))
+                   (searched (org-ai-skills-core-provider-search-files "def add_numbers" dir 20))
+                   (python-run
+                    (org-ai-skills-core-provider-python-exec
+                     "import sample; print(sample.add_numbers(2, 3))"
+                     dir))
+                   (org-run
+                    (org-ai-skills-core-provider-org-babel-exec
+                     "emacs-lisp"
+                     "(format \"* Experiment Report\\n- function: add_numbers\\n- status: %s\" \"ok\")"
+                     dir)))
+              (should (plist-get listed :ok))
+              (should (member "sample.py" (plist-get listed :entries)))
+              (should (plist-get searched :ok))
+              (should (= (plist-get searched :match-count) 1))
+              (should (plist-get python-run :ok))
+              (should (equal (string-trim (plist-get python-run :stdout)) "5"))
+              (should (plist-get org-run :ok))
+              (should (string-match-p "\\* Experiment Report"
+                                      (plist-get org-run :result))))))
+      (delete-directory dir t))))
 
 (ert-deftest org-ai-skills-read-file-respects-max-chars ()
   "File read helper should truncate content by max char budget."
@@ -665,6 +880,18 @@
       (should (equal (plist-get buffer-scope :purpose) "Whole-file purpose"))
       (should (equal (plist-get buffer-scope :source-file-path) "./notes/file.md")))))
 
+(ert-deftest org-ai-skills-org-collect-context-candidates-buffer-does-not-guess-source-file-path ()
+  "Buffer scope should not infer SOURCE_FILE_PATH from current Org file."
+  (with-temp-buffer
+    (org-mode)
+    (let ((buffer-file-name "/tmp/current-note.org"))
+      (insert "Plain text.\n")
+      (goto-char (point-min))
+      (let* ((candidates (org-ai-skills-org-collect-context-candidates))
+             (buffer-scope (cdar candidates)))
+        (should (eq (plist-get buffer-scope :context-mode) 'buffer))
+        (should-not (plist-get buffer-scope :source-file-path))))))
+
 (ert-deftest org-ai-skills-sanitize-rewrite-output-fixes-level-and-preface ()
   "Sanitizer should remove explanation preface and enforce target level."
   (let* ((subtree '(:level 2 :heading "Child"))
@@ -840,6 +1067,7 @@
                (lambda (_status _progress) nil)))
       (let ((org-ai-skills--ui-run-state
              (list :status 'ready
+                   :source-buffer (current-buffer)
                    :begin 1
                    :end 10
                    :context-mode 'buffer
@@ -874,6 +1102,19 @@
           (org-ai-skills-ui-apply-selected-candidate)))
       (with-current-buffer source-buffer
         (should (string= (buffer-string) "#+TITLE: Draft\n\nNew\n"))))))
+
+(ert-deftest org-ai-skills-ui-apply-selected-candidate-errors-when-slot-key-missing ()
+  "Apply should signal actionable error when run state has no slot key."
+  (let ((org-ai-skills--ui-run-state
+         (list :status 'ready
+               :source-buffer (current-buffer)
+               :begin 1
+               :end 1
+               :context-mode 'buffer
+               :selected-candidate nil
+               :slot-key nil)))
+    (should-error (org-ai-skills-ui-apply-selected-candidate)
+                  :type 'org-ai-skills-version-store-error)))
 
 (ert-deftest org-ai-skills-ui-current-target-reconstructs-from-ui-state ()
   "When stored target is absent, UI should reconstruct scope from run state."
@@ -1126,12 +1367,13 @@
             (should (multibyte-string-p loaded))))
       (delete-directory store-dir t))))
 
-(ert-deftest org-ai-skills-rewrite-noninteractive-saves-candidate-without-auto-apply ()
-  "Non-interactive rewrite should persist candidate and not mutate subtree text."
+(ert-deftest org-ai-skills-rewrite-noninteractive-saves-candidate-when-auto-apply-disabled ()
+  "Non-interactive rewrite should keep source unchanged when auto-apply is disabled."
   (let ((store-dir (make-temp-file "org-ai-skills-versions-" t))
         (skill (org-ai-skills-parse-skill-file org-ai-skills-test--first-skill-file)))
     (unwind-protect
-        (let ((org-ai-skills-version-store-dir store-dir))
+        (let ((org-ai-skills-version-store-dir store-dir)
+              (org-ai-skills-auto-apply-generated-candidate nil))
           (with-temp-buffer
             (org-mode)
             (insert "* Leaf\nOriginal body.\n")
@@ -1149,6 +1391,26 @@
                 (should (= (length items) 1))
                 (should (string-match-p "Rewritten body"
                                         (plist-get (car items) :output-text)))))))
+      (delete-directory store-dir t))))
+
+(ert-deftest org-ai-skills-rewrite-noninteractive-auto-applies-when-enabled ()
+  "Non-interactive rewrite should auto-apply generated candidate when enabled."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t))
+        (skill (org-ai-skills-parse-skill-file org-ai-skills-test--first-skill-file)))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir)
+              (org-ai-skills-auto-apply-generated-candidate t))
+          (with-temp-buffer
+            (org-mode)
+            (insert "* Leaf\nOriginal body.\n")
+            (goto-char (point-min))
+            (let ((subtree (org-ai-skills-org-resolve-subtree 'current)))
+              (cl-letf (((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+                         (lambda (_request callback)
+                           (funcall callback "*** Leaf\nRewritten body.\n"))))
+                (org-ai-skills-org-rewrite-subtree subtree skill "Rewrite now"))
+              (goto-char (point-min))
+              (should (re-search-forward "Rewritten body\\." nil t)))))
       (delete-directory store-dir t))))
 
 (ert-deftest org-ai-skills-rewrite-interactive-auto-applies-generated-candidate ()
@@ -1230,6 +1492,20 @@
               (should (re-search-forward "Replaced body\\." nil t)))))
       (delete-directory store-dir t))))
 
+(ert-deftest org-ai-skills-apply-candidate-with-missing-slot-metadata-does-not-crash ()
+  "Applying candidate should not crash when slot metadata is missing."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Leaf\nOriginal body.\n")
+    (goto-char (point-min))
+    (let ((subtree (org-ai-skills-org-resolve-subtree 'current))
+          (candidate '(:output-text "* Leaf\nApplied body.\n"
+                       :slot-key nil
+                       :candidate-id nil)))
+      (org-ai-skills-org-apply-candidate-to-subtree subtree candidate)
+      (goto-char (point-min))
+      (should (re-search-forward "Applied body\\." nil t)))))
+
 (ert-deftest org-ai-skills-ui-workspace-open-close-lifecycle ()
   "Workspace command should open control/source columns and restore layout on close."
   (save-window-excursion
@@ -1286,9 +1562,69 @@
   (let ((called nil)
         (org-ai-skills--ui-run-state nil))
     (setq org-ai-skills--ui-run-state
-          (list :rerun-fn (lambda () (setq called t))))
+          (list :source-buffer (current-buffer)
+                :rerun-fn (lambda () (setq called t))))
     (org-ai-skills-ui-rerun)
     (should called)))
+
+(ert-deftest org-ai-skills-ui-rerun-runs-in-source-buffer ()
+  "Rerun from control panel should execute function in source buffer context."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Source\n")
+    (let ((source-buffer (current-buffer))
+          (called nil))
+      (with-temp-buffer
+        (setq org-ai-skills--ui-run-state
+              (list :source-buffer source-buffer
+                    :rerun-fn
+                    (lambda ()
+                      (setq called (eq (current-buffer) source-buffer)))))
+        (org-ai-skills-ui-rerun))
+      (should called))))
+
+(ert-deftest org-ai-skills-ui-apply-selected-candidate-errors-without-source-buffer ()
+  "Apply should fail explicitly when control state cannot resolve source buffer."
+  (let ((org-ai-skills--ui-run-state
+         (list :status 'ready
+               :begin 1
+               :end 1
+               :context-mode 'current
+               :source-buffer nil
+               :selected-candidate
+               '(:slot-key "k" :candidate-id "c1" :output-text "* X\nY\n"))))
+    (should-error (org-ai-skills-ui-apply-selected-candidate)
+                  :type 'org-ai-skills-org-context-error)))
+
+(ert-deftest org-ai-skills-ui-adjust-planner-runs-in-source-buffer ()
+  "Adjust planner action should run planner from source buffer context."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Root\nBody\n")
+    (let ((source-buffer (current-buffer))
+          (begin (copy-marker (point-min)))
+          (end (copy-marker (point-max)))
+          (called-in-source nil)
+          (captured-target nil))
+      (with-temp-buffer
+        (setq org-ai-skills--ui-run-state
+              (list :status 'ready
+                    :run-type 'planner
+                    :source-buffer source-buffer
+                    :target nil
+                    :begin begin
+                    :end end
+                    :context-mode 'current
+                    :task "old task"))
+        (cl-letf (((symbol-function 'read-string)
+                   (lambda (&rest _args) "new task"))
+                  ((symbol-function 'org-ai-skills-plan-run)
+                   (lambda (target _task &optional _interactive-origin _preset-id)
+                     (setq captured-target target)
+                     (setq called-in-source (eq (current-buffer) source-buffer)))))
+          (org-ai-skills-ui-adjust-task-or-instruction)))
+      (should called-in-source)
+      (should (eq (plist-get captured-target :context-mode) 'current)))))
 
 (ert-deftest org-ai-skills-ui-select-candidate-wires-minibuffer-flow ()
   "Control candidate selector should reuse minibuffer and store selected candidate."
@@ -1359,6 +1695,23 @@
                 (goto-char (point-min))
                 (should (re-search-forward " \\*01 \\[G\\] " nil t))))))
       (delete-directory store-dir t))))
+
+(ert-deftest org-ai-skills-ui-control-buffer-renders-error-detail ()
+  "Control buffer should show explicit failure error detail."
+  (let ((org-ai-skills--ui-run-state
+         (list :run-id "run-error"
+               :status 'failed
+               :progress "tool-error"
+               :error-detail "Provider tool failed (org-ai-skills-core-provider-list-files, path-not-allowed): blocked"
+               :run-type 'rewrite
+               :heading "Code Base Learning"
+               :task "research")))
+    (org-ai-skills-ui-refresh-control-buffer)
+    (with-current-buffer (get-buffer org-ai-skills-control-buffer-name)
+      (goto-char (point-min))
+      (should (re-search-forward "^Status: failed$" nil t))
+      (should (re-search-forward "^Progress: tool-error$" nil t))
+      (should (re-search-forward "^Error: Provider tool failed" nil t)))))
 
 (ert-deftest org-ai-skills-rewrite-interactive-auto-opens-control-workspace ()
   "Interactive rewrite should auto-open control workspace when enabled."
@@ -1803,10 +2156,84 @@
     (should (= callback-count 1))
     (should (string-match-p "^\\*\\*\\* Final" callback-output))))
 
+(ert-deftest org-ai-skills-extract-tool-result-errors-detects-provider-failure ()
+  "Tool-result parser should detect provider failures with error taxonomy."
+  (let* ((errors
+          (org-ai-skills--extract-tool-result-errors
+           '(tool-result
+             (dummy-tool
+              (:directory "/tmp/demo")
+              "(:ok nil :error-kind \"path-not-allowed\" :error-message \"blocked\")"))))
+         (first (car errors)))
+    (should (= (length errors) 1))
+    (should (string= (plist-get first :error-kind) "path-not-allowed"))
+    (should (string= (plist-get first :error-message) "blocked"))))
+
+(ert-deftest org-ai-skills-execute-plan-step-fails-fast-on-provider-tool-error ()
+  "Planner step should return fatal error state when provider tool call fails."
+  (let (callback-run-state callback-output)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (skill-id &optional _directory)
+                 (list :skill-id skill-id :title "Skill" :description "desc")))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback
+                          '(tool-result
+                            (dummy-tool
+                             (:directory "/blocked")
+                             "(:ok nil :error-kind \"path-not-allowed\" :error-message \"blocked\")")))
+                 (funcall callback "*** Final\nShould not be used\n"))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :goal "g" :skills ("alpha") :expected-output "o")
+       '(:task "task" :subtree (:text "*** Input\n"))
+       (lambda (run-state output)
+         (setq callback-run-state run-state)
+         (setq callback-output output))))
+    (should (stringp (plist-get callback-run-state :fatal-error)))
+    (should-not (plist-get callback-run-state :steps))
+    (should-not callback-output)))
+
+(ert-deftest org-ai-skills-rewrite-fails-fast-on-provider-tool-error ()
+  "Rewrite flow should fail and not apply content after provider tool errors."
+  (let ((store-dir (make-temp-file "org-ai-skills-versions-" t))
+        (skill (org-ai-skills-parse-skill-file org-ai-skills-test--first-skill-file)))
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir)
+              (org-ai-skills-auto-apply-generated-candidate t)
+              (applied nil)
+              (statuses nil))
+          (with-temp-buffer
+            (org-mode)
+            (insert "* Leaf\nOriginal body.\n")
+            (goto-char (point-min))
+            (let ((subtree (org-ai-skills-org-resolve-subtree 'current)))
+              (cl-letf (((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+                         (lambda (_request callback)
+                           (funcall callback
+                                    '(tool-result
+                                      (dummy-tool
+                                       (:directory "/blocked")
+                                       "(:ok nil :error-kind \"path-not-allowed\" :error-message \"blocked\")")))
+                           (funcall callback "*** Leaf\nRewritten body.\n")))
+                        ((symbol-function 'org-ai-skills-org-apply-candidate-to-subtree)
+                         (lambda (&rest _args) (setq applied t)))
+                        ((symbol-function 'org-ai-skills--ui-set-status)
+                         (lambda (status progress)
+                           (push (list status progress) statuses)))
+                        ((symbol-function 'org-ai-skills--ui-clear-overlay)
+                         (lambda () nil)))
+                (org-ai-skills-org-rewrite-subtree subtree skill "Rewrite now")))
+            (goto-char (point-min))
+            (should (re-search-forward "Original body\\." nil t))
+            (should-not applied)
+            (should (member '(failed "tool-error") statuses))))
+      (delete-directory store-dir t))))
+
 (ert-deftest org-ai-skills-gptel-dispatch-registers-request-tools ()
   "Dispatch should register request-scoped function calls as gptel tools."
   (let ((org-ai-skills-debug-enabled nil)
         (org-ai-skills-enable-core-read-tools nil)
+        (org-ai-skills-enable-core-provider-tools nil)
         (gptel-use-tools nil)
         (gptel-tools nil)
         (captured-use-tools nil)

@@ -2,45 +2,98 @@
 #+STARTUP: overview
 
 * Problem
-The system lacks a clearly defined core command layer that exposes basic Emacs capabilities to the LLM in a safe, composable way. Without this layer, complex tasks become brittle and hard to test.
+The system lacks a clearly defined core command layer that exposes essential runtime abilities to the LLM in a safe, composable way. Without this layer, complex tasks (such as learning an unfamiliar Python codebase and running guided experiments) become brittle, ad-hoc, and hard to test or reproduce.
 
 * Scope
 - In scope:
-  - Define a core command catalog for fundamental editor/project operations.
+  - Define a core command catalog for essential operations needed by complex task execution:
+    - Read/list/search files in a project.
+    - Execute shell commands with explicit boundaries.
+    - Execute Python snippets for rapid experiments.
+    - Execute Org Babel code blocks as part of reproducible workflows.
   - Add a provider abstraction that maps command intents to Emacs implementations.
-  - Add capability boundaries, argument validation, and structured result schema.
-  - Support command composition to enable multi-step higher-level tasks.
+  - Add a minimal execution policy using:
+    - Allowed command types list
+    - Allowed folder/path scope list
+  - Keep a simple structured result schema shared by commands.
+  - Support command composition to enable multi-step higher-level tasks (explore -> inspect key functions -> run experiments -> summarize results).
+  - Produce org-friendly outputs so the full exploration/experiment flow can be preserved as an Org document.
+  - Keep interaction model fixed to existing org-mode workflow (no new interaction channels in this phase).
+  - Reference Efrit-style usage patterns (tool-driven codebase exploration + iterative experiments) as design input, while adapting to this project's governance model.
 - Out of scope:
-  - Arbitrary shell command execution by default.
+  - Unbounded/arbitrary shell execution outside the allowed command and folder lists.
   - Domain-specific skill logic outside the core command layer.
   - Replacing existing skill governance flows.
+  - Full autonomous software engineering loops (this PRD focuses on foundational command primitives only).
+  - New UI/agent interaction paradigms beyond current org-mode usage.
 
 * Constraints
 - Technical constraints:
   - Commands must be deterministic/testable with clear input/output contracts.
   - Avoid hidden global state mutation; side effects must be explicit.
   - Must support future provider extensions without breaking compatibility.
+  - Command execution results must capture enough metadata for reproducibility (command, cwd/context, exit status, stdout/stderr, timestamps when applicable).
+  - Keep phase-1 safety checks minimal: enforce only command-type allowlist and folder/path allowlist.
 - Process constraints:
   - No behavior changes without ERT coverage.
   - Any breaking contract proposal must be documented before implementation.
+  - Design choices influenced by external systems (e.g., Efrit) must be translated into local constraints and tests, not copied implicitly.
 
 * Expected Behavior
 - Behavior 1:
-  - LLM-facing core commands expose stable interfaces for navigation, read/write, search, and structured edits.
+  - LLM-facing core commands expose stable interfaces for file exploration and inspection (list/read/search) in a codebase.
 - Behavior 2:
   - Every command returns normalized success/error payloads with actionable diagnostics.
 - Behavior 3:
-  - Command permissions and preconditions are validated before execution.
+  - Before execution, runtime validates only:
+    - command is in allowed command set
+    - target folder/path is in allowed scope
 - Behavior 4:
   - Complex tasks can chain core commands with predictable intermediate state.
+- Behavior 5:
+  - The user can prompt the agent to inspect a random Python repository, identify key functions/modules, run targeted shell/Python/Org-Babel experiments, and collect outputs into an Org document artifact.
+- Behavior 6:
+  - Failed command execution surfaces actionable failure details (validation error vs execution error) without silent fallback.
+- Behavior 7:
+  - All scenarios run from org-mode files using existing project workflow; no alternate interaction mode is introduced in this phase.
 
 * Tasks
-- [ ] Define command taxonomy and contract (inputs, outputs, errors, side effects).
-- [ ] Implement provider abstraction and command registry in `elisp/`.
-- [ ] Implement initial command set for core editing and project operations.
-- [ ] Add guardrails for permission checks and argument validation.
-- [ ] Add ERT tests for command correctness, validation failures, and composition.
-- [ ] Update README with core layer purpose and extension pattern.
+- [x] Define command taxonomy and contract (inputs, outputs, errors, side effects) for:
+  - file-read/list/search
+  - shell-exec
+  - python-exec
+  - org-babel-exec
+- [x] Implement provider abstraction and command registry in `elisp/`.
+- [x] Implement initial command set for project exploration and experiment execution.
+- [x] Implement minimal safety policy (allowed command types + allowed folders/paths).
+- [x] Add structured result payload schema and error taxonomy shared by all command providers.
+- [x] Add ERT tests for command correctness, allowlist validation failures, composition, and reproducibility metadata.
+- [x] Add at least one integration-style scenario test: explore Python project -> identify target function -> execute experiment block -> capture Org-ready result.
+- [x] Update README with core layer purpose and extension pattern.
+- [x] Enforce fail-fast behavior when core provider tool results contain policy/runtime errors (for example =path-not-allowed=), so rewrite/planner flows stop and surface explicit errors instead of applying fabricated summaries.
+- [x] Disable implicit =:source-file-path= inference from current Org buffer file in subtree/buffer context; only explicit =SOURCE_FILE_PATH= should be propagated.
+- [x] Show actionable failure details in control panel when rewrite/planner run fails, instead of status-only failure markers.
+- [x] Guard UI candidate selection/apply flow when run state has no slot key; show explicit version-store error instead of low-level =stringp nil= crash.
+- [x] Guard candidate apply status-update path when selected candidate metadata is incomplete (missing =:slot-key= or =:candidate-id=), to avoid =stringp nil= crashes with legacy/runtime-incomplete candidates.
+- [x] Relax Customize type for =org-ai-skills-core-provider-allowed-paths= to =repeat string= so users can save intended paths before they exist.
+- [x] Harden allowed-path normalization against invalid/non-string entries (for example transient Customize nil items) to prevent =stringp nil= on Apply.
+- [x] Harden default initializer for =org-ai-skills-core-provider-allowed-paths= so Customize evaluation never passes nil to =expand-file-name=.
+- [x] Fix control-panel candidate apply/rerun context resolution so operations always run in source Org buffer (never in =*org-ai-skills-control*=), with explicit error when source buffer cannot be resolved.
 
 * Worklog
 - 2026-02-22 :: PRD created for core provider command layer and composable command execution contracts. Test status: not run.
+- 2026-02-22 :: PRD refined with explicit runtime abilities (file/shell/python/org-babel execution), Efrit-inspired exploration workflow target, reproducibility metadata requirements, and scenario-driven expected behavior. Test status: not run.
+- 2026-02-22 :: PRD simplified for phase 1: reduced guardrail complexity to command/path allowlists and constrained interaction to existing org-mode workflow only. Test status: not run.
+- 2026-02-22 :: Implemented phase-1 core provider command layer (registry + read/list/search/shell/python/org-babel commands), integrated optional tool exposure into request pipeline, added allowlist enforcement, added unit/integration ERT coverage, and documented configuration in README. Test status: pass (126/126).
+- 2026-02-22 :: Updated default configuration to enable phase-1 core provider tools by default; adjusted tests and README to match default-on behavior. Test status: pass (126/126).
+- 2026-02-22 :: Fixed follow-up runtime issues: (1) auto-apply now executes whenever target markers are valid (not only interactive origin), (2) provider commands now use context-aware working directory inference (PURPOSE path hint first, then SOURCE_FILE_PATH) and request-scoped directory fallback for omitted tool args. Test status: pass (129/129).
+- 2026-02-22 :: Fixed subtree apply/scope drift regressions by resolving targets from stable slot ID in source Org buffer (with marker fallback), and by storing slot-resolved targets for rerun/apply paths. Added regression tests for marker drift and wrong-subtree replacement. Test status: pass (131/131).
+- 2026-02-22 :: Fixed tool-error propagation: execution now detects core provider tool failures from gptel tool-result events, fails the run explicitly, and blocks candidate apply when access/policy errors occur. Added ERT coverage for tool-result error parsing and planner/rewrite fail-fast behavior, plus README behavior notes. Test status: pass (134/134).
+- 2026-02-22 :: Removed implicit source-file-path fallback to current Org file for subtree/buffer scope; runtime now propagates source path only when explicitly declared via =SOURCE_FILE_PATH=. Added regression tests to prevent accidental context leakage. Test status: pass (136/136).
+- 2026-02-22 :: Added control-panel error detail rendering for failed runs; runtime now stores and displays explicit failure message (for example provider tool policy errors) alongside failed status/progress. Added ERT coverage for control buffer error visibility and README notes. Test status: pass (137/137).
+- 2026-02-22 :: Fixed UI apply/select crash path when =:slot-key= is missing in run state; selection now fails fast with actionable version-store error message rather than propagating =Wrong type argument: stringp, nil=. Added ERT regression coverage. Test status: pass (138/138).
+- 2026-02-22 :: Fixed apply-path crash for legacy/incomplete candidates: if =:slot-key= or =:candidate-id= is missing, apply still updates subtree but skips status persistence safely with warning message. Added ERT regression coverage. Test status: pass (139/139).
+- 2026-02-22 :: Updated =org-ai-skills-core-provider-allowed-paths= custom type from =repeat directory= to =repeat string= to support Customize save without directory existence constraints. Added ERT guard for custom type contract. Test status: pass (140/140).
+- 2026-02-22 :: Fixed Customize Apply robustness for allowed paths: runtime now ignores invalid/non-string path entries when computing effective allowed roots, preventing =Wrong type argument: stringp, nil=. Added ERT regression coverage. Test status: pass (141/141).
+- 2026-02-22 :: Fixed allowed-paths default initializer to be nil-safe across Customize evaluation contexts (no =load-file-name=/=buffer-file-name= assumptions), eliminating =expand-file-name: Wrong type argument: stringp, nil= from default-value re-evaluation. Added ERT regression coverage. Test status: pass (142/142).
+- 2026-02-22 :: Fixed control-panel context routing for rerun/adjust/apply: removed unsafe current-buffer fallback, added source-buffer resolver from run-state/markers, and enforced source-buffer execution for UI actions to prevent accidental operations in =*org-ai-skills-control*=. Added regression coverage for rerun/adjust source context and missing-source apply errors. Test status: pass (145/145).
