@@ -1,14 +1,15 @@
-#+TITLE: PRD 017 - Org Skill Code Block Support and Debug Workflow
+#+TITLE: PRD 017 - Org Code Block Execution and Autonomous Debug Workflow
 #+STARTUP: overview
 
 * Problem
-Org skill flows need first-class support for code blocks and debugging in-place. Current flow is not explicit enough for code-block execution lifecycle, failure diagnosis, and iterative repair.
+Org workflows need first-class support for code block execution and debugging in-place across any org file, not only skill files. Current flow is not explicit enough for the full lifecycle: generation, execution, failure diagnosis, and iterative repair against user intent.
 
 * Scope
 - In scope:
-  - Parse and identify executable code blocks within org skill contexts.
+  - Parse and identify executable code blocks within any org buffer/file context.
   - Execute supported code blocks with captured stdout/stderr/exit status.
-  - Add debug workflow for rerun, inspect artifacts, and patch suggestions.
+  - Add autonomous debug workflow: rerun, inspect artifacts, and propose/apply targeted fixes.
+  - Support a prompt-driven loop where generated code blocks are validated by actual execution and corrected when results fail or do not satisfy prompt constraints.
   - Surface execution metadata in org buffers for traceability.
 - Out of scope:
   - Full replacement of Org Babel behavior.
@@ -20,27 +21,33 @@ Org skill flows need first-class support for code blocks and debugging in-place.
   - Execution must be explicit, sandbox-aware, and language-scoped.
   - Preserve reproducibility: inputs, env, and outputs should be recordable.
   - Debug flow must not silently mutate unrelated org content.
+  - Auto-adjust must be bounded (attempt limit/time limit) and must preserve an auditable change history.
 - Process constraints:
   - New execution/debug behavior requires ERT coverage.
   - Any supported language additions must include validation and tests.
 
 * Expected Behavior
 - Behavior 1:
-  - Users can run an org skill code block and receive structured result output.
+  - Users can run a code block from any org file and receive structured result output.
 - Behavior 2:
-  - On failure, debug view shows error context, command/runtime metadata, and rerun controls.
+  - On failure (runtime error or unmet prompt expectation), debug view shows error context, command/runtime metadata, and rerun controls.
 - Behavior 3:
-  - Users can iterate with explicit rerun and optional patch proposal workflow.
+  - System can iterate with explicit rerun and optional patch proposal/apply workflow, bounded by configured retry policy.
 - Behavior 4:
-  - Execution and debug events are logged for observability and later analysis.
+  - Execution, evaluation, and debug events are logged for observability and later analysis.
 
 * Tasks
-- [ ] Define code block execution contract (language, args, env, artifacts).
-- [ ] Implement parser/integration for org skill code block discovery.
-- [ ] Implement execution engine adapters with structured output capture.
-- [ ] Implement debug flow for failed blocks (inspect, rerun, propose fix).
-- [ ] Add ERT tests for success/failure/debug rerun scenarios.
-- [ ] Update README with org code block execution and debugging usage.
+- [X] Define code block execution contract for generic org buffers (language, args, env, artifacts).
+- [X] Define evaluation contract for prompt alignment (what counts as "meets prompt" vs failure).
+- [X] Implement parser/integration for org code block discovery (non-skill-specific).
+- [X] Implement execution engine adapters with structured output capture.
+- [X] Implement bounded autonomous debug loop for failed blocks (inspect, rerun, propose/apply fix).
+- [X] Add ERT tests for success/failure/debug rerun scenarios.
+- [X] Update README with org code block execution and debugging usage.
 
 * Worklog
 - 2026-02-22 :: PRD created for org skill code block execution and debugging lifecycle. Test status: not run.
+- 2026-02-22 :: PRD updated to broaden scope from org skill files to any org file, and to include prompt-driven autonomous run/evaluate/repair loop with bounded retries and auditability. Test status: not run.
+- 2026-02-22 :: Implemented generic Org src block discovery/execution APIs, language executor routing (shell + emacs-lisp), structured execution result model, metadata append logging, and bounded auto-debug run/evaluate/repair loop with pluggable evaluator and repair callback. Added ERT tests for discovery, success/failure execution, prompt-mismatch repair, and invalid repair failure paths. Updated README usage for new APIs and controls. Test status: pass (122/122, batch ERT).
+- 2026-02-22 :: Fixed planner stability path for empty initial plan responses: when planner returns empty =plan= but has valid candidates, runtime now synthesizes a one-step fallback plan from top candidate to avoid hard async failure. Added parser/request-flow tests for fallback and empty-candidate failure path. Updated README planner behavior notes. Test status: pass (124/124, batch ERT).
+- 2026-02-22 :: Hardened planner request path for fully empty initial planner payloads (=plan=[]= and =candidates=[]=): runtime now synthesizes one-step fallback from metadata (prefer suggest+pure skill), preventing async callback crash on =Planner response must include non-empty plan=. Added request-flow regression test and updated README fallback behavior notes. Test status: pass (125/125, batch ERT).

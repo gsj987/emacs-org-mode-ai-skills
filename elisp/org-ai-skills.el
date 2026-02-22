@@ -73,6 +73,26 @@ When nil, include all steps and stages."
                  (string :tag "Step or stage id"))
   :group 'org-ai-skills)
 
+(defcustom org-ai-skills-org-code-block-max-retries 2
+  "Maximum retries for autonomous Org code-block debug loops."
+  :type 'integer
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-org-code-block-executors
+  '(("sh" . org-ai-skills--execute-shell-src-block)
+    ("bash" . org-ai-skills--execute-shell-src-block)
+    ("shell" . org-ai-skills--execute-shell-src-block)
+    ("emacs-lisp" . org-ai-skills--execute-elisp-src-block)
+    ("elisp" . org-ai-skills--execute-elisp-src-block))
+  "Language to executor mapping for Org src block execution."
+  :type '(alist :key-type string :value-type function)
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-org-code-block-append-metadata t
+  "When non-nil, append execution metadata comments below executed src blocks."
+  :type 'boolean
+  :group 'org-ai-skills)
+
 (defcustom org-ai-skills-planner-max-steps 6
   "Maximum number of plan steps allowed in one planner revision."
   :type 'integer
@@ -298,6 +318,7 @@ When set to an empty string, dispatch falls back to the default execution system
 (define-error 'org-ai-skills-embark-error "Embark integration error")
 (define-error 'org-ai-skills-planner-error "Planner integration error")
 (define-error 'org-ai-skills-function-call-error "Skill function call error")
+(define-error 'org-ai-skills-execution-error "Code block execution error")
 
 (define-error 'org-ai-skills-version-store-error "Version store error")
 
@@ -973,6 +994,51 @@ Return a list of one or more normalized steps."
         :expected-output (or (org-ai-skills--plist-value step :expected-output :expected_output) "")
         :composition-reason (or (org-ai-skills--plist-value step :composition-reason :composition_reason) "")))
 
+(defun org-ai-skills--planner-fallback-step-from-candidates (candidates)
+  "Build one fallback planner step from CANDIDATES.
+Returns nil when no candidate is available."
+  (let ((first (car candidates)))
+    (when (and (listp first) (plist-get first :skill-id))
+      (list :step-id "fallback-step-1"
+            :goal "Execute best matching skill from planner candidates"
+            :skills (list (plist-get first :skill-id))
+            :input-from '("task")
+            :expected-output "Initial transformed output draft"
+            :composition-reason
+            "Auto-generated fallback because planner returned an empty plan"))))
+
+(defun org-ai-skills--planner-fallback-skill-id-from-metadata (metadata)
+  "Pick one fallback skill id from planner METADATA."
+  (let* ((pick
+          (or
+           (seq-find
+            (lambda (item)
+              (and (string= (plist-get (plist-get item :tags) :invocation) "suggest")
+                   (string= (plist-get (plist-get item :tags) :effect) "pure")))
+            metadata)
+           (seq-find
+            (lambda (item)
+              (string= (plist-get (plist-get item :tags) :invocation) "suggest"))
+            metadata)
+           (car metadata))))
+    (plist-get pick :skill-id)))
+
+(defun org-ai-skills--planner-fallback-response-from-metadata (metadata)
+  "Build fallback planner response from METADATA."
+  (let ((skill-id (org-ai-skills--planner-fallback-skill-id-from-metadata metadata)))
+    (when (and (stringp skill-id) (not (string-empty-p skill-id)))
+      (list :candidates (list (list :skill-id skill-id
+                                    :why "Fallback from metadata due to empty planner plan/candidates"
+                                    :score 0.0))
+            :plan (list (list :step-id "fallback-step-1"
+                              :goal "Execute metadata fallback skill"
+                              :skills (list skill-id)
+                              :input-from '("task")
+                              :expected-output "Initial transformed output draft"
+                              :composition-reason
+                              "Auto-generated fallback from metadata because planner returned empty plan and candidates"))
+            :replan-signal (list :enabled nil :condition "")))))
+
 (defun org-ai-skills-parse-planner-response (text metadata-list &optional allow-empty-plan)
   "Parse planner TEXT into normalized structure using METADATA-LIST.
 When ALLOW-EMPTY-PLAN is non-nil, an empty plan is accepted."
@@ -1003,10 +1069,21 @@ When ALLOW-EMPTY-PLAN is non-nil, an empty plan is accepted."
             normalized-plan-raw))
          (replan-raw
           (or (org-ai-skills--plist-value raw :replan-signal :replan_signal)
-              nil)))
+              nil))
+         (normalized-candidates
+          (mapcar (lambda (candidate)
+                    (org-ai-skills--normalize-planner-candidate candidate known-skill-ids))
+                  candidates-raw)))
     (unless (listp plan-raw)
       (signal 'org-ai-skills-planner-error
               (list "Planner response must include plan list")))
+    (when (and (not allow-empty-plan)
+               (null effective-plan-raw))
+      (let ((fallback-step
+             (org-ai-skills--planner-fallback-step-from-candidates
+              normalized-candidates)))
+        (when fallback-step
+          (setq effective-plan-raw (list fallback-step)))))
     (when (and (not allow-empty-plan) (null effective-plan-raw))
       (signal 'org-ai-skills-planner-error
               (list "Planner response must include non-empty plan")))
@@ -1015,11 +1092,7 @@ When ALLOW-EMPTY-PLAN is non-nil, an empty plan is accepted."
               (list (format "Planner response exceeds max steps (%d > %d)"
                             (length effective-plan-raw)
                             org-ai-skills-planner-max-steps))))
-    (let* ((normalized-candidates
-            (mapcar (lambda (candidate)
-                      (org-ai-skills--normalize-planner-candidate candidate known-skill-ids))
-                    candidates-raw))
-           (normalized-steps
+    (let* ((normalized-steps
             (apply #'append
                    (mapcar (lambda (step)
                              (org-ai-skills--validate-planner-step
@@ -1092,11 +1165,318 @@ When ALLOW-EMPTY-PLAN is non-nil, an empty plan is accepted."
   "Signal Embark integration error with MESSAGE."
   (signal 'org-ai-skills-embark-error (list message)))
 
+(defun org-ai-skills--signal-execution-error (message)
+  "Signal Org code block execution error with MESSAGE."
+  (signal 'org-ai-skills-execution-error (list message)))
+
 (defun org-ai-skills--require-org-mode ()
   "Ensure current buffer is an Org buffer."
   (unless (derived-mode-p 'org-mode)
     (org-ai-skills--signal-org-context-error
      "Current buffer is not in org-mode")))
+
+(defun org-ai-skills--normalize-src-language (language)
+  "Return normalized Org src LANGUAGE string."
+  (downcase (string-trim (or language ""))))
+
+(defun org-ai-skills--src-block-plist (element)
+  "Convert Org ELEMENT src-block to normalized plist."
+  (unless (eq (org-element-type element) 'src-block)
+    (org-ai-skills--signal-execution-error "Element is not a src block"))
+  (list :language (org-ai-skills--normalize-src-language
+                   (org-element-property :language element))
+        :parameters (or (org-element-property :parameters element) "")
+        :begin (org-element-property :begin element)
+        :end (org-element-property :end element)
+        :contents-begin (org-element-property :contents-begin element)
+        :contents-end (org-element-property :contents-end element)
+        :body (or (org-element-property :value element) "")))
+
+(defun org-ai-skills-org-src-block-at-point (&optional position)
+  "Return src block plist at POSITION or current point."
+  (org-ai-skills--require-org-mode)
+  (save-excursion
+    (when position
+      (goto-char position))
+    (let* ((context (org-element-context))
+           (block (if (eq (org-element-type context) 'src-block)
+                      context
+                    (org-element-lineage context '(src-block) t))))
+      (unless (eq (org-element-type block) 'src-block)
+        (org-ai-skills--signal-execution-error "Point is not inside an Org src block"))
+      (org-ai-skills--src-block-plist block))))
+
+(defun org-ai-skills-org-collect-src-blocks ()
+  "Collect all executable src blocks from current Org buffer."
+  (org-ai-skills--require-org-mode)
+  (org-element-map (org-element-parse-buffer) 'src-block
+    (lambda (element)
+      (org-ai-skills--src-block-plist element))))
+
+(defun org-ai-skills--resolve-src-block-executor (language)
+  "Resolve executor function for src LANGUAGE."
+  (let* ((lang (org-ai-skills--normalize-src-language language))
+         (entry (assoc-string lang org-ai-skills-org-code-block-executors t))
+         (executor (cdr entry)))
+    (unless (functionp executor)
+      (org-ai-skills--signal-execution-error
+       (format "Unsupported or unavailable src block language: %s" lang)))
+    executor))
+
+(defun org-ai-skills--coerce-retry-count (value)
+  "Coerce retry VALUE into bounded integer."
+  (let ((n (cond
+            ((integerp value) value)
+            ((and (stringp value) (string-match-p "^[0-9]+$" value))
+             (string-to-number value))
+            (t org-ai-skills-org-code-block-max-retries))))
+    (max 0 n)))
+
+(defun org-ai-skills--execute-shell-src-block (block)
+  "Execute shell src BLOCK and return structured result plist."
+  (let* ((script (or (plist-get block :body) ""))
+         (script-file (make-temp-file "org-ai-skills-shell-script-"))
+         (stderr-file (make-temp-file "org-ai-skills-shell-err-"))
+         (stdout-buf (generate-new-buffer " *org-ai-skills-shell-out*"))
+         (started-at (float-time))
+         (exit-value nil)
+         (stderr "")
+         (stdout ""))
+    (unwind-protect
+        (progn
+          (with-temp-file script-file
+            (insert script))
+          (setq exit-value
+                (process-file shell-file-name
+                              script-file
+                              (list stdout-buf stderr-file)
+                              nil
+                              "--noprofile"
+                              "--norc"))
+          (setq stdout (with-current-buffer stdout-buf (buffer-string)))
+          (setq stderr (with-temp-buffer
+                         (insert-file-contents stderr-file)
+                         (buffer-string))))
+      (when (buffer-live-p stdout-buf)
+        (kill-buffer stdout-buf))
+      (when (file-exists-p script-file)
+        (delete-file script-file))
+      (when (file-exists-p stderr-file)
+        (delete-file stderr-file)))
+    (when (stringp exit-value)
+      (setq stderr (concat stderr
+                           (if (string-empty-p stderr) "" "\n")
+                           (format "Process terminated by signal: %s" exit-value)))
+      (setq exit-value 1))
+    (list :exit-code (or exit-value 1)
+          :stdout stdout
+          :stderr stderr
+          :duration-ms (truncate (* 1000 (- (float-time) started-at))))))
+
+(defun org-ai-skills--execute-elisp-src-block (block)
+  "Execute emacs-lisp src BLOCK and return structured result plist."
+  (let* ((body (or (plist-get block :body) ""))
+         (started-at (float-time))
+         (stdout "")
+         (stderr "")
+         (exit-code 0))
+    (condition-case err
+        (let ((value nil))
+          (setq stdout
+                (with-output-to-string
+                  (setq value
+                        (eval (read (concat "(progn\n" body "\n)")) t))))
+          (when (string-empty-p stdout)
+            (setq stdout (if (null value) "" (format "%S" value)))))
+      (error
+       (setq exit-code 1)
+       (setq stderr (error-message-string err))))
+    (list :exit-code exit-code
+          :stdout stdout
+          :stderr stderr
+          :duration-ms (truncate (* 1000 (- (float-time) started-at))))))
+
+(defun org-ai-skills--default-execution-evaluator (result _prompt)
+  "Default execution evaluator for RESULT.
+_PROMPT is ignored in the default evaluator."
+  (if (= (or (plist-get result :exit-code) 1) 0)
+      (list :ok t :reason "")
+    (list :ok nil :reason (or (plist-get result :stderr) "non-zero exit"))))
+
+(defun org-ai-skills--evaluate-execution-result (result prompt evaluator)
+  "Evaluate execution RESULT for PROMPT using EVALUATOR."
+  (let* ((fn (or evaluator #'org-ai-skills--default-execution-evaluator))
+         (evaluation (funcall fn result prompt))
+         (ok (if (plist-get evaluation :ok) t nil))
+         (reason (or (plist-get evaluation :reason) "")))
+    (list :ok ok :reason reason :evaluation evaluation)))
+
+(defun org-ai-skills--execution-metadata-text (result)
+  "Render RESULT metadata into an Org comment block."
+  (let ((timestamp (format-time-string "%Y-%m-%dT%H:%M:%S%z")))
+    (concat
+     "#+BEGIN_COMMENT\n"
+     "org-ai-skills execution metadata\n"
+     (format "timestamp: %s\n" timestamp)
+     (format "language: %s\n" (or (plist-get result :language) ""))
+     (format "status: %s\n" (or (plist-get result :status) 'failed))
+     (format "attempt: %s\n" (or (plist-get result :attempt) 1))
+     (format "exit_code: %s\n" (or (plist-get result :exit-code) 1))
+     (format "duration_ms: %s\n" (or (plist-get result :duration-ms) 0))
+     (format "meets_prompt: %s\n" (if (plist-get result :meets-prompt) "t" "nil"))
+     (format "evaluation_reason: %s\n" (or (plist-get result :evaluation-reason) ""))
+     "stdout:\n"
+     (or (plist-get result :stdout) "")
+     "\n"
+     "stderr:\n"
+     (or (plist-get result :stderr) "")
+     "\n#+END_COMMENT\n")))
+
+(defun org-ai-skills-org-append-src-block-execution-metadata (result)
+  "Append execution RESULT metadata below the related src block."
+  (org-ai-skills--require-org-mode)
+  (let ((block-end (or (plist-get result :block-end)
+                       (plist-get result :end))))
+    (unless (integer-or-marker-p block-end)
+      (org-ai-skills--signal-execution-error "Result missing block-end position"))
+    (save-excursion
+      (goto-char block-end)
+      (insert "\n" (org-ai-skills--execution-metadata-text result)))))
+
+(defun org-ai-skills-org-set-src-block-body (block new-body)
+  "Replace src BLOCK body with NEW-BODY text and return refreshed block plist."
+  (org-ai-skills--require-org-mode)
+  (let* ((refreshed (org-ai-skills-org-src-block-at-point (plist-get block :begin)))
+         (block-begin (plist-get refreshed :begin))
+         (block-end (plist-get refreshed :end))
+         (contents-begin nil)
+         (contents-end nil))
+    (save-excursion
+      (goto-char block-begin)
+      (unless (re-search-forward "^[ \t]*#\\+begin_src\\b.*$" block-end t)
+        (org-ai-skills--signal-execution-error
+         "Cannot locate #+begin_src line for body update"))
+      (forward-line 1)
+      (setq contents-begin (point))
+      (unless (re-search-forward "^[ \t]*#\\+end_src\\b" block-end t)
+        (org-ai-skills--signal-execution-error
+         "Cannot locate #+end_src line for body update"))
+      (beginning-of-line)
+      (setq contents-end (point)))
+    (save-excursion
+      (goto-char contents-begin)
+      (delete-region contents-begin contents-end)
+      (insert (if (string-suffix-p "\n" new-body)
+                  new-body
+                (concat new-body "\n"))))
+    (org-ai-skills-org-src-block-at-point contents-begin)))
+
+(defun org-ai-skills-org-execute-src-block
+    (&optional block prompt evaluator attempt append-metadata)
+  "Execute one Org src BLOCK and return structured result.
+When BLOCK is nil, resolve the src block at point."
+  (let* ((src (or block (org-ai-skills-org-src-block-at-point)))
+         (language (plist-get src :language))
+         (executor (org-ai-skills--resolve-src-block-executor language))
+         (raw (funcall executor src))
+         (judgement (org-ai-skills--evaluate-execution-result raw prompt evaluator))
+         (result (append
+                  src
+                  raw
+                  (list :attempt (or attempt 1)
+                        :language language
+                        :prompt (or prompt "")
+                        :status (if (plist-get judgement :ok) 'success 'failed)
+                        :meets-prompt (plist-get judgement :ok)
+                        :evaluation-reason (plist-get judgement :reason)
+                        :evaluation (plist-get judgement :evaluation)))))
+    (when append-metadata
+      (org-ai-skills-org-append-src-block-execution-metadata result))
+    result))
+
+(defun org-ai-skills-org-run-src-block-auto-debug
+    (prompt repair-fn &optional block evaluator options)
+  "Run bounded execute/evaluate/repair loop for Org src BLOCK.
+PROMPT is user intent text. REPAIR-FN receives context plist and returns new body.
+When BLOCK is nil, resolve src block at point.
+EVALUATOR receives (RESULT PROMPT) and returns plist with :ok and :reason.
+OPTIONS plist supports keys:
+- :max-retries integer (default `org-ai-skills-org-code-block-max-retries')
+- :apply-fixes boolean (default t)
+- :append-metadata boolean (default `org-ai-skills-org-code-block-append-metadata')."
+  (unless (functionp repair-fn)
+    (org-ai-skills--signal-execution-error "repair-fn must be callable"))
+  (let* ((src (or block (org-ai-skills-org-src-block-at-point)))
+         (max-retries (org-ai-skills--coerce-retry-count
+                       (plist-get options :max-retries)))
+         (append-metadata
+          (if (plist-member options :append-metadata)
+              (if (plist-get options :append-metadata) t nil)
+            org-ai-skills-org-code-block-append-metadata))
+         (apply-fixes
+          (if (plist-member options :apply-fixes)
+              (if (plist-get options :apply-fixes) t nil)
+            t))
+         (attempt 1)
+         (history nil)
+         (current src)
+         (done nil)
+         (final nil))
+    (while (and (not done) (<= attempt (1+ max-retries)))
+      (let* ((result (org-ai-skills-org-execute-src-block
+                      current
+                      prompt
+                      evaluator
+                      attempt
+                      append-metadata))
+             (entry (list :attempt attempt
+                          :body (plist-get current :body)
+                          :result result)))
+        (push entry history)
+        (if (plist-get result :meets-prompt)
+            (setq done t
+                  final (list :status 'success
+                              :attempt-count attempt
+                              :final-result result
+                              :history (reverse history)))
+          (if (>= attempt (1+ max-retries))
+              (setq done t
+                    final (list :status 'failed
+                                :attempt-count attempt
+                                :final-result result
+                                :history (reverse history)))
+            (let* ((context (list :prompt (or prompt "")
+                                  :attempt attempt
+                                  :max-retries max-retries
+                                  :language (plist-get current :language)
+                                  :body (plist-get current :body)
+                                  :result result
+                                  :history (reverse history)))
+                   (next-body (funcall repair-fn context)))
+              (unless (and (stringp next-body)
+                           (not (string-empty-p next-body)))
+                (org-ai-skills--signal-execution-error
+                 "repair-fn must return non-empty src block body text"))
+              (if apply-fixes
+                  (setq current (org-ai-skills-org-set-src-block-body current next-body))
+                (setq current (plist-put (copy-sequence current) :body next-body)))
+              (setq attempt (1+ attempt)))))))
+    final))
+
+(defun org-ai-skills-org-execute-src-block-at-point (&optional prompt)
+  "Interactive helper to execute Org src block at point."
+  (interactive
+   (list (read-string "Prompt expectation (optional): ")))
+  (let ((result (org-ai-skills-org-execute-src-block
+                 nil
+                 prompt
+                 nil
+                 1
+                 org-ai-skills-org-code-block-append-metadata)))
+    (message "org-ai-skills block %s (exit=%s)"
+             (plist-get result :status)
+             (plist-get result :exit-code))
+    result))
 
 (defun org-ai-skills--subtree-at-heading-point ()
   "Return subtree plist at heading point.

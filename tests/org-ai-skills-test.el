@@ -2163,8 +2163,17 @@
     (should-error (org-ai-skills-parse-planner-response json metadata)
                   :type 'org-ai-skills-planner-error)))
 
-(ert-deftest org-ai-skills-parse-planner-response-rejects-empty-plan-by-default ()
-  "Planner parser should reject empty plan for initial planning."
+(ert-deftest org-ai-skills-parse-planner-response-builds-fallback-for-empty-initial-plan ()
+  "Planner parser should build fallback plan from candidates when initial plan is empty."
+  (let* ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
+         (json "{\"candidates\":[{\"skill_id\":\"gen-notes\",\"why\":\"fit\",\"score\":0.9}],\"plan\":[],\"replan_signal\":{\"enabled\":false,\"condition\":\"\"}}")
+         (parsed (org-ai-skills-parse-planner-response json metadata)))
+    (should (= (length (plist-get parsed :plan)) 1))
+    (should (equal (plist-get (car (plist-get parsed :plan)) :skills)
+                   '("gen-notes")))))
+
+(ert-deftest org-ai-skills-parse-planner-response-rejects-empty-plan-without-candidates ()
+  "Planner parser should reject empty initial plan when no candidate can seed fallback."
   (let* ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
          (json "{\"candidates\":[],\"plan\":[],\"replan_signal\":{\"enabled\":false,\"condition\":\"\"}}"))
     (should-error (org-ai-skills-parse-planner-response json metadata)
@@ -2897,5 +2906,97 @@
       '(:replans 1 :latest-output "[[REPLAN]]")
       '(:replan-signal (:enabled t) :plan ((:step-id "s2" :skills ("gen-notes")))))
      :type 'org-ai-skills-planner-error)))
+
+(ert-deftest org-ai-skills-org-src-block-at-point-resolves-parent-block ()
+  "Src block resolver should work when point is inside block body."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Demo\n#+begin_src sh\necho hello\n#+end_src\n")
+    (goto-char (point-min))
+    (search-forward "echo hello")
+    (let ((block (org-ai-skills-org-src-block-at-point)))
+      (should (equal (plist-get block :language) "sh"))
+      (should (string-match-p "echo hello" (plist-get block :body))))))
+
+(ert-deftest org-ai-skills-org-execute-src-block-shell-success ()
+  "Shell src block execution should return captured stdout and success status."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Demo\n#+begin_src sh\necho run-ok\n#+end_src\n")
+    (goto-char (point-min))
+    (search-forward "echo run-ok")
+    (let ((result (org-ai-skills-org-execute-src-block
+                   nil nil nil 1 nil)))
+      (should (eq (plist-get result :status) 'success))
+      (should (= (plist-get result :exit-code) 0))
+      (should (string-match-p "run-ok" (plist-get result :stdout))))))
+
+(ert-deftest org-ai-skills-org-execute-src-block-shell-failure ()
+  "Shell src block execution should report non-zero exit as failure."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Demo\n#+begin_src sh\nexit 7\n#+end_src\n")
+    (goto-char (point-min))
+    (search-forward "exit 7")
+    (let ((result (org-ai-skills-org-execute-src-block
+                   nil nil nil 1 nil)))
+      (should (eq (plist-get result :status) 'failed))
+      (should (= (plist-get result :exit-code) 7))
+      (should-not (plist-get result :meets-prompt)))))
+
+(ert-deftest org-ai-skills-org-execute-src-block-appends-metadata-comment ()
+  "Execution with metadata enabled should append an Org comment block."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Demo\n#+begin_src sh\necho run-ok\n#+end_src\n")
+    (goto-char (point-min))
+    (search-forward "echo run-ok")
+    (org-ai-skills-org-execute-src-block nil nil nil 1 t)
+    (goto-char (point-min))
+    (should (search-forward "org-ai-skills execution metadata" nil t))
+    (should (search-forward "#+END_COMMENT" nil t))))
+
+(ert-deftest org-ai-skills-org-run-src-block-auto-debug-repairs-prompt-mismatch ()
+  "Auto debug should repair and rerun when output does not meet prompt evaluation."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Demo\n#+begin_src sh\necho wrong\n#+end_src\n")
+    (goto-char (point-min))
+    (search-forward "echo wrong")
+    (let* ((evaluator
+            (lambda (result _prompt)
+              (if (string-match-p "right" (or (plist-get result :stdout) ""))
+                  '(:ok t :reason "")
+                '(:ok nil :reason "missing target output"))))
+           (repair-fn
+            (lambda (_context) "echo right"))
+           (summary
+            (org-ai-skills-org-run-src-block-auto-debug
+             "must print right"
+             repair-fn
+             nil
+             evaluator
+             '(:max-retries 2 :apply-fixes t :append-metadata nil)))
+           (final-result (plist-get summary :final-result))
+           (final-block (org-ai-skills-org-src-block-at-point)))
+      (should (eq (plist-get summary :status) 'success))
+      (should (= (plist-get summary :attempt-count) 2))
+      (should (eq (plist-get final-result :status) 'success))
+      (should (string-match-p "echo right" (plist-get final-block :body))))))
+
+(ert-deftest org-ai-skills-org-run-src-block-auto-debug-errors-on-invalid-repair ()
+  "Auto debug should fail fast when repair function returns empty body."
+  (with-temp-buffer
+    (org-mode)
+    (insert "* Demo\n#+begin_src sh\nexit 1\n#+end_src\n")
+    (goto-char (point-min))
+    (search-forward "exit 1")
+    (should-error
+     (org-ai-skills-org-run-src-block-auto-debug
+      "must pass"
+      (lambda (_context) "")
+      nil nil
+      '(:max-retries 2 :apply-fixes nil :append-metadata nil))
+     :type 'org-ai-skills-execution-error)))
 
 ;;; org-ai-skills-test.el ends here

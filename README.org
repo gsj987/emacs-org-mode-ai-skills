@@ -448,6 +448,44 @@ Embark integration:
 - Registers action key =R= on target type =org-heading=.
 - Trigger =R= from Embark on an Org heading target to run rewrite flow.
 
+* Usage (Org Src Block Execution and Auto Debug)
+
+This flow targets executable src blocks in any Org file (not limited to =skills/= files).
+
+Interactive execution:
+- Open any Org buffer and place point inside a =#+begin_src ... #+end_src= block.
+- Run:
+  - =M-x org-ai-skills-org-execute-src-block-at-point=
+- Optional prompt expectation can be entered to annotate/evaluate run intent.
+
+Core APIs:
+- Resolve src block at point:
+  - =(org-ai-skills-org-src-block-at-point)=
+- Discover all src blocks in current Org buffer:
+  - =(org-ai-skills-org-collect-src-blocks)=
+- Execute one src block:
+  - =(org-ai-skills-org-execute-src-block block prompt evaluator attempt append-metadata)=
+- Run bounded execute/evaluate/repair loop:
+  - =(org-ai-skills-org-run-src-block-auto-debug prompt repair-fn block evaluator options)=
+  - =repair-fn= input: plist with prompt, attempt, language, current body, last result, and history.
+  - =repair-fn= output: non-empty replacement block body string.
+  - =evaluator= input: =(result prompt)=, output plist =(:ok t/nil :reason "...")=.
+
+Supported executors (default):
+- =sh=, =bash=, =shell=
+- =emacs-lisp=, =elisp=
+
+Execution/debug controls:
+- =org-ai-skills-org-code-block-max-retries= (default 2)
+- =org-ai-skills-org-code-block-executors= (language -> executor function map)
+- =org-ai-skills-org-code-block-append-metadata= (default =t=)
+
+Behavior notes:
+- Each run returns structured output: language, stdout, stderr, exit code, duration, attempt, and evaluation status.
+- Auto-debug loop stops early on success and is always bounded by retry limit.
+- With =:apply-fixes t=, only the current src block body is mutated between attempts.
+- When metadata append is enabled, run records are appended below the block as Org comments for traceability.
+
 * Usage (Autonomous Planner + Lazy Skill Loading)
 
 Planner mode adds automatic skill candidate selection, multi-step execution, and optional replanning.
@@ -498,6 +536,10 @@ Behavior notes:
 - If planner returns too many skills in one step:
   - =reject=: signal planner validation error.
   - =split=: auto-split one oversized step into bounded step parts.
+- If initial planner response returns empty =plan= but includes candidates:
+  - Runtime synthesizes a one-step fallback plan from the top candidate.
+  - If both =plan= and =candidates= are empty, runtime synthesizes fallback
+    from metadata (preferred: suggest+pure skill, else first available skill).
 - Planner apply behavior:
   - Interactive planner commands (=org-ai-skills-plan-run=,
     =...-repeat-task=, =...-preset=, and fixed-task commands from
