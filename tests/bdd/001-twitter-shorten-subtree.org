@@ -1,0 +1,26 @@
+#+TITLE: BDD 001 - Rewrite subtree for Twitter shortening
+
+* Feature
+As a user, I can rewrite a subtree into a shorter Twitter-ready version and still verify runtime visibility through debug and DAG info.
+
+* Scenario: Shorten subtree and verify runtime artifacts
+Given target heading "Draft Paragraph"
+And fixture source is "inline section: Fixture Input"
+And skill id "simplify-twitter"
+And instruction "Rewrite this subtree for Twitter posting while preserving the core claim. The final rewritten subtree must be shorter than the original subtree."
+And model "meta-llama/llama-3.2-3b-instruct"
+And provider mode "live"
+When user runs command "org-ai-skills-org-rewrite-subtree"
+Then run status should be "applied"
+And heading should remain "Draft Paragraph"
+And slot text should be shorter than fixture input
+And debug log should contain "meta-llama/llama-3.2-3b-instruct"
+And dag info should contain "Execution DAG"
+And dag info should contain "rewrite"
+And effective model should be "meta-llama/llama-3.2-3b-instruct"
+
+* Fixture Input
+** Draft Paragraph
+The product update contains several good improvements across reliability, onboarding, and editing speed,
+but the current paragraph is too long and verbose for social posting.
+We want a shorter version that keeps the key point and can be posted on Twitter directly.

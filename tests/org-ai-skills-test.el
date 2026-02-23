@@ -2230,6 +2230,18 @@
     (should (equal (plist-get (car edges) :from) "planning.request#1"))
     (should (equal (plist-get (car edges) :to) "planning.parse#1"))))
 
+(ert-deftest org-ai-skills-build-execution-dag-treats-applied-as-success ()
+  "DAG status mapping should treat applied step status as success."
+  (let* ((run-state
+          '(:steps ((:step-id "rewrite"
+                     :status applied
+                     :skills ("simplify-twitter")
+                     :goal "Rewrite for twitter"))))
+         (dag (org-ai-skills-build-execution-dag run-state))
+         (node (car (plist-get dag :nodes))))
+    (should (equal (plist-get node :id) "rewrite"))
+    (should (eq (plist-get node :status) 'success))))
+
 (ert-deftest org-ai-skills-ui-show-dag-renders-current-planner-run ()
   "DAG view command should render from current planner run-state."
   (let ((org-ai-skills--ui-run-state
@@ -3335,5 +3347,36 @@
       nil nil
       '(:max-retries 2 :apply-fixes nil :append-metadata nil))
      :type 'org-ai-skills-execution-error)))
+
+(ert-deftest org-ai-skills-bdd-parse-file-collects-gwt-steps ()
+  "BDD parser should preserve Given/When/Then step phases."
+  (let* ((file (expand-file-name "tests/bdd/001-twitter-shorten-subtree.org"
+                                  org-ai-skills-test--project-root))
+         (scenario (org-ai-skills-bdd-parse-file file))
+         (steps (plist-get scenario :steps)))
+    (should (string-match-p "BDD 001" (plist-get scenario :title)))
+    (should (seq-find (lambda (step)
+                        (and (eq (plist-get step :phase) 'given)
+                             (string-match-p "target heading" (plist-get step :text))))
+                      steps))
+    (should (seq-find (lambda (step)
+                        (and (eq (plist-get step :phase) 'when)
+                             (string-match-p "org-ai-skills-org-rewrite-subtree"
+                                             (plist-get step :text))))
+                      steps))
+    (should (seq-find (lambda (step)
+                        (and (eq (plist-get step :phase) 'then)
+                             (string-match-p "effective model should be"
+                                             (plist-get step :text))))
+                      steps))))
+
+(ert-deftest org-ai-skills-bdd-parse-file-collects-scenario-properties ()
+  "BDD parser should expose scenario property drawer entries."
+  (let* ((file (expand-file-name "tests/bdd/000-template.org"
+                                 org-ai-skills-test--project-root))
+         (scenario (org-ai-skills-bdd-parse-file file))
+         (props (plist-get scenario :scenario-properties)))
+    (should (equal "bdd-xxx" (cdr (assoc "SCENARIO_ID" props))))
+    (should (equal "p2" (cdr (assoc "PRIORITY" props))))))
 
 ;;; org-ai-skills-test.el ends here

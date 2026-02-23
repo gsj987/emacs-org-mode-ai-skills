@@ -1839,8 +1839,7 @@ When INCLUDE-EVENTS is non-nil, render one node per timing event occurrence."
                    (usage (or (plist-get event :usage) nil))
                    (resolved-step (and step-id (gethash step-id step-table)))
                    (status (cond
-                            ((eq (plist-get event :status) 'error) 'failure)
-                            ((eq (plist-get event :status) 'failed) 'failure)
+                            ((memq (plist-get event :status) '(error failed failure)) 'failure)
                             ((eq (plist-get event :status) 'running) 'running)
                             (t 'success)))
                    (skills (or (plist-get event :skill-ids)
@@ -1870,8 +1869,8 @@ When INCLUDE-EVENTS is non-nil, render one node per timing event occurrence."
                  (done (gethash step-id step-table))
                  (status (cond
                           ((null done) 'pending)
-                          ((memq (plist-get done :status) '(done success)) 'success)
-                          ((eq (plist-get done :status) 'failed) 'failure)
+                          ((memq (plist-get done :status) '(done success applied)) 'success)
+                          ((memq (plist-get done :status) '(failed failure error)) 'failure)
                           (t 'running)))
                  (deps (seq-filter
                         (lambda (dep)
@@ -1901,7 +1900,7 @@ When INCLUDE-EVENTS is non-nil, render one node per timing event occurrence."
               (push (list :id step-id
                           :goal (or (plist-get step :goal) "")
                           :skills (or (plist-get step :skills) nil)
-                          :status (if (memq (plist-get step :status) '(done success))
+                          :status (if (memq (plist-get step :status) '(done success applied))
                                       'success
                                     'failure)
                           :dependencies nil
@@ -2619,6 +2618,15 @@ If ENABLED is non-nil, set debug mode accordingly."
      ((and (listp first) (plist-get first :content))
       (plist-get first :content))
      ((stringp second) second)
+     ((and (listp second)
+           (or (plist-get second :error)
+               (plist-get second :status)
+               (plist-get second :http-status)))
+      (org-ai-skills--signal-gptel-error
+       (format "gptel returned no text (http=%s status=%s error=%S)"
+               (or (plist-get second :http-status) "")
+               (or (plist-get second :status) "")
+               (plist-get second :error))))
      (t (org-ai-skills--signal-gptel-error
          "gptel callback did not return text response")))))
 
@@ -5269,7 +5277,7 @@ When ROLE is `planner', return nil because planner must not use tools."
             (let ((first (car response))
                   (info (cadr response)))
               (unless logged-metadata
-                (when (and (listp info) (plist-member info :data))
+                (when (listp info)
                   (setq logged-metadata t)
                   (org-ai-skills--append-debug-entry
                    (list :event-type 'gptel-request-data
@@ -5282,6 +5290,7 @@ When ROLE is `planner', return nil because planner must not use tools."
                          :skill-ids (plist-get request :skill-ids)
                          :prompt "gptel request data payload"
                          :gptel-data (plist-get info :data)
+                         :gptel-info info
                          :gptel-tool-names tool-names))))
               (when (and (consp first) (memq (car first) '(tool-call tool-result)))
                 (org-ai-skills--append-debug-entry
@@ -5667,6 +5676,423 @@ Optional DOCSTRING overrides the generated command documentation."
      ,(or docstring (format "Run planner-driven rewrite with fixed task: %s" task))
      (interactive (list (org-ai-skills-org-read-rewrite-target)))
      (org-ai-skills-plan-run target ,task t nil)))
+
+(defcustom org-ai-skills-bdd-scenario-dir
+  (expand-file-name "../tests/bdd" (file-name-directory (or load-file-name buffer-file-name)))
+  "Directory that stores Org-based BDD scenario files."
+  :type 'directory
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-e2e-model-profile
+  "meta-llama/llama-3.2-3b-instruct"
+  "Default model id used by BDD/E2E profile tests."
+  :type 'string
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-e2e-think-mode nil
+  "When non-nil, allow think mode in E2E profile.
+Phase-1 BDD/E2E defaults this to nil for fast, low-cost runs."
+  :type 'boolean
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-bdd-live-timeout-seconds 120
+  "Maximum seconds to wait for one live BDD rewrite run."
+  :type 'integer
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-bdd-live-setup-function nil
+  "Optional function called before live BDD execution.
+Use this to load provider/backend config for gptel in E2E runs."
+  :type '(choice (const :tag "None" nil)
+                 (function :tag "Setup function"))
+  :group 'org-ai-skills)
+
+(defun org-ai-skills-bdd-parse-file (file)
+  "Parse Org BDD FILE and return plist scenario model.
+Supported step keywords are Given/When/Then/And."
+  (let* ((path (expand-file-name file))
+         (text (with-temp-buffer
+                 (insert-file-contents path)
+                 (buffer-string)))
+         (lines (split-string text "\n"))
+         (title "")
+         (scenario "")
+         (phase nil)
+         (steps nil))
+    (dolist (line lines)
+      (cond
+       ((string-match "^#\\+TITLE:[ \t]*\\(.*\\)$" line)
+        (setq title (string-trim (match-string 1 line))))
+       ((string-match "^\\*+[ \t]+Scenario:[ \t]*\\(.*\\)$" line)
+        (setq scenario (string-trim (match-string 1 line))))
+       ((string-match "^[ \t]*\\(Given\\|When\\|Then\\|And\\)[ \t]+\\(.+\\)$" line)
+        (let* ((kw (downcase (match-string 1 line)))
+               (body (string-trim (match-string 2 line)))
+               (step-phase
+                (pcase kw
+                  ("given" 'given)
+                  ("when" 'when)
+                  ("then" 'then)
+                  ("and" (or phase
+                             (org-ai-skills--signal-parse-error
+                              path
+                              "And step cannot be first BDD step")))
+                  (_ (org-ai-skills--signal-parse-error
+                      path
+                      (format "Unsupported step keyword: %s" kw))))))
+          (setq phase step-phase)
+          (push (list :phase step-phase :text body) steps)))))
+    (unless steps
+      (org-ai-skills--signal-parse-error
+       path
+       "BDD scenario contains no Given/When/Then steps"))
+    (list :file path
+          :title title
+          :scenario scenario
+          :scenario-properties
+          (org-ai-skills-bdd--extract-scenario-properties path)
+          :steps (nreverse steps))))
+
+(defun org-ai-skills-bdd--extract-scenario-properties (file)
+  "Extract property drawer entries under first Scenario heading in FILE."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (org-mode)
+    (goto-char (point-min))
+    (if (re-search-forward "^\\*+[ \t]+Scenario:[ \t]*.*$" nil t)
+        (progn
+          (forward-line 1)
+          (if (looking-at-p "^[ \t]*:PROPERTIES:[ \t]*$")
+              (let ((props nil))
+                (forward-line 1)
+                (while (and (not (eobp))
+                            (not (looking-at-p "^[ \t]*:END:[ \t]*$")))
+                  (when (looking-at "^[ \t]*:\\([^:\n]+\\):[ \t]*\\(.*\\)$")
+                    (push (cons (upcase (match-string 1))
+                                (string-trim (or (match-string 2) "")))
+                          props))
+                  (forward-line 1))
+                (nreverse props))
+            nil))
+      nil)))
+
+(defun org-ai-skills-bdd--step-capture (steps phase pattern)
+  "Return first capture from STEPS with PHASE matching PATTERN."
+  (let ((found nil))
+    (dolist (step steps)
+      (when (and (eq (plist-get step :phase) phase)
+                 (not found)
+                 (string-match pattern (plist-get step :text)))
+        (setq found (match-string 1 (plist-get step :text)))))
+    found))
+
+(defun org-ai-skills-bdd--section-body (file heading)
+  "Return trimmed body text for HEADING section in Org FILE.
+Returns nil when section does not exist or body is empty."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (org-mode)
+    (goto-char (point-min))
+    (if (re-search-forward
+         (format "^\\*+[ \t]+%s[ \t]*$" (regexp-quote heading))
+         nil t)
+        (let* ((start (line-beginning-position))
+               (end (save-excursion
+                      (goto-char start)
+                      (org-end-of-subtree t t)))
+               (begin (save-excursion
+                        (goto-char start)
+                        (forward-line 1)
+                        (point)))
+               (raw (buffer-substring-no-properties begin end))
+               (text (string-trim raw)))
+          (unless (string-empty-p text) text))
+      nil)))
+
+(defun org-ai-skills-bdd--require-step-capture (steps phase pattern label scenario-file)
+  "Require captured value from STEPS for PHASE/PATTERN; error when missing.
+LABEL and SCENARIO-FILE are used for clear error text."
+  (let ((value (org-ai-skills-bdd--step-capture steps phase pattern)))
+    (unless value
+      (org-ai-skills--signal-parse-error
+       scenario-file
+       (format "Missing BDD step for %s" label)))
+    value))
+
+(defun org-ai-skills-bdd--find-heading (heading)
+  "Move point to HEADING in current Org buffer, or signal context error."
+  (goto-char (point-min))
+  (unless (re-search-forward
+           (format "^\\*+[ \t]+%s[ \t]*$" (regexp-quote heading))
+           nil t)
+    (org-ai-skills--signal-org-context-error
+     (format "BDD heading not found: %s" heading)))
+  (beginning-of-line))
+
+(defun org-ai-skills-bdd--usage-from-debug-events ()
+  "Extract normalized usage from debug events when provider reported it."
+  (let ((events (or org-ai-skills--debug-events nil))
+        (usage nil))
+    (while (and events (not usage))
+      (let* ((entry (car events))
+             (event-type (plist-get entry :event-type))
+             (data (or (plist-get entry :gptel-data)
+                       (plist-get entry :gptel-info))))
+        (when (and (eq event-type 'gptel-request-data) (listp data))
+          (let ((normalized (org-ai-skills--normalize-provider-usage data)))
+            (when (org-ai-skills--usage-observed-p normalized)
+              (setq usage normalized))))
+        (setq events (cdr events))))
+    usage))
+
+(defun org-ai-skills-bdd--effective-model-from-debug-events ()
+  "Extract effective model string from debug events, or nil."
+  (let ((events (or org-ai-skills--debug-events nil))
+        (model nil))
+    (while (and events (not model))
+      (let ((entry (car events)))
+        (setq model (plist-get entry :effective-model))
+        (setq events (cdr events))))
+    model))
+
+(defun org-ai-skills-bdd--wait-for-run-completion (run-id timeout-seconds)
+  "Wait until UI run RUN-ID exits running state, up to TIMEOUT-SECONDS.
+Returns final status symbol."
+  (let* ((timeout (max 1 (or timeout-seconds org-ai-skills-bdd-live-timeout-seconds)))
+         (deadline (+ (float-time) timeout))
+         (status (plist-get org-ai-skills--ui-run-state :status)))
+    (while (and (eq status 'running)
+                (< (float-time) deadline))
+      (accept-process-output nil 0.2)
+      (setq status
+            (if (equal (plist-get org-ai-skills--ui-run-state :run-id) run-id)
+                (plist-get org-ai-skills--ui-run-state :status)
+              'failed)))
+    (if (eq status 'running)
+        (signal 'org-ai-skills-gptel-error
+                (list (format "BDD live run timeout after %ss" timeout)))
+      status)))
+
+(defun org-ai-skills-bdd--ensure-live-environment ()
+  "Ensure live gptel environment is available for BDD runs."
+  (unless (org-ai-skills-require-gptel)
+    (org-ai-skills--signal-gptel-error
+     "BDD live run requires gptel, but it could not be loaded"))
+  (require 'gptel-curl nil t)
+  (when (functionp org-ai-skills-bdd-live-setup-function)
+    (funcall org-ai-skills-bdd-live-setup-function))
+  (unless (fboundp 'gptel-request)
+    (org-ai-skills--signal-gptel-error
+     "gptel-request is unavailable after live setup"))
+  (unless (fboundp 'gptel-curl-get-response)
+    (org-ai-skills--signal-gptel-error
+     "gptel curl transport is unavailable; ensure gptel-curl is loadable"))
+  t)
+
+(defun org-ai-skills-bdd--build-rewrite-dag-text (status skill-id instruction output duration-ms usage)
+  "Render rewrite DAG text from STATUS/SKILL-ID/INSTRUCTION/OUTPUT with metrics."
+  (let* ((event-status (if (memq status '(applied success done))
+                           'success
+                         'failed))
+         (effective-usage (or usage '(:input-tokens 0 :output-tokens 0 :total-tokens 0)))
+         (run-state (list :steps (list (list :step-id "rewrite"
+                                             :status status
+                                             :skills (list skill-id)
+                                             :goal instruction
+                                             :output output))
+                          :events (list (list :stage-id 'execution.step
+                                              :status event-status
+                                              :duration-ms (max 1 (or duration-ms 0))
+                                              :step-id "rewrite"
+                                              :skill-ids (list skill-id)
+                                              :usage effective-usage
+                                              :estimated-cost-usd 0.0))))
+         (dag (org-ai-skills-build-execution-dag run-state))
+         (text (org-ai-skills-render-execution-dag-text dag)))
+    (concat text
+            (format "\nRun summary: rewrite -> %s\n"
+                    (symbol-name (or status 'unknown))))))
+
+(defun org-ai-skills-bdd--assertions-from-steps (steps status heading text debug dag model fixture-text)
+  "Evaluate Then/And assertions from STEPS and return (PASSED . FAILED)."
+  (let ((passed nil)
+        (failed nil))
+    (dolist (step steps)
+      (when (eq (plist-get step :phase) 'then)
+        (let ((body (plist-get step :text)))
+          (cond
+           ((string-match "^run status should be \"\\([^\"]+\\)\"$" body)
+            (let ((expected (match-string 1 body))
+                  (actual (symbol-name (or status 'unknown))))
+              (if (string= expected actual)
+                  (push (format "status=%s" expected) passed)
+                (push (format "status expected=%s actual=%s" expected actual) failed))))
+           ((string-match "^slot text should contain \"\\([^\"]+\\)\"$" body)
+            (let ((needle (match-string 1 body)))
+              (if (string-match-p (regexp-quote needle) text)
+                  (push (format "slot contains: %s" needle) passed)
+                (push (format "slot missing: %s" needle) failed))))
+           ((string-match "^heading should remain \"\\([^\"]+\\)\"$" body)
+            (let ((expected (match-string 1 body)))
+              (if (string= expected heading)
+                  (push (format "heading=%s" expected) passed)
+                (push (format "heading expected=%s actual=%s" expected heading) failed))))
+           ((string-match "^debug log should contain \"\\([^\"]+\\)\"$" body)
+            (let ((needle (match-string 1 body)))
+              (if (and (stringp debug)
+                       (string-match-p (regexp-quote needle) debug))
+                  (push (format "debug contains: %s" needle) passed)
+                (push (format "debug missing: %s" needle) failed))))
+           ((string-match "^dag info should contain \"\\([^\"]+\\)\"$" body)
+            (let ((needle (match-string 1 body)))
+              (if (and (stringp dag)
+                       (string-match-p (regexp-quote needle) dag))
+                  (push (format "dag contains: %s" needle) passed)
+                (push (format "dag missing: %s" needle) failed))))
+           ((string-match "^effective model should be \"\\([^\"]+\\)\"$" body)
+            (let ((expected (match-string 1 body)))
+              (if (equal expected model)
+                  (push (format "model=%s" expected) passed)
+                (push (format "model expected=%s actual=%s" expected model) failed))))
+           ((string= body "slot text should be shorter than fixture input")
+            (if (< (length (or text "")) (length (or fixture-text "")))
+                (push "slot shorter than fixture input" passed)
+              (push (format "slot not shorter (slot=%d fixture=%d)"
+                            (length (or text ""))
+                            (length (or fixture-text "")))
+                    failed)))
+           ((string= body "dag metrics should be non-zero")
+            (if (and (stringp dag)
+                     (not (string-match-p "metrics: 0ms, in:0 out:0 total:0" dag)))
+                (push "dag metrics non-zero" passed)
+              (push "dag metrics are zero" failed)))
+           (t
+            (push (format "unsupported assertion: %s" body) failed))))))
+    (cons (nreverse passed) (nreverse failed))))
+
+(defun org-ai-skills-bdd-run-file (file &optional profile)
+  "Run one BDD scenario FILE and return plist result.
+PROFILE is a plist; :model overrides execution model."
+  (let* ((scenario (org-ai-skills-bdd-parse-file file))
+         (scenario-file (plist-get scenario :file))
+         (steps (plist-get scenario :steps))
+         (inline-fixture-text (org-ai-skills-bdd--section-body scenario-file "Fixture Input"))
+         (fixture-path
+          (org-ai-skills-bdd--step-capture
+           steps 'given "^fixture file \"\\([^\"]+\\)\"$"))
+         (target-heading
+          (org-ai-skills-bdd--require-step-capture
+           steps 'given "^target heading \"\\([^\"]+\\)\"$" "target heading" scenario-file))
+         (skill-id
+          (org-ai-skills-bdd--require-step-capture
+           steps 'given "^skill id \"\\([^\"]+\\)\"$" "skill id" scenario-file))
+         (instruction
+          (or (org-ai-skills-bdd--step-capture
+               steps 'given "^instruction \"\\([^\"]+\\)\"$")
+              "Rewrite subtree"))
+         (provider-mode
+          (or (org-ai-skills-bdd--step-capture
+               steps 'given "^provider mode \"\\([^\"]+\\)\"$")
+              "live"))
+         (model
+          (or (plist-get profile :model)
+              (org-ai-skills-bdd--step-capture steps 'given "^model \"\\([^\"]+\\)\"$")
+              org-ai-skills-e2e-model-profile))
+         (command
+          (org-ai-skills-bdd--require-step-capture
+           steps 'when "^user runs command \"\\([^\"]+\\)\"$"
+           "when command"
+           scenario-file))
+         (fixture-file (and fixture-path (expand-file-name fixture-path default-directory)))
+         (fixture-text
+          (or inline-fixture-text
+              (and fixture-file
+                   (with-temp-buffer
+                     (insert-file-contents fixture-file)
+                     (buffer-string)))
+              (org-ai-skills--signal-parse-error
+               scenario-file
+               "Missing fixture input: add section `* Fixture Input` or Given fixture file")))
+         (store-dir (make-temp-file "org-ai-skills-bdd-store-" t))
+         (user-dir (make-temp-file "org-ai-skills-bdd-home-" t))
+         (debug-buffer (format "*org-ai-skills-bdd-debug-%s*" (org-ai-skills--candidate-id)))
+         (run-id nil)
+         (status nil)
+         (captured-model nil)
+         (captured-usage nil)
+         (effective-heading "")
+         (effective-text "")
+         (dag-text "")
+         (debug-text "")
+         (run-start-ms 0)
+         (run-end-ms 0)
+         (skill (org-ai-skills-load-skill-by-id skill-id)))
+    (unless (string= provider-mode "live")
+      (org-ai-skills--signal-parse-error
+       scenario-file
+       (format "Unsupported BDD provider mode: %s (expected: live)" provider-mode)))
+    (unless (string= command "org-ai-skills-org-rewrite-subtree")
+      (org-ai-skills--signal-parse-error
+       scenario-file
+       (format "Unsupported BDD command: %s" command)))
+    (org-ai-skills-bdd--ensure-live-environment)
+    (unwind-protect
+        (let ((org-ai-skills-version-store-dir store-dir)
+              (org-ai-skills-debug-enabled t)
+              (org-ai-skills-debug-buffer-name debug-buffer)
+              (org-ai-skills--debug-events nil)
+              (org-ai-skills--last-debug-entry nil)
+              (org-ai-skills-auto-apply-generated-candidate t)
+              (org-ai-skills-model-execution model)
+              (org-ai-skills-e2e-think-mode nil))
+          (with-temp-buffer
+            (org-mode)
+            (let ((user-emacs-directory user-dir))
+              (insert fixture-text)
+              (org-ai-skills-bdd--find-heading target-heading)
+              (let ((target (org-ai-skills-org-resolve-subtree 'current)))
+                (setq run-start-ms (org-ai-skills--observability-now-ms))
+                (org-ai-skills-org-rewrite-subtree target skill instruction)
+                (setq run-id (plist-get org-ai-skills--ui-run-state :run-id))
+                (org-ai-skills-bdd--wait-for-run-completion
+                 run-id
+                 org-ai-skills-bdd-live-timeout-seconds)
+                (setq run-end-ms (org-ai-skills--observability-now-ms))
+                (setq status (plist-get org-ai-skills--ui-run-state :status))
+                (setq captured-model (or (org-ai-skills-bdd--effective-model-from-debug-events)
+                                         model))
+                (setq captured-usage (org-ai-skills-bdd--usage-from-debug-events))
+                (goto-char (point-min))
+                (re-search-forward "^\\*+[ \t]+\\(.*\\)$" nil t)
+                (setq effective-heading (or (match-string 1) ""))
+                (setq effective-text (buffer-string))
+                (setq dag-text
+                      (org-ai-skills-bdd--build-rewrite-dag-text
+                       status
+                       skill-id
+                       instruction
+                       effective-text
+                       (and run-start-ms run-end-ms (- run-end-ms run-start-ms))
+                       captured-usage)))))
+          (when (get-buffer debug-buffer)
+            (with-current-buffer debug-buffer
+              (setq debug-text (buffer-string))))
+          (let* ((assertion-results
+                  (org-ai-skills-bdd--assertions-from-steps
+                   steps status effective-heading effective-text debug-text dag-text captured-model fixture-text))
+                 (passed (car assertion-results))
+                 (failed (cdr assertion-results)))
+            (list :name (or (plist-get scenario :scenario) (plist-get scenario :title))
+                  :status (if failed 'fail 'pass)
+                  :assertions passed
+                  :failures failed
+                  :effective-model captured-model
+                  :dag dag-text
+                  :debug-log debug-text)))
+      (when (get-buffer debug-buffer)
+        (kill-buffer debug-buffer))
+      (delete-directory store-dir t)
+      (delete-directory user-dir t))))
 
 (defvar org-ai-skills-embark-org-heading-map
   (let ((map (make-sparse-keymap)))

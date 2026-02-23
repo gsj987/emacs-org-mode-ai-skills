@@ -1,0 +1,158 @@
+#+TITLE: PRD 018 - Behavior-Driven E2E Testing via Multi-Worktree Codex Orchestration
+#+STARTUP: overview
+
+* Problem
+Current testing is mostly ERT unit-level because plugin behavior depends on a personal Emacs runtime (=~/.emacs.d/init.el=), real gptel provider setup, and live API keys. This blocks reproducible end-to-end validation of user-observable behavior and prevents safe parallel feature verification with multiple Codex instances.
+
+* Scope
+- In scope:
+  - Define a behavior-driven test specification format in natural language (user behavior + expected outcomes) for org-ai-skills.
+  - Add a reproducible E2E test harness that runs Emacs with isolated test config (no dependence on personal init or secrets).
+  - Support multi-worktree execution where each worktree can be driven by a dedicated Codex instance against a branch-scoped PRD.
+  - Add orchestration entry points (scripts/commands) to create worktrees, assign scenario sets, run E2E suites, and collect results.
+  - Provide deterministic provider simulation/stubbing for gptel interactions in E2E mode.
+  - Define result artifacts for each run (logs, scenario pass/fail, traces) for auditability.
+- Out of scope:
+  - Replacing existing ERT unit tests.
+  - Running real paid provider calls in CI by default.
+  - Full distributed scheduler for remote machines.
+
+* Ownership Boundary
+- Primary ownership area for this PR:
+  - =prd/018-bdd-e2e-multi-worktree-codex-orchestration.org=
+  - =elisp/= (E2E harness integration points)
+  - =tests/= (BDD/E2E coverage)
+  - =scripts/= (worktree and E2E orchestration helpers)
+  - =README.org= (usage updates)
+- Expected conflict points:
+  - Core execution APIs in =elisp/org-ai-skills.el= if concurrent feature branches also touch runtime orchestration.
+
+* Constraints
+- Technical constraints:
+  - E2E mode must run with explicit isolated init (e.g. =emacs -Q= + controlled load path or dedicated minimal init file).
+  - No runtime dependency on user secrets. Tests must pass with fake/mock providers.
+  - Scenario execution must be deterministic enough for repeated local and CI runs.
+  - Parallel worktrees must not share mutable runtime state (temp files, caches, sockets) unless namespaced.
+  - Behavior specs must be machine-runnable while remaining human-readable.
+- Process constraints:
+  - PRD-first: implementation starts only after this PRD is approved/updated.
+  - New behavior requires ERT/E2E tests, including failure scenarios.
+  - README must document how to run BDD and E2E flows locally.
+
+* Expected Behavior
+- Behavior 1:
+  - A developer writes a behavior scenario in natural language with explicit Given/When/Then expectations.
+- Behavior 2:
+  - Running the E2E command executes scenarios in an isolated Emacs runtime without loading personal =~/.emacs.d/init.el=.
+- Behavior 3:
+  - gptel/provider interactions are simulated or fixture-driven in E2E mode, so no real API key is required.
+- Behavior 4:
+  - Multiple worktrees can run independent scenario subsets in parallel, each with isolated artifacts and clear pass/fail summary.
+- Behavior 5:
+  - Failures include actionable traces (step, assertion, captured outputs, and relevant buffer/file state).
+
+* Open Questions
+- Should behavior scenario files live under =tests/bdd/= or =skills/...= with metadata tags?
+  - Decision: all behavior scenario files live under =tests/bdd/= as org files.
+- Preferred orchestration command surface:
+  - one command for full flow (=create worktrees + run + aggregate=), or
+  - separated commands for explicit control?
+  - Decision: no extra orchestration command surface in first phase; focus on scenario-driven test cases defined in org files.
+- Do we require optional “live provider” E2E profile for manual pre-release validation?
+  - Decision: no live-provider profile in phase 1. Add dedicated E2E profile config (smaller model, think disabled) for faster and cheaper runs when provider-backed tests are enabled later.
+
+* Agreed Decisions (Locked)
+- BDD specs are org files under =tests/bdd/=.
+- E2E v1 is scenario-first, no separate multi-command orchestration UX.
+- E2E runtime has its own config profile, independent from user init.
+- Phase 1 avoids live-provider dependency; provider behavior is deterministic via stubs/fixtures.
+
+* Tasks
+- [X] Define behavior scenario schema and parser contract (Given/When/Then + fixtures + assertions).
+- [X] Define isolated Emacs E2E runtime contract (load path, init strategy, temp dir and cache namespacing).
+- [X] Implement provider abstraction/stub layer for deterministic gptel behavior in E2E mode.
+- [X] Implement E2E runner (scenario discovery, execution, assertion engine, artifact output).
+- [X] Implement worktree-safe runtime isolation (artifact namespacing and temp-dir isolation per run/worktree).
+- [X] Implement E2E profile config (small model defaults, think disabled, zero dependency on personal init).
+- [X] Add ERT coverage for parser/runner internals and failure modes.
+- [X] Add end-to-end scenario tests that validate user-visible flows and expected outputs.
+- [X] Update README with setup, execution commands, and troubleshooting.
+- [X] Consolidate E2E entry scripts under =tests/= (remove parallel =test/= folder path).
+- [X] Append implementation/test results to this PRD worklog.
+
+* Preview: BDD Scenario File (=tests/bdd/001-rewrite-subtree.org=)
+#+begin_src org
+#+TITLE: BDD 001 - Rewrite subtree keeps heading and updates body
+
+,* Feature
+User can rewrite a selected subtree and get updated body content while preserving heading structure.
+
+,* Background
+Given an org buffer fixture "article.org"
+And provider mode is "stub"
+And response fixture is "rewrite-success.json"
+
+,* Scenario: Rewrite a subtree with style constraint
+Given point is at heading "Draft Paragraph"
+And subtree body contains "The market moved a lot today."
+When user runs command "org-ai-skills-rewrite-subtree"
+And user prompt is "Rewrite in concise professional tone"
+Then command exits with status "success"
+And heading text remains "Draft Paragraph"
+And subtree body should contain "concise professional tone"
+And event log should contain "rewrite-subtree completed"
+And no call should read "~/.emacs.d/init.el"
+#+end_src
+
+* Preview: E2E Test Script (=tests/e2e/org-ai-skills-e2e-test.el=)
+#+begin_src emacs-lisp
+;;; org-ai-skills-e2e-test.el --- E2E tests for org-ai-skills -*- lexical-binding: t; -*-
+
+(require 'ert)
+(require 'org)
+(require 'org-ai-skills)
+
+(defvar org-ai-skills-e2e-profile
+  '(:model "gpt-4o-mini"
+    :think nil
+    :provider-mode stub)
+  "Dedicated E2E profile. Must not depend on user init/secrets.")
+
+(defun org-ai-skills-e2e--with-isolated-runtime (fn)
+  "Run FN in isolated temp state for deterministic E2E behavior."
+  (let* ((tmp (make-temp-file "org-ai-skills-e2e-" t))
+         (user-emacs-directory tmp)
+         (org-ai-skills-artifact-dir (expand-file-name "artifacts" tmp)))
+    (unwind-protect
+        (funcall fn)
+      (delete-directory tmp t))))
+
+(defun org-ai-skills-e2e--run-bdd-file (bdd-file)
+  "Parse and run one BDD org file. Return plist result."
+  ;; Preview contract only:
+  ;; (:name "BDD 001" :status pass|fail :assertions (...) :artifacts (...))
+  (org-ai-skills-bdd-run-file bdd-file org-ai-skills-e2e-profile))
+
+(ert-deftest org-ai-skills-e2e-bdd-001-rewrite-subtree ()
+  "End-to-end scenario: rewrite subtree with preserved heading."
+  (org-ai-skills-e2e--with-isolated-runtime
+   (lambda ()
+     (let* ((result (org-ai-skills-e2e--run-bdd-file
+                     "tests/bdd/001-rewrite-subtree.org"))
+            (status (plist-get result :status)))
+       (should (eq status 'pass))
+       (should (member "heading-preserved" (plist-get result :assertions)))
+       (should (member "body-updated" (plist-get result :assertions)))))))
+#+end_src
+
+* Worklog
+- 2026-02-23 :: PRD drafted for behavior-driven E2E testing with multi-worktree Codex orchestration and isolated Emacs runtime. Test status: not run.
+- 2026-02-23 :: Incorporated product decisions from user answers and added concrete previews for BDD org-case format plus E2E test script contract in PRD. Test status: not run.
+- 2026-02-23 :: Implemented phase-1 BDD/E2E vertical slice: added Org BDD parser/runner APIs, isolated runtime + model profile controls, deterministic stub provider path, first twitter-shortening BDD scenario/fixtures, ERT parser test, E2E scenario test, and dedicated tests/e2e entry. Updated README with execution commands. Test status: pass (2 targeted BDD tests + 1 dedicated E2E test in batch mode).
+- 2026-02-23 :: Migrated first BDD scenario to inline fixture sections inside the same org file (=* Fixture Input= and =* Stub Response=), enhanced runner to read fixture sections as subtree bodies (with optional legacy file-path fallback), removed external fixture files, and revalidated tests. Test status: pass (2 targeted BDD tests + 1 dedicated E2E test in batch mode).
+- 2026-02-23 :: Aligned BDD/E2E design to live-call intent: removed BDD stub-dispatch path, set provider mode expectation to =live=, added async wait+timeout for rewrite completion, extracted usage/model from debug events, and kept fixture input inline in scenario file. ERT BDD/E2E integration tests are now opt-in via =ORG_AI_SKILLS_BDD_LIVE=1 to avoid breaking offline unit runs. Test status: pass (parser/unit subset); live suite not run in this environment.
+- 2026-02-23 :: Added explicit live gptel setup path for BDD/E2E: runner now preflights gptel + gptel-curl availability and supports pluggable setup via =org-ai-skills-bdd-live-setup-function=. Live tests now load init from =ORG_AI_SKILLS_E2E_INIT_FILE= and skip with clear guidance when missing. Added starter template =tests/e2e/e2e-gptel-init.example.el=. Test status: pass (offline subset with expected live skips); full live run depends on user credentials/network.
+- 2026-02-23 :: Simplified live E2E workflow to no flags: added direct entry files =test/e2e-init.el= (gptel init) and =test/e2e-tests.el= (live BDD tests) so runs use one command with explicit init file loading under =emacs -Q --batch=. Updated README to make this the primary path. Test status: pass (offline subset); full live run still depends on valid provider config in =test/e2e-init.el=.
+- 2026-02-23 :: Commit-readiness cleanup: removed legacy env-gated E2E flow/files under =tests/e2e/= and removed corresponding live-gated test from =tests/org-ai-skills-test.el= to keep one E2E path (=test/e2e-init.el= + =test/e2e-tests.el=). Hardened security by removing forced gptel debug logging and dropping token extraction from raw transport logs. Added reusable BDD template =tests/bdd/000-template.org=. Test status: pass (unit subset + live first-case E2E in network-enabled run).
+- 2026-02-23 :: Extended BDD parser/template support for scenario property drawers: parser now returns =:scenario-properties=, template shows scenario + fixture drawer examples, and ERT coverage added for scenario property extraction. README updated to document drawer usage. Test status: pass (targeted parser tests).
+- 2026-02-23 :: Consolidated E2E entry script location by moving =test/e2e-init.el= and =test/e2e-tests.el= into =tests/=, and updated command/docs/comments accordingly to reduce folder duplication. Test status: pass (batch load check with new paths).

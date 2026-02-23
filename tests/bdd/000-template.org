@@ -1,0 +1,38 @@
+#+TITLE: BDD XXX - Short scenario title
+
+* Feature
+Describe user-visible behavior in one sentence.
+
+* Scenario: Describe one behavior outcome
+ :PROPERTIES:
+ :SCENARIO_ID: bdd-xxx
+ :PRIORITY: p2
+ :END:
+Given target heading "Your Heading"
+And skill id "simplify-twitter"
+And instruction "Describe the rewrite intent in natural language."
+And model "meta-llama/llama-3.2-3b-instruct"
+And provider mode "live"
+When user runs command "org-ai-skills-org-rewrite-subtree"
+Then run status should be "applied"
+And heading should remain "Your Heading"
+And slot text should be shorter than fixture input
+And debug log should contain "meta-llama/llama-3.2-3b-instruct"
+And dag info should contain "Execution DAG"
+And dag info should contain "rewrite"
+And effective model should be "meta-llama/llama-3.2-3b-instruct"
+
+* Fixture Input
+** Your Heading
+ :PROPERTIES:
+ :PURPOSE: Optional purpose metadata for retention tests
+ :SOURCE_FILE_PATH: ./optional/source/path.org
+ :CUSTOM_FLAG: keep-me
+ :END:
+Put original input content here.
+
+** Optional Child Heading
+ :PROPERTIES:
+ :CUSTOM_CHILD: child-meta
+ :END:
+ Optional child content for nested subtree/property retention tests.

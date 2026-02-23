@@ -75,6 +75,34 @@ To run tests:
 
 All new features must include tests.
 
+** BDD + E2E (Phase 1)
+
+Phase 1 adds Org-based BDD scenarios under =tests/bdd/= and a live E2E runner that executes real gptel calls in isolated runtime state.
+
+- Scenario file example:
+  - =tests/bdd/000-template.org=
+  - =tests/bdd/001-twitter-shorten-subtree.org=
+- Scenario file keeps fixture data inline via sections:
+  - =* Fixture Input=
+- Scenario and fixture headings can include Org property drawers for richer cases.
+- Optional fallback remains supported:
+  - Given =fixture file "..."=
+
+Simple live E2E command:
+
+#+begin_example
+emacs -Q --batch \
+  -l tests/e2e-init.el \
+  -l tests/e2e-tests.el \
+  -f ert-run-tests-batch-and-exit
+#+end_example
+
+Put your gptel backend/api-key/model init in:
+- =tests/e2e-init.el=
+
+Default E2E model profile:
+- =meta-llama/llama-3.2-3b-instruct=
+
 * Usage (Initial Version)
 
 Add to init.el:
