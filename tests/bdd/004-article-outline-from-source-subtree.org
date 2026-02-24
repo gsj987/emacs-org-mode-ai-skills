@@ -1,0 +1,24 @@
+#+TITLE: BDD 004 - Rewrite subtree with Article Outline From Source
+
+* Feature
+As a user, I can run =article-outline-from-source= to produce an outline-oriented subtree.
+
+* Scenario: Produce outline-oriented rewrite with stable runtime checks
+Given target heading "AI Adoption Notes"
+And fixture source is "inline section: Fixture Input"
+And skill id "article-outline-from-source"
+And instruction "Rewrite this subtree into an article outline with logical section headings and PURPOSE-focused organization."
+And model "qwen/qwen3-8b"
+And provider mode "live"
+When user runs command "org-ai-skills-org-rewrite-subtree"
+Then run status should be "applied"
+And heading should remain "AI Adoption Notes"
+And debug log should contain "qwen/qwen3-8b"
+And dag info should contain "Execution DAG"
+And dag info should contain "rewrite"
+And effective model should be "qwen/qwen3-8b"
+
+* Fixture Input
+** AI Adoption Notes
+Teams want productivity gains from AI but worry about governance and model drift.
+Need a structure before drafting the full article.

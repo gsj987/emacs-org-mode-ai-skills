@@ -1,0 +1,25 @@
+#+TITLE: BDD 002 - Rewrite subtree with Generate Structured Notes
+
+* Feature
+As a user, I can run =gen-notes= to expand terse notes into a fuller structured subtree.
+
+* Scenario: Expand terse notes with stable runtime checks
+Given target heading "Sprint Notes"
+And fixture source is "inline section: Fixture Input"
+And skill id "gen-notes"
+And instruction "Rewrite this subtree into detailed structured notes with meaningful paragraph content under clear headings."
+And model "qwen/qwen3-8b"
+And provider mode "live"
+When user runs command "org-ai-skills-org-rewrite-subtree"
+Then run status should be "applied"
+And heading should remain "Sprint Notes"
+And debug log should contain "qwen/qwen3-8b"
+And dag info should contain "Execution DAG"
+And dag info should contain "rewrite"
+And effective model should be "qwen/qwen3-8b"
+
+* Fixture Input
+** Sprint Notes
+Need better onboarding docs.
+Fix flaky tests.
+Clarify release checklist.

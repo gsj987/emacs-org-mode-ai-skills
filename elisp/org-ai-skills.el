@@ -28,6 +28,7 @@
 (defvar gptel-max-tokens nil)
 (defvar gptel-tools nil)
 (defvar gptel-use-tools nil)
+(defvar gptel--request-params nil)
 
 (defgroup org-ai-skills nil
   "Experimental cognitive runtime for Org-based AI skills."
@@ -177,6 +178,11 @@ When nil, interactive flow asks user to select a candidate explicitly."
   :type 'boolean
   :group 'org-ai-skills)
 
+(defcustom org-ai-skills-enable-skill-function-calls t
+  "When non-nil, expose skill-defined function calls on execution requests."
+  :type 'boolean
+  :group 'org-ai-skills)
+
 (defun org-ai-skills--default-core-provider-allowed-paths ()
   "Return nil-safe default allowed root list for core provider commands."
   (let* ((anchor (or load-file-name
@@ -220,6 +226,14 @@ When nil, execution requests use gptel default model selection."
   :type '(choice (const :tag "Use gptel default model" nil)
                  (string :tag "Model id")
                  (symbol :tag "Model symbol"))
+  :group 'org-ai-skills)
+
+(defcustom org-ai-skills-gptel-request-params nil
+  "Extra gptel request parameters merged into each dispatch request.
+Useful for provider-specific routing controls (for example OpenRouter
+`provider.require_parameters` for tool-call-capable endpoints)."
+  :type '(choice (const :tag "None" nil)
+                 (plist :tag "Request params plist"))
   :group 'org-ai-skills)
 
 (defcustom org-ai-skills-planner-temperature 0.0
@@ -2508,6 +2522,19 @@ OPTIONS is a plist; CALLBACK receives final run-state."
         (goto-char (point-max))
         (insert entry)))))
 
+(defun org-ai-skills--gptel-info-summary-for-debug (info)
+  "Return sanitized debug summary plist from gptel callback INFO."
+  (when (listp info)
+    (list :http-status (plist-get info :http-status)
+          :status (plist-get info :status)
+          :error (plist-get info :error)
+          :stop-reason (plist-get info :stop-reason)
+          :tool-success (plist-get info :tool-success)
+          :input-tokens (plist-get info :input-tokens)
+          :output-tokens (plist-get info :output-tokens)
+          :total-tokens (plist-get info :total-tokens)
+          :gptel-tool-names (plist-get info :gptel-tool-names))))
+
 (defun org-ai-skills--default-debug-log-level (event-type)
   "Return default log level symbol for EVENT-TYPE."
   (pcase event-type
@@ -2846,6 +2873,14 @@ Keep valid non-indented drawers intact."
 
 (defun org-ai-skills--merge-rewrite-constraints (base override)
   "Merge BASE and OVERRIDE rewrite constraints plists."
+  (let ((result (copy-sequence (or base nil))))
+    (while override
+      (setq result (plist-put result (car override) (cadr override)))
+      (setq override (cddr override)))
+    result))
+
+(defun org-ai-skills--merge-plists (base override)
+  "Merge OVERRIDE plist keys into BASE plist and return merged plist."
   (let ((result (copy-sequence (or base nil))))
     (while override
       (setq result (plist-put result (car override) (cadr override)))
@@ -5137,10 +5172,11 @@ When ROLE is `planner', return nil because planner must not use tools."
           (setq calls (append calls org-ai-skills--core-read-function-calls)))
         (when org-ai-skills-enable-core-provider-tools
           (setq calls (append calls org-ai-skills--core-provider-function-calls)))
-        (when skill-context
-          (setq calls (append calls (or (plist-get skill-context :function-calls) nil))))
-        (dolist (ctx skill-contexts)
-          (setq calls (append calls (or (plist-get ctx :function-calls) nil))))
+        (when org-ai-skills-enable-skill-function-calls
+          (when skill-context
+            (setq calls (append calls (or (plist-get skill-context :function-calls) nil))))
+          (dolist (ctx skill-contexts)
+            (setq calls (append calls (or (plist-get ctx :function-calls) nil)))))
         (cl-remove-duplicates
          calls
          :test (lambda (a b)
@@ -5290,7 +5326,8 @@ When ROLE is `planner', return nil because planner must not use tools."
                          :skill-ids (plist-get request :skill-ids)
                          :prompt "gptel request data payload"
                          :gptel-data (plist-get info :data)
-                         :gptel-info info
+                         :gptel-info-summary
+                         (org-ai-skills--gptel-info-summary-for-debug info)
                          :gptel-tool-names tool-names))))
               (when (and (consp first) (memq (car first) '(tool-call tool-result)))
                 (org-ai-skills--append-debug-entry
@@ -5324,6 +5361,10 @@ When ROLE is `planner', return nil because planner must not use tools."
     (let ((org-ai-skills--core-provider-context-directory working-directory)
           (gptel-tools tools)
           (gptel-use-tools (and tools t))
+          (gptel--request-params
+           (org-ai-skills--merge-plists
+            gptel--request-params
+            org-ai-skills-gptel-request-params))
           (gptel-model (or effective-model gptel-model))
           (gptel-temperature (or (plist-get generation-settings :temperature)
                                  gptel-temperature))
@@ -5463,59 +5504,67 @@ When TARGET is nil, resolve current subtree."
                            "tool-error"
                            (error-message-string err)))))
                      (when raw
-                       (if (org-ai-skills--ui-stop-requested-p run-id)
-                           (org-ai-skills--ui-set-status 'canceled "canceled")
-                         (let* ((rewritten (org-ai-skills--sanitize-rewrite-output raw slot))
-                                (candidate nil)
-                                (apply-target
-                                 (or (org-ai-skills--resolve-subtree-from-slot slot buffer)
-                                     (and (markerp begin)
-                                          (marker-buffer begin)
-                                          (markerp end)
-                                          (marker-buffer end)
-                                          (list :begin begin
-                                                :end end
-                                                :context-mode (plist-get slot :context-mode))))))
-                           (setq rewritten
-                                 (org-ai-skills--enforce-rewrite-constraints
-                                  rewritten slot effective-constraints))
-                           (setq candidate
-                                 (org-ai-skills--record-generated-candidate
-                                  slot
-                                  (or (plist-get request :goal) "rewrite")
-                                  "rewrite"
-                                  (plist-get request :prompt)
-                                  rewritten))
-                           (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
-                             (org-ai-skills--ui-run-set :selected-candidate candidate))
-                           (with-current-buffer buffer
-                             (if apply-target
-                                 (if org-ai-skills-auto-apply-generated-candidate
-                                     (progn
-                                       (org-ai-skills-org-apply-candidate-to-subtree
-                                        apply-target
-                                        candidate)
-                                       (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
-                                         (org-ai-skills--ui-clear-overlay)
-                                         (org-ai-skills--ui-set-status 'applied "applied")))
-                                   (if interactive-run
-                                       (let ((selected (org-ai-skills--read-slot-candidate
-                                                        (plist-get slot :slot-key) t)))
-                                         (when selected
+                       (condition-case err
+                           (if (org-ai-skills--ui-stop-requested-p run-id)
+                               (org-ai-skills--ui-set-status 'canceled "canceled")
+                             (let* ((rewritten (org-ai-skills--sanitize-rewrite-output raw slot))
+                                    (candidate nil)
+                                    (apply-target
+                                     (or (org-ai-skills--resolve-subtree-from-slot slot buffer)
+                                         (and (markerp begin)
+                                              (marker-buffer begin)
+                                              (markerp end)
+                                              (marker-buffer end)
+                                              (list :begin begin
+                                                    :end end
+                                                    :context-mode (plist-get slot :context-mode))))))
+                               (setq rewritten
+                                     (org-ai-skills--enforce-rewrite-constraints
+                                      rewritten slot effective-constraints))
+                               (setq candidate
+                                     (org-ai-skills--record-generated-candidate
+                                      slot
+                                      (or (plist-get request :goal) "rewrite")
+                                      "rewrite"
+                                      (plist-get request :prompt)
+                                      rewritten))
+                               (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                                 (org-ai-skills--ui-run-set :selected-candidate candidate))
+                               (with-current-buffer buffer
+                                 (if apply-target
+                                     (if org-ai-skills-auto-apply-generated-candidate
+                                         (progn
                                            (org-ai-skills-org-apply-candidate-to-subtree
                                             apply-target
-                                            selected))
+                                            candidate)
+                                           (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                                             (org-ai-skills--ui-clear-overlay)
+                                             (org-ai-skills--ui-set-status 'applied "applied")))
+                                       (if interactive-run
+                                           (let ((selected (org-ai-skills--read-slot-candidate
+                                                            (plist-get slot :slot-key) t)))
+                                             (when selected
+                                               (org-ai-skills-org-apply-candidate-to-subtree
+                                                apply-target
+                                                selected))
+                                             (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                                               (org-ai-skills--ui-set-overlay 'ready)
+                                               (org-ai-skills--ui-set-status 'ready "candidate-ready")))
                                          (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
                                            (org-ai-skills--ui-set-overlay 'ready)
-                                           (org-ai-skills--ui-set-status 'ready "candidate-ready")))
-                                     (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
-                                       (org-ai-skills--ui-set-overlay 'ready)
-                                       (org-ai-skills--ui-set-status 'ready "candidate-ready"))))
-                               (message "org-ai-skills candidate saved for: %s"
-                                        (plist-get slot :heading))
-                               (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
-                                 (org-ai-skills--ui-set-overlay 'ready)
-                                 (org-ai-skills--ui-set-status 'ready "candidate-ready"))))))))
+                                           (org-ai-skills--ui-set-status 'ready "candidate-ready"))))
+                                   (message "org-ai-skills candidate saved for: %s"
+                                            (plist-get slot :heading))
+                                   (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                                     (org-ai-skills--ui-set-overlay 'ready)
+                                     (org-ai-skills--ui-set-status 'ready "candidate-ready"))))))
+                         (error
+                          (setq failed t)
+                          (when (equal (org-ai-skills--ui-run-get :run-id) run-id)
+                            (org-ai-skills--ui-clear-overlay)
+                            (org-ai-skills--ui-set-failure
+                             "rewrite-apply-failed"
+                             (error-message-string err))))))))
                (org-ai-skills-exclude-skill-function-calls skill)))))
           (setq dispatched t))
       (unless dispatched
@@ -5524,7 +5573,7 @@ When TARGET is nil, resolve current subtree."
           (org-ai-skills--ui-set-failure
            "dispatch-failed"
            "Failed to dispatch rewrite request to gptel"))
-        (org-ai-skills-exclude-skill-function-calls skill)))))
+        (org-ai-skills-exclude-skill-function-calls skill))))
 
 (defun org-ai-skills-org-rewrite-subtree-strict
     (target skill &optional instruction interactive-origin)

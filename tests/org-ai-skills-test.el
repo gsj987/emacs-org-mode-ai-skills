@@ -3379,4 +3379,45 @@
     (should (equal "bdd-xxx" (cdr (assoc "SCENARIO_ID" props))))
     (should (equal "p2" (cdr (assoc "PRIORITY" props))))))
 
+(ert-deftest org-ai-skills-bdd-scenarios-cover-all-current-skills ()
+  "BDD scenarios should include at least one case for every current skill id."
+  (let* ((skill-files
+          (directory-files (expand-file-name "skills" org-ai-skills-test--project-root)
+                           t "\\.org\\'"))
+         (scenario-files
+          (directory-files (expand-file-name "tests/bdd" org-ai-skills-test--project-root)
+                           t "^[0-9][0-9][0-9]-.*\\.org\\'"))
+         (skill-ids
+          (sort
+           (delete-dups
+            (mapcar (lambda (file)
+                      (plist-get (org-ai-skills-parse-skill-file file) :skill-id))
+                    skill-files))
+           #'string<))
+         (scenario-skill-ids
+          (sort
+           (delete-dups
+            (delq
+             nil
+             (mapcar
+              (lambda (file)
+                (let* ((scenario (org-ai-skills-bdd-parse-file file))
+                       (steps (plist-get scenario :steps))
+                       (skill-step (seq-find
+                                    (lambda (step)
+                                      (and (eq (plist-get step :phase) 'given)
+                                           (string-match
+                                            "^skill id \"\\([^\"]+\\)\"$"
+                                            (plist-get step :text))))
+                                    steps)))
+                  (and skill-step
+                       (string-match
+                        "^skill id \"\\([^\"]+\\)\"$"
+                        (plist-get skill-step :text))
+                       (match-string 1 (plist-get skill-step :text)))))
+              scenario-files)))
+           #'string<)))
+    (dolist (skill-id skill-ids)
+      (should (member skill-id scenario-skill-ids)))))
+
 ;;; org-ai-skills-test.el ends here

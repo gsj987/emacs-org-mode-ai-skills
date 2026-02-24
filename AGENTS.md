@@ -47,7 +47,8 @@ Do not write code before PRD exists.
 
 ### Step 3 — Write Tests
 
-- Add ERT tests in `tests/`
+- Add ERT tests in `tests/org-ai-skills-test.el`
+- Add BDD scenario tests in `tests/bdd/` following `tests/bdd/000-template.org`
 - Cover core logic
 - Include failure scenarios
 
@@ -59,6 +60,7 @@ Ensure tests pass.
 If tests fail:
 - Fix implementation
 - Do not remove tests unless justified in PRD
+- Do not mark feature complete until all relevant test suites pass (ERT + BDD/E2E when applicable)
 
 
 ### Step 5 — Documentation Update
@@ -94,8 +96,8 @@ Before finishing a task, verify:
 
 - PRD exists
 - Code matches PRD
-- Tests exist
-- Tests pass
+- Tests exist in both `tests/org-ai-skills-test.el` and `tests/bdd/` (for new feature behavior)
+- Tests pass (all relevant ERT and BDD/E2E cases)
 - README updated if needed
 - Worklog updated
 

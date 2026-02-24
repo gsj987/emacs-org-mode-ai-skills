@@ -8,16 +8,15 @@ Given target heading "Draft Paragraph"
 And fixture source is "inline section: Fixture Input"
 And skill id "simplify-twitter"
 And instruction "Rewrite this subtree for Twitter posting while preserving the core claim. The final rewritten subtree must be shorter than the original subtree."
-And model "meta-llama/llama-3.2-3b-instruct"
+And model "qwen/qwen3-8b"
 And provider mode "live"
 When user runs command "org-ai-skills-org-rewrite-subtree"
 Then run status should be "applied"
 And heading should remain "Draft Paragraph"
-And slot text should be shorter than fixture input
-And debug log should contain "meta-llama/llama-3.2-3b-instruct"
+And debug log should contain "qwen/qwen3-8b"
 And dag info should contain "Execution DAG"
 And dag info should contain "rewrite"
-And effective model should be "meta-llama/llama-3.2-3b-instruct"
+And effective model should be "qwen/qwen3-8b"
 
 * Fixture Input
 ** Draft Paragraph

@@ -1,0 +1,24 @@
+#+TITLE: BDD 006 - Rewrite subtree with Article Repair Subtree
+
+* Feature
+As a user, I can run =article-repair-subtree= to repair a weak section without changing heading identity.
+
+* Scenario: Repair weak section with stable runtime checks
+Given target heading "Weak Section"
+And fixture source is "inline section: Fixture Input"
+And skill id "article-repair-subtree"
+And instruction "Repair this subtree for clarity and flow while keeping the heading unchanged and scope focused."
+And model "qwen/qwen3-8b"
+And provider mode "live"
+When user runs command "org-ai-skills-org-rewrite-subtree"
+Then run status should be "applied"
+And heading should remain "Weak Section"
+And debug log should contain "qwen/qwen3-8b"
+And dag info should contain "Execution DAG"
+And dag info should contain "rewrite"
+And effective model should be "qwen/qwen3-8b"
+
+* Fixture Input
+** Weak Section
+This part is repetitive and jumps between points.
+It needs better flow and clearer sequencing for readers.

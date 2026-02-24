@@ -1,0 +1,24 @@
+#+TITLE: BDD 007 - Rewrite subtree with Article Polish Editorial
+
+* Feature
+As a user, I can run =article-polish-editorial= to standardize tone and wording.
+
+* Scenario: Polish editorial quality with stable runtime checks
+Given target heading "Editorial Pass"
+And fixture source is "inline section: Fixture Input"
+And skill id "article-polish-editorial"
+And instruction "Rewrite this subtree with a consistent editorial tone and smoother transitions while preserving meaning."
+And model "qwen/qwen3-8b"
+And provider mode "live"
+When user runs command "org-ai-skills-org-rewrite-subtree"
+Then run status should be "applied"
+And heading should remain "Editorial Pass"
+And debug log should contain "qwen/qwen3-8b"
+And dag info should contain "Execution DAG"
+And dag info should contain "rewrite"
+And effective model should be "qwen/qwen3-8b"
+
+* Fixture Input
+** Editorial Pass
+The article alternates between formal and casual wording.
+Sections feel disconnected and transitions are abrupt.

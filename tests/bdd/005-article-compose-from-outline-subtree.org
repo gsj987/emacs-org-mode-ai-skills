@@ -1,0 +1,24 @@
+#+TITLE: BDD 005 - Rewrite subtree with Article Compose From Outline
+
+* Feature
+As a user, I can run =article-compose-from-outline= to expand outline points into draft prose.
+
+* Scenario: Expand outline into draft-like rewrite with stable runtime checks
+Given target heading "Draft From Outline"
+And fixture source is "inline section: Fixture Input"
+And skill id "article-compose-from-outline"
+And instruction "Rewrite this subtree into a fuller article draft. Keep the exact heading line unchanged as \"** Draft From Outline\" and only improve body content under it."
+And model "qwen/qwen3-8b"
+And provider mode "live"
+When user runs command "org-ai-skills-org-rewrite-subtree"
+Then run status should be "applied"
+And heading should remain "Draft From Outline"
+And debug log should contain "qwen/qwen3-8b"
+And dag info should contain "Execution DAG"
+And dag info should contain "rewrite"
+And effective model should be "qwen/qwen3-8b"
+
+* Fixture Input
+** Draft From Outline
+This approved outline needs expansion into a coherent article draft.
+Keep the heading stable and provide richer paragraph-level content.

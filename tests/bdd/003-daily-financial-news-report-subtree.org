@@ -1,0 +1,25 @@
+#+TITLE: BDD 003 - Rewrite subtree with Daily Financial News Report
+
+* Feature
+As a user, I can run =fin-news-daily-report= to format a daily financial report subtree.
+
+* Scenario: Generate daily financial report shaped output with stable runtime checks
+Given target heading "Daily Market Brief"
+And fixture source is "inline section: Fixture Input"
+And skill id "fin-news-daily-report"
+And instruction "Rewrite this subtree into a concise daily financial news report in Org format with a clear date heading, short intro, and bullet highlights."
+And model "qwen/qwen3-8b"
+And provider mode "live"
+When user runs command "org-ai-skills-org-rewrite-subtree"
+Then run status should be "applied"
+And heading should remain "Daily Market Brief"
+And debug log should contain "qwen/qwen3-8b"
+And dag info should contain "Execution DAG"
+And dag info should contain "rewrite"
+And effective model should be "qwen/qwen3-8b"
+
+* Fixture Input
+** Daily Market Brief
+US equities closed mixed.
+Treasury yields moved higher after policy comments.
+Oil and gold diverged on macro risk sentiment.
