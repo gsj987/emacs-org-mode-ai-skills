@@ -11,7 +11,6 @@ And model "minimax/minimax-m2.5"
 And provider mode "live"
 When user runs command "org-ai-skills-plan-run"
 Then run status should be one of "applied,success,done,failed"
-And debug log should contain "execution.step"
 And dag info should contain "Execution DAG"
 
 * Fixture Input

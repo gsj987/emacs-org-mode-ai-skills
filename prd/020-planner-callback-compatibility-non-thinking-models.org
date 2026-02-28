@@ -14,6 +14,8 @@ Planner runs can appear frozen when provider/model callback shape does not deliv
     - terminal completion marker with payload in callback info data
   - Add regression ERT coverage for completion-marker paths.
   - Add one BDD scenario documenting planner compatibility expectation.
+  - Make planner BDD scenarios executable by the shared BDD runner (not rewrite-only).
+  - Add live E2E entries so planner BDD scenarios are actually executed in =tests/e2e-tests.el=.
   - Update README behavior notes for planner callback handling.
 - Out of scope:
   - Changing planner prompt contract or schema.
@@ -79,6 +81,10 @@ Planner runs can appear frozen when provider/model callback shape does not deliv
 - [X] Add ERT regressions for function-call error string detection and fail-fast propagation.
 - [X] Clean up temporary deep-debug instrumentation and keep essential observability controls only.
 - [X] Add explicit observability verbosity flags for debug payload size/level control.
+- [X] Extend =org-ai-skills-bdd-run-file= to support planner command scenarios (=org-ai-skills-plan-run=).
+- [X] Add assertion support for planner BDD status grammar (=run status should be one of "...")=.
+- [X] Add planner BDD scenarios (=008..011=) to live E2E test entry file.
+- [X] Run BDD parser tests and live E2E suite after planner BDD wiring, then record status.
 
 * Worklog
 - 2026-02-24 :: PRD created for planner callback compatibility fix. Test status: pending.
@@ -118,3 +124,4 @@ Planner runs can appear frozen when provider/model callback shape does not deliv
 - 2026-02-28 :: Fixed remaining ERT baseline failures in tool-surface default tests by binding feature flags explicitly in test scope (test environment init overrides these defaults to nil). Updated =org-ai-skills-core-read-tools-enabled-by-default= and =org-ai-skills-core-provider-tools-enabled-by-default= accordingly. Test status: full ERT batch pass (=206/206=).
 - 2026-02-28 :: Root-cause fix for false execution abort on recoverable tool-call failures: live logs showed one early =tool-result= with =function-call-error= followed by later successful =tool-result= payloads for the same tool in the same run. Runtime previously failed immediately on first error chunk. Updated callback handling to track pending tool errors per tool and clear them when a later successful result for that tool arrives; execution/rewrite now fail only if unresolved tool errors remain when producing final output. Added ERT regression =org-ai-skills-execute-plan-step-allows-recovered-tool-result-after-error=. Test status: full ERT batch pass (=207/207=).
 - 2026-02-28 :: Root-cause fix for residual "no response buffer" failures despite later successful =tool-result=: pending-error map keys were inconsistent (symbol vs string tool names) across callback shapes, so recovery result could not clear earlier error for the same tool. Normalized tool names to stable strings in =org-ai-skills--tool-name-from-result-item= and added regression =org-ai-skills-tool-name-from-result-item-normalizes-symbol-and-string=. Test status: targeted pass (new regression 1/1).
+- 2026-02-28 :: Closed planner-BDD execution gap: extended =org-ai-skills-bdd-run-file= to support =org-ai-skills-plan-run= scenarios (planner task capture, planner DAG rendering), added BDD assertion grammar =run status should be one of "..."=, and added ERT regression coverage for both. Wired planner BDD files =008..011= into live =tests/e2e-tests.el=. Updated planner BDD scenario assertions to focus on completion/non-freeze signals and removed strict schema assertion from 008 for current provider compatibility. README updated with planner BDD scenario list and planner E2E lane note. Test status: pass (=org-ai-skills-bdd-= 5/5); live E2E =11/12= pass with planner lane passing (=008..011=), one unrelated existing failure remains (=org-ai-skills-e2e-live-bdd-005-article-compose-from-outline=, status expected=applied actual=failed).

@@ -83,6 +83,30 @@
   (org-ai-skills-e2e-test--run-bdd
    "tests/bdd/007-article-polish-editorial-subtree.org"))
 
+(ert-deftest org-ai-skills-e2e-live-bdd-008-planner-terminal-callback-compatibility ()
+  "Run BDD 008 via live gptel call."
+  (let ((org-ai-skills-planner-schema-mode 'off))
+    (org-ai-skills-e2e-test--run-bdd
+     "tests/bdd/008-planner-terminal-callback-compatibility.org")))
+
+(ert-deftest org-ai-skills-e2e-live-bdd-009-planner-multiline-json-parse ()
+  "Run BDD 009 via live gptel call."
+  (let ((org-ai-skills-planner-schema-mode 'off))
+    (org-ai-skills-e2e-test--run-bdd
+     "tests/bdd/009-planner-multiline-json-parse.org")))
+
+(ert-deftest org-ai-skills-e2e-live-bdd-010-tool-call-buffer-lifecycle ()
+  "Run BDD 010 via live gptel call."
+  (let ((org-ai-skills-planner-schema-mode 'off))
+    (org-ai-skills-e2e-test--run-bdd
+     "tests/bdd/010-tool-call-buffer-lifecycle.org")))
+
+(ert-deftest org-ai-skills-e2e-live-bdd-011-execution-stall-fail-fast ()
+  "Run BDD 011 via live gptel call."
+  (let ((org-ai-skills-planner-schema-mode 'off))
+    (org-ai-skills-e2e-test--run-bdd
+     "tests/bdd/011-execution-stall-fail-fast.org")))
+
 (ert-deftest org-ai-skills-e2e-live-tool-call-financial-report ()
   "Verify live tool-calling path by requiring a tool event in BDD 003."
   (let ((org-ai-skills-enable-skill-function-calls t)

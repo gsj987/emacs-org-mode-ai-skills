@@ -4102,6 +4102,78 @@
     (should (equal "bdd-xxx" (cdr (assoc "SCENARIO_ID" props))))
     (should (equal "p2" (cdr (assoc "PRIORITY" props))))))
 
+(ert-deftest org-ai-skills-bdd-assertions-support-status-one-of ()
+  "BDD assertions should support `run status should be one of ...` grammar."
+  (let* ((steps (list (list :phase 'then
+                            :text "run status should be one of \"applied,success,done\"")))
+         (result (org-ai-skills-bdd--assertions-from-steps
+                  steps
+                  'applied
+                  "Heading"
+                  "* Heading\nBody"
+                  ""
+                  "Execution DAG"
+                  "qwen/qwen3-8b"
+                  "* Heading\nFixture"))
+         (passed (car result))
+         (failed (cdr result)))
+    (should (= (length passed) 1))
+    (should (null failed))))
+
+(ert-deftest org-ai-skills-bdd-run-file-supports-planner-command ()
+  "BDD runner should execute planner scenarios without requiring skill id."
+  (let* ((scenario-file (make-temp-file "org-ai-skills-bdd-planner-" nil ".org"))
+         (scenario
+          (concat
+           "#+TITLE: Planner BDD test\n\n"
+           "* Scenario: planner command path\n"
+           "Given target heading \"Planner Target\"\n"
+           "And fixture source is \"inline section: Fixture Input\"\n"
+           "And planner task \"Plan this subtree\"\n"
+           "And model \"qwen/qwen3-8b\"\n"
+           "And provider mode \"live\"\n"
+           "When user runs command \"org-ai-skills-plan-run\"\n"
+           "Then run status should be one of \"applied,success,done\"\n"
+           "And dag info should contain \"planning.request\"\n"
+           "And debug log should contain \"planner\"\n\n"
+           "* Fixture Input\n"
+           "** Planner Target\n"
+           "Seed text.\n")))
+    (unwind-protect
+        (progn
+          (with-temp-file scenario-file
+            (insert scenario))
+          (cl-letf (((symbol-function 'org-ai-skills-bdd--ensure-live-environment)
+                     (lambda () t))
+                    ((symbol-function 'org-ai-skills--observability-now-ms)
+                     (lambda () 1000))
+                    ((symbol-function 'org-ai-skills-bdd--wait-for-run-completion)
+                     (lambda (_run-id _timeout) 'applied))
+                    ((symbol-function 'org-ai-skills-plan-run)
+                     (lambda (_target _task &optional _interactive-origin _preset-id)
+                       (setq org-ai-skills--ui-run-state
+                             (list :run-id "bdd-planner-run"
+                                   :status 'applied
+                                   :planner-run-state
+                                   (list :run-id "bdd-planner-run"
+                                         :active-plan (list (list :step-id "step-1"
+                                                                  :goal "plan"
+                                                                  :skills (list "fin-news-daily-report")
+                                                                  :input-from nil))
+                                         :events (list (list :stage-id 'planning.request
+                                                             :status 'success
+                                                             :duration-ms 12)
+                                                       (list :stage-id 'planning.parse
+                                                             :status 'success
+                                                             :duration-ms 8)))))
+                       (with-current-buffer (get-buffer-create org-ai-skills-debug-buffer-name)
+                         (goto-char (point-max))
+                         (insert "planner")))))
+            (let ((result (org-ai-skills-bdd-run-file scenario-file)))
+              (should (eq (plist-get result :status) 'pass))
+              (should (null (plist-get result :failures))))))
+      (delete-file scenario-file))))
+
 (ert-deftest org-ai-skills-bdd-scenarios-cover-all-current-skills ()
   "BDD scenarios should include at least one case for every current skill id."
   (let* ((skill-files

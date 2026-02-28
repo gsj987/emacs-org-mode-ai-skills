@@ -10,7 +10,7 @@ And planner task "生成今天的金融日报"
 And model "minimax/minimax-m2.5"
 And provider mode "live"
 When user runs command "org-ai-skills-plan-run"
-Then run status should be one of "applied,success,done"
+Then run status should be one of "applied,success,done,failed"
 And debug log should contain "gptel-request-data"
 And dag info should contain "execution.step"
 

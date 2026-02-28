@@ -88,6 +88,10 @@ Phase 1 adds Org-based BDD scenarios under =tests/bdd/= and a live E2E runner th
   - =tests/bdd/005-article-compose-from-outline-subtree.org=
   - =tests/bdd/006-article-repair-subtree.org=
   - =tests/bdd/007-article-polish-editorial-subtree.org=
+  - =tests/bdd/008-planner-terminal-callback-compatibility.org=
+  - =tests/bdd/009-planner-multiline-json-parse.org=
+  - =tests/bdd/010-tool-call-buffer-lifecycle.org=
+  - =tests/bdd/011-execution-stall-fail-fast.org=
 - Scenario file keeps fixture data inline via sections:
   - =* Fixture Input=
 - Scenario and fixture headings can include Org property drawers for richer cases.
@@ -124,6 +128,11 @@ Put your gptel backend/api-key/model init in:
 
 Default E2E model profile:
 - =qwen/qwen3-8b=
+
+Planner BDD E2E lane (=008..011=):
+- Uses the same live OpenRouter path and binds planner schema mode to =off=
+  in =tests/e2e-tests.el= to keep planner callback behavior coverage stable
+  on current provider routes.
 
 * Usage (Initial Version)
 

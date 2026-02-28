@@ -6470,6 +6470,19 @@ Returns final status symbol."
             (format "\nRun summary: rewrite -> %s\n"
                     (symbol-name (or status 'unknown))))))
 
+(defun org-ai-skills-bdd--build-planner-dag-text ()
+  "Render planner DAG text from current UI planner run state when available."
+  (let* ((planner-state (plist-get org-ai-skills--ui-run-state :planner-run-state))
+         (state (or planner-state org-ai-skills--ui-run-state))
+         (plan (or (plist-get state :active-plan)
+                   (plist-get state :latest-plan)
+                   nil))
+         (dag (org-ai-skills-build-execution-dag
+               state
+               plan
+               (and (plist-get state :events) t))))
+    (org-ai-skills-render-execution-dag-text dag)))
+
 (defun org-ai-skills-bdd--assertions-from-steps (steps status heading text debug dag model fixture-text)
   "Evaluate Then/And assertions from STEPS and return (PASSED . FAILED)."
   (let ((passed nil)
@@ -6484,6 +6497,13 @@ Returns final status symbol."
               (if (string= expected actual)
                   (push (format "status=%s" expected) passed)
                 (push (format "status expected=%s actual=%s" expected actual) failed))))
+           ((string-match "^run status should be one of \"\\([^\"]+\\)\"$" body)
+            (let* ((raw (match-string 1 body))
+                   (expected-list (split-string raw "," t "[[:space:]]+"))
+                   (actual (symbol-name (or status 'unknown))))
+              (if (member actual expected-list)
+                  (push (format "status in [%s]: %s" raw actual) passed)
+                (push (format "status expected one of [%s] actual=%s" raw actual) failed))))
            ((string-match "^slot text should contain \"\\([^\"]+\\)\"$" body)
             (let ((needle (match-string 1 body)))
               (if (string-match-p (regexp-quote needle) text)
@@ -6533,6 +6553,11 @@ PROFILE is a plist; :model overrides execution model."
   (let* ((scenario (org-ai-skills-bdd-parse-file file))
          (scenario-file (plist-get scenario :file))
          (steps (plist-get scenario :steps))
+         (command
+          (org-ai-skills-bdd--require-step-capture
+           steps 'when "^user runs command \"\\([^\"]+\\)\"$"
+           "when command"
+           scenario-file))
          (inline-fixture-text (org-ai-skills-bdd--section-body scenario-file "Fixture Input"))
          (fixture-path
           (org-ai-skills-bdd--step-capture
@@ -6541,12 +6566,18 @@ PROFILE is a plist; :model overrides execution model."
           (org-ai-skills-bdd--require-step-capture
            steps 'given "^target heading \"\\([^\"]+\\)\"$" "target heading" scenario-file))
          (skill-id
-          (org-ai-skills-bdd--require-step-capture
-           steps 'given "^skill id \"\\([^\"]+\\)\"$" "skill id" scenario-file))
+          (and (string= command "org-ai-skills-org-rewrite-subtree")
+               (org-ai-skills-bdd--require-step-capture
+                steps 'given "^skill id \"\\([^\"]+\\)\"$" "skill id" scenario-file)))
          (instruction
-          (or (org-ai-skills-bdd--step-capture
-               steps 'given "^instruction \"\\([^\"]+\\)\"$")
-              "Rewrite subtree"))
+          (and (string= command "org-ai-skills-org-rewrite-subtree")
+               (or (org-ai-skills-bdd--step-capture
+                    steps 'given "^instruction \"\\([^\"]+\\)\"$")
+                   "Rewrite subtree")))
+         (planner-task
+          (and (string= command "org-ai-skills-plan-run")
+               (org-ai-skills-bdd--require-step-capture
+                steps 'given "^planner task \"\\([^\"]+\\)\"$" "planner task" scenario-file)))
          (provider-mode
           (or (org-ai-skills-bdd--step-capture
                steps 'given "^provider mode \"\\([^\"]+\\)\"$")
@@ -6555,11 +6586,6 @@ PROFILE is a plist; :model overrides execution model."
           (or (plist-get profile :model)
               (org-ai-skills-bdd--step-capture steps 'given "^model \"\\([^\"]+\\)\"$")
               org-ai-skills-e2e-model-profile))
-         (command
-          (org-ai-skills-bdd--require-step-capture
-           steps 'when "^user runs command \"\\([^\"]+\\)\"$"
-           "when command"
-           scenario-file))
          (fixture-file (and fixture-path (expand-file-name fixture-path default-directory)))
          (fixture-text
           (or inline-fixture-text
@@ -6583,12 +6609,13 @@ PROFILE is a plist; :model overrides execution model."
          (debug-text "")
          (run-start-ms 0)
          (run-end-ms 0)
-         (skill (org-ai-skills-load-skill-by-id skill-id)))
+         (skill (and skill-id (org-ai-skills-load-skill-by-id skill-id))))
     (unless (string= provider-mode "live")
       (org-ai-skills--signal-parse-error
        scenario-file
        (format "Unsupported BDD provider mode: %s (expected: live)" provider-mode)))
-    (unless (string= command "org-ai-skills-org-rewrite-subtree")
+    (unless (member command '("org-ai-skills-org-rewrite-subtree"
+                              "org-ai-skills-plan-run"))
       (org-ai-skills--signal-parse-error
        scenario-file
        (format "Unsupported BDD command: %s" command)))
@@ -6601,6 +6628,7 @@ PROFILE is a plist; :model overrides execution model."
               (org-ai-skills--last-debug-entry nil)
               (org-ai-skills-auto-apply-generated-candidate t)
               (org-ai-skills-model-execution model)
+              (org-ai-skills-model-planner model)
               (org-ai-skills-e2e-think-mode nil))
           (with-temp-buffer
             (org-mode)
@@ -6609,7 +6637,11 @@ PROFILE is a plist; :model overrides execution model."
               (org-ai-skills-bdd--find-heading target-heading)
               (let ((target (org-ai-skills-org-resolve-subtree 'current)))
                 (setq run-start-ms (org-ai-skills--observability-now-ms))
-                (org-ai-skills-org-rewrite-subtree target skill instruction)
+                (pcase command
+                  ("org-ai-skills-org-rewrite-subtree"
+                   (org-ai-skills-org-rewrite-subtree target skill instruction))
+                  ("org-ai-skills-plan-run"
+                   (org-ai-skills-plan-run target planner-task nil nil)))
                 (setq run-id (plist-get org-ai-skills--ui-run-state :run-id))
                 (org-ai-skills-bdd--wait-for-run-completion
                  run-id
@@ -6624,13 +6656,15 @@ PROFILE is a plist; :model overrides execution model."
                 (setq effective-heading (or (match-string 1) ""))
                 (setq effective-text (buffer-string))
                 (setq dag-text
-                      (org-ai-skills-bdd--build-rewrite-dag-text
-                       status
-                       skill-id
-                       instruction
-                       effective-text
-                       (and run-start-ms run-end-ms (- run-end-ms run-start-ms))
-                       captured-usage)))))
+                      (if (string= command "org-ai-skills-org-rewrite-subtree")
+                          (org-ai-skills-bdd--build-rewrite-dag-text
+                           status
+                           skill-id
+                           instruction
+                           effective-text
+                           (and run-start-ms run-end-ms (- run-end-ms run-start-ms))
+                           captured-usage)
+                        (org-ai-skills-bdd--build-planner-dag-text))))))
           (when (get-buffer debug-buffer)
             (with-current-buffer debug-buffer
               (setq debug-text (buffer-string))))
