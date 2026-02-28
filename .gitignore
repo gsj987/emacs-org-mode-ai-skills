@@ -19,3 +19,20 @@ coverage/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Local env/secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+id_rsa
+id_ed25519
+
+# Local databases/state
+*.db
+*.sqlite
+*.sqlite3
