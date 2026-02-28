@@ -1,0 +1,28 @@
+#+TITLE: BDD 014 - Rewrite subtree with Outline Driven Long Report
+
+* Feature
+As a user, I can run =outline-driven-long-report= to expand an approved outline into a long-form report subtree.
+
+* Scenario: Expand outline into long-form report content with stable runtime checks
+Given target heading "Long Report Draft"
+And fixture source is "inline section: Fixture Input"
+And skill id "outline-driven-long-report"
+And instruction "Expand this outline into a long-form report, keep the exact heading line unchanged as \"** Long Report Draft\", and only enrich content under it."
+And model "qwen/qwen3-8b"
+And provider mode "live"
+When user runs command "org-ai-skills-org-rewrite-subtree"
+Then run status should be "applied"
+And heading should remain "Long Report Draft"
+And debug log should contain "qwen/qwen3-8b"
+And dag info should contain "Execution DAG"
+And dag info should contain "rewrite"
+And effective model should be "qwen/qwen3-8b"
+
+* Fixture Input
+** Long Report Draft
+*** Background
+**** Problem
+Outline-only note requiring expansion into complete prose.
+*** Approach
+**** Constraints
+Use section-scoped detail and preserve heading structure.

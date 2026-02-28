@@ -40,15 +40,23 @@ Long report generation from large code/context sources can trigger broad explora
   - Runtime observability shows progression by section so users can identify which section consumed time/cost.
 
 * Tasks
-- [ ] Create new skill spec file (org-mode) for outline-driven long report generation with clear inputs/outputs/contracts/requirements/steps/function-calls.
-- [ ] Define planner-facing guidance so section/headline-level decomposition is preferred for this workflow.
-- [ ] Add ERT tests for skill metadata parsing, request composition expectations, and plan normalization constraints.
-- [ ] Add BDD scenario(s) for end-to-end outline-to-long-report flow and core assertions.
-- [ ] Update README with usage instructions and recommended planner settings for long reports.
+- [X] Create new skill spec file (org-mode) for outline-driven long report generation with clear inputs/outputs/contracts/requirements/steps/function-calls.
+- [X] Define planner-facing guidance so section/headline-level decomposition is preferred for this workflow.
+- [X] Add ERT tests for skill metadata parsing, request composition expectations, and plan normalization constraints.
+- [X] Add BDD scenario(s) for end-to-end outline-to-long-report flow and core assertions.
+- [X] Update README with usage instructions and recommended planner settings for long reports.
 
 * Open Questions
 - Should planner decomposition be enforced strictly by parser/runtime rule for this skill, or kept as prompt-level guidance first?
 - Should section expansion order always follow outline order, or allow planner to reorder for dependency reasons?
 
+* Decisions
+- Planner decomposition for this workflow is prompt-level guidance first, with strict runtime output constraints reused from outline-compose (headline lock + property drawer omission).
+- Section expansion order follows outline order by default for deterministic report flow.
+
 * Worklog
 - 2026-02-28 :: PRD drafted for outline-driven long report skill and section-by-section planner orchestration. Test status: pending.
+- 2026-02-28 :: Implemented =skills/008-outline-driven-long-report.org=, extended outline-expansion runtime constraints to include new skill id, added planner prompt decomposition guidance, added ERT coverage for rewrite/step/planner constraints, added BDD scenario =tests/bdd/014-outline-driven-long-report-subtree.org= with E2E entry, and updated README usage/testing lists. Test status: pass (ERT batch).
+- 2026-02-28 :: Debugged and fixed execution-time timeout root cause exposed by live run logs: execution callback path now handles terminal metadata (`:stop-reason` / `:data :done`) consistently with planner path, consumes terminal text from callback info when present, and fails fast (non-timeout) when terminal metadata arrives without usable text. Added ERT regressions for both terminal-info success and terminal-no-text error paths. Test status: pass (220/220, batch ERT).
+- 2026-02-28 :: Debugged second timeout signature from live log (/tmp/debug.log): execution watchdog was absolute-duration based and could fire during active tool-callback streams. Converted to inactivity watchdog by re-arming timeout on every callback event. Added ERT regression =org-ai-skills-execute-plan-step-refreshes-timeout-on-callback-events=. Test status: pass (221/221, batch ERT).
+- 2026-02-28 :: Debugged third timeout signature from live log (/tmp/debug.log): execution step could finalize early on non-terminal plain text after tool callbacks, causing overlapping step streams and unstable run lifecycle. Added terminal gating for text finalization after tool events (accept text only on terminal callback for tool-flow runs), plus regression coverage for non-terminal text suppression. Test status: pass (222/222, batch ERT).

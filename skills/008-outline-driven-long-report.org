@@ -1,0 +1,52 @@
+* Skill: Outline Driven Long Report
+:PROPERTIES:
+:SKILL_ID: outline-driven-long-report
+:END:
+
+#+EFFECT: pure
+#+INVOCATION: manual
+#+CONTEXT: project
+#+DETERMINISM: heuristic
+
+** Description
+Expand an approved outline subtree into a long-form report section-by-section, preserving heading hierarchy and processing in outline order.
+
+** Inputs
+- approved-outline-subtree
+- optional-source-file-context
+
+** Outputs
+- expanded-org-report-subtree
+- substantial section bodies under each existing heading
+- output must be valid Org subtree text only
+
+** Contracts
+- preserve heading hierarchy, headline text, and outline order
+- expand one heading section at a time during execution planning
+- return only final Org artifact
+- preserve original task language unless explicitly overridden
+
+** Requirements
+- generate concrete long-form content for each section
+- do not emit heading-only output
+- keep style/terminology consistent across sections
+- use bounded, section-scoped reads for source grounding
+- do not perform broad/unbounded repository traversal
+
+** Function Calls
+- name: org-ai-skills-read-file
+  when: when a section needs grounded source context from an external file
+  args: (file_path max_chars)
+  file_path: absolute or project-relative path to source file
+  max_chars: optional max characters to read; default 20000
+- name: org-ai-skills-read-buffer
+  when: when a section needs bounded local context from current buffer
+  args: (start end)
+  start: optional start position for section-local reads
+  end: optional end position for section-local reads
+
+** Steps
+1. Parse outline structure and section intents from =:PURPOSE:= hints.
+2. Plan section expansion in outline order, using one heading section per execution step.
+3. Read only section-relevant source context (bounded reads).
+4. Draft section bodies under existing headings without modifying headline lines.

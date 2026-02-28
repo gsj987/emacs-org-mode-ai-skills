@@ -93,6 +93,7 @@ Phase 1 adds Org-based BDD scenarios under =tests/bdd/= and a live E2E runner th
   - =tests/bdd/010-tool-call-buffer-lifecycle.org=
   - =tests/bdd/011-execution-stall-fail-fast.org=
   - =tests/bdd/012-call-level-watchdog-and-dag-visibility.org=
+  - =tests/bdd/014-outline-driven-long-report-subtree.org=
 - Scenario file keeps fixture data inline via sections:
   - =* Fixture Input=
 - Scenario and fixture headings can include Org property drawers for richer cases.
@@ -258,6 +259,8 @@ Example skill set for composition testing:
   - Regenerates selected weak subtree while preserving surrounding scope.
 - =skills/007-article-polish-editorial.org=
   - Runs final editorial consistency pass for wording/tone.
+- =skills/008-outline-driven-long-report.org=
+  - Expands approved outlines into long-form reports with section-by-section guidance.
 
 Load gptel from straight checkout path if needed:
 
@@ -622,6 +625,9 @@ Article workflow recommendation:
   - Headline lines are treated as immutable (outline lock).
   - Property drawers in model output are stripped before apply.
   - Prompt context is compacted to outline summary to reduce prompt bloat.
+- Outline long-report defaults (=outline-driven-long-report=):
+  - Uses same strict outline lock and compact outline-summary context.
+  - Planner prompt prefers one heading section per step for bounded expansion.
 - Subtree apply ensures resulting headings have =:ID:= for rerun targeting.
 
 Core model:

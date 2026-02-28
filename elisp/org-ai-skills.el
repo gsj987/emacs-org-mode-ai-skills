@@ -842,6 +842,8 @@ This parser intentionally avoids extracting full context sections."
            (format "- max_skills_per_step: %d\n" org-ai-skills-planner-max-skills-per-step)
            (format "- batching_mode: %s\n\n"
                    (symbol-name org-ai-skills-planner-batching-mode))
+           "Outline-expansion planning rule:\n"
+           "- For outline-driven long reports, prefer multiple small steps and expand one heading section per step.\n\n"
            "Output minimization rules:\n"
            "- Use at most 3 candidates and 2 steps.\n"
            "- Keep why/goal/expected_output/composition_reason/condition very short.\n"
@@ -1806,8 +1808,7 @@ INSTRUCTION overrides the default rewrite goal."
                       "- Do not output any property drawer block.\n"
                     "")
                   "\n"
-                  (if (and (stringp skill-id)
-                           (string= skill-id org-ai-skills--compose-skill-id))
+                  (if (org-ai-skills--outline-expansion-skill-p skill-id)
                       "For composition, derive a concise summary internally first, then expand section-by-section.\n\n"
                     "")
                   "Rewrite the following Org subtree:\n\n"
@@ -2261,15 +2262,16 @@ Returns plist with keys:
          (subtree (plist-get run-state :subtree))
          (working-directory (or (plist-get run-state :working-directory)
                                 (org-ai-skills--resolve-working-directory subtree)))
-         (compose-step-p
+         (outline-expansion-step-p
           (seq-some (lambda (skill)
-                      (string= (plist-get skill :skill-id) org-ai-skills--compose-skill-id))
+                      (org-ai-skills--outline-expansion-skill-p
+                       (plist-get skill :skill-id)))
                     loaded-skills))
          (input-text (or (org-ai-skills--run-state-latest-output run-state)
                          (plist-get subtree :text)
                          ""))
          (effective-input
-          (if compose-step-p
+          (if outline-expansion-step-p
               (concat
                "Outline summary (compact context):\n"
                (org-ai-skills--compose-outline-summary input-text))
@@ -2319,7 +2321,7 @@ Returns plist with keys:
                    (or (plist-get subtree :source-file-path) ""))
            (format "Working directory hint: %s\n\n"
                    (or working-directory ""))
-           (if compose-step-p
+           (if outline-expansion-step-p
                (concat
                 "Strict compose constraints:\n"
                 "- Keep all headline lines unchanged at all levels.\n"
@@ -2372,6 +2374,7 @@ Only skills referenced by STEP are loaded from DIRECTORY."
          (failed nil)
          (done nil)
          (watchdog-timer nil)
+         (saw-tool-callback nil)
          (pending-tool-errors (make-hash-table :test 'equal))
          (tool-start-table (make-hash-table :test 'equal))
          (tool-call-counters (make-hash-table :test 'equal))
@@ -2500,7 +2503,7 @@ Only skills referenced by STEP are loaded from DIRECTORY."
                                 (or (plist-get b :start-ms) 0)))))
                     (next-state state))
                (dolist (record records)
-                 (setq next-state
+                (setq next-state
                        (org-ai-skills--run-state-append-timing-event
                         next-state
                         'tool.call
@@ -2564,36 +2567,54 @@ Only skills referenced by STEP are loaded from DIRECTORY."
              (lambda (&rest response)
                (unwind-protect
                    (unless (or failed done)
-                     (condition-case err
-                         (let* ((first (car response))
-                                (info (cadr response))
-                                (raw (apply #'org-ai-skills--extract-gptel-response-text-if-ready response))
-                                (non-text-event-p
-                                 (and (consp first)
-                                      (memq (car first) '(tool-call tool-result reasoning))))
-                                (terminal-signal
-                                 (or (eq first t)
-                                     (and (not non-text-event-p)
-                                          (org-ai-skills--gptel-callback-terminal-p info))))
-                                (progress-signal
-                                 (org-ai-skills--gptel-callback-progress-p first info raw)))
-                           (update-tool-timing-from-callback first)
-                           (org-ai-skills--update-pending-tool-errors first pending-tool-errors)
-                           (setq request
-                                 (plist-put
-                                  request
-                                  :provider-data
-                                  (org-ai-skills--select-provider-usage-source
+                     ;; Use an inactivity watchdog: any callback event refreshes timeout.
+                     (reset-watchdog)
+                    (condition-case err
+                        (let* ((raw (apply #'org-ai-skills--extract-gptel-response-text-if-ready response))
+                               (first (car response))
+                               (info (cadr response))
+                               (non-text-event-p
+                                (and (consp first)
+                                     (memq (car first) '(tool-call tool-result reasoning))))
+                               (terminal-signal
+                                (or (eq first t)
+                                    (and (not non-text-event-p)
+                                         (org-ai-skills--gptel-callback-terminal-p info))))
+                               (progress-signal
+                                (org-ai-skills--gptel-callback-progress-p first info raw))
+                               (pending-message nil))
+                          (update-tool-timing-from-callback first)
+                          (when (and (consp first)
+                                     (memq (car first) '(tool-call tool-result)))
+                            (setq saw-tool-callback t))
+                          (org-ai-skills--update-pending-tool-errors first pending-tool-errors)
+                          (setq pending-message
+                                (org-ai-skills--first-pending-tool-error
+                                 pending-tool-errors))
+                          (setq request
+                                (plist-put
+                                 request
+                                 :provider-data
+                                 (org-ai-skills--select-provider-usage-source
                                    first info (plist-get request :provider-data))))
-                           (when (and (not terminal-signal) progress-signal)
-                             (reset-watchdog))
-                           (if raw
-                               (let ((pending-message
-                                      (org-ai-skills--first-pending-tool-error
-                                       pending-tool-errors)))
-                                 (cond
-                                  ((and (stringp pending-message)
-                                        terminal-signal)
+                          (when (and terminal-signal
+                                     (not non-text-event-p)
+                                     (string-empty-p (or raw "")))
+                             ;; Some providers deliver terminal text only in callback info.
+                             (setq raw (org-ai-skills--extract-gptel-text-from-info info)))
+                          ;; After tool callbacks begin, treat non-terminal text as interim
+                          ;; to avoid early step finalization while the same request continues.
+                          (when (and saw-tool-callback
+                                      (not terminal-signal)
+                                      (not non-text-event-p)
+                                      (or (stringp pending-message)
+                                          (and info (listp info))))
+                            (setq raw nil))
+                          (if raw
+                              (let ()
+                                (cond
+                                 ((and (stringp pending-message)
+                                       terminal-signal)
                                    (finish-error pending-message))
                                   ((stringp pending-message)
                                    ;; Non-terminal text can arrive before tool retries finish.
@@ -3602,6 +3623,19 @@ Keep valid non-indented drawers intact."
 (defconst org-ai-skills--compose-skill-id "article-compose-from-outline"
   "Skill id used for article composition from approved outline.")
 
+(defconst org-ai-skills--outline-long-report-skill-id "outline-driven-long-report"
+  "Skill id used for long report generation from approved outline.")
+
+(defconst org-ai-skills--outline-expansion-skill-ids
+  (list org-ai-skills--compose-skill-id
+        org-ai-skills--outline-long-report-skill-id)
+  "Skill ids that require strict heading-preserving outline expansion.")
+
+(defun org-ai-skills--outline-expansion-skill-p (skill-id)
+  "Return non-nil when SKILL-ID requires strict outline expansion mode."
+  (and (stringp skill-id)
+       (member skill-id org-ai-skills--outline-expansion-skill-ids)))
+
 (defun org-ai-skills--strict-rewrite-instruction (instruction)
   "Build strict rewrite instruction string from optional INSTRUCTION."
   (if (string-empty-p (or instruction ""))
@@ -3612,8 +3646,7 @@ Keep valid non-indented drawers intact."
 
 (defun org-ai-skills--skill-default-rewrite-constraints (skill-id)
   "Return default rewrite constraints for SKILL-ID."
-  (if (and (stringp skill-id)
-           (string= skill-id org-ai-skills--compose-skill-id))
+  (if (org-ai-skills--outline-expansion-skill-p skill-id)
       '(:preserve-headlines t :omit-property-drawers t)
     nil))
 
@@ -3669,8 +3702,7 @@ Keep valid non-indented drawers intact."
   "Return context text used in rewrite prompt for SKILL and SUBTREE."
   (let* ((skill-id (plist-get skill :skill-id))
          (full (or (plist-get subtree :text) "")))
-    (if (and (stringp skill-id)
-             (string= skill-id org-ai-skills--compose-skill-id))
+    (if (org-ai-skills--outline-expansion-skill-p skill-id)
         (concat
          "Outline summary (compact context):\n"
          (org-ai-skills--compose-outline-summary full)

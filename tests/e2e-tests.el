@@ -113,6 +113,11 @@
     (org-ai-skills-e2e-test--run-bdd
      "tests/bdd/012-call-level-watchdog-and-dag-visibility.org")))
 
+(ert-deftest org-ai-skills-e2e-live-bdd-014-outline-driven-long-report ()
+  "Run BDD 014 via live gptel call."
+  (org-ai-skills-e2e-test--run-bdd
+   "tests/bdd/014-outline-driven-long-report-subtree.org"))
+
 (ert-deftest org-ai-skills-e2e-live-tool-call-financial-report ()
   "Verify live tool-calling path by requiring a tool event in BDD 003."
   (let ((org-ai-skills-enable-skill-function-calls t)

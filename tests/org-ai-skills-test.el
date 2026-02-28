@@ -34,6 +34,9 @@
 (defconst org-ai-skills-test--article-polish-skill-file
   (expand-file-name "skills/007-article-polish-editorial.org" org-ai-skills-test--project-root))
 
+(defconst org-ai-skills-test--outline-long-report-skill-file
+  (expand-file-name "skills/008-outline-driven-long-report.org" org-ai-skills-test--project-root))
+
 (defconst org-ai-skills-test--gptel-dir
   (expand-file-name "~/.emacs.d/straight/repos/gptel/"))
 
@@ -97,12 +100,14 @@
                         (list org-ai-skills-test--article-outline-skill-file
                               org-ai-skills-test--article-compose-skill-file
                               org-ai-skills-test--article-repair-skill-file
-                              org-ai-skills-test--article-polish-skill-file))))
+                              org-ai-skills-test--article-polish-skill-file
+                              org-ai-skills-test--outline-long-report-skill-file))))
     (should (equal (mapcar (lambda (skill) (plist-get skill :skill-id)) skills)
                    '("article-outline-from-source"
                      "article-compose-from-outline"
                      "article-repair-subtree"
-                     "article-polish-editorial")))
+                     "article-polish-editorial"
+                     "outline-driven-long-report")))
     (should (equal (plist-get (car (plist-get (car skills) :function-calls)) :name)
                    "org-ai-skills-read-buffer"))
     (should (equal (plist-get (car (last (plist-get (nth 2 skills) :function-calls))) :name)
@@ -316,11 +321,43 @@
     (should (string-match-p "Outline summary (compact context)"
                             (plist-get request :prompt)))))
 
+(ert-deftest org-ai-skills-build-gptel-rewrite-request-outline-long-report-enforces-outline-lock ()
+  "Long report skill rewrite request should include strict outline constraints."
+  (let* ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--outline-long-report-skill-file))
+         (subtree '(:heading "Report"
+                    :level 1
+                    :path "Report"
+                    :purpose "Expand into long report"
+                    :source-file-path "./notes/source.md"
+                    :text "* Report\n** A\n:PURPOSE: p\n:END:\n"
+                    :context-mode current
+                    :levels-up 0))
+         (request (org-ai-skills-build-gptel-rewrite-request skill subtree "Expand")))
+    (should (plist-get request :rewrite-constraints))
+    (should (plist-get (plist-get request :rewrite-constraints) :preserve-headlines))
+    (should (plist-get (plist-get request :rewrite-constraints) :omit-property-drawers))
+    (should (string-match-p "Keep every headline line unchanged"
+                            (plist-get request :prompt)))
+    (should (string-match-p "Outline summary (compact context)"
+                            (plist-get request :prompt)))))
+
 (ert-deftest org-ai-skills-build-step-request-compose-uses-compact-context ()
   "Planner step request for compose skill should use compact outline context."
   (let* ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--article-compose-skill-file))
          (step '(:step-id "s1" :goal "compose" :skills ("article-compose-from-outline")))
          (run-state '(:task "compose article"
+                     :subtree (:text "* Root\n** A\n:PURPOSE: x\n:END:\n")))
+         (request (org-ai-skills-build-step-request step run-state (list skill))))
+    (should (string-match-p "Outline summary (compact context)"
+                            (plist-get request :prompt)))
+    (should (string-match-p "Strict compose constraints"
+                            (plist-get request :prompt)))))
+
+(ert-deftest org-ai-skills-build-step-request-outline-long-report-uses-compact-context ()
+  "Planner step request for long report skill should use compact outline context."
+  (let* ((skill (org-ai-skills-parse-skill-file org-ai-skills-test--outline-long-report-skill-file))
+         (step '(:step-id "s1" :goal "expand report" :skills ("outline-driven-long-report")))
+         (run-state '(:task "write report"
                      :subtree (:text "* Root\n** A\n:PURPOSE: x\n:END:\n")))
          (request (org-ai-skills-build-step-request step run-state (list skill))))
     (should (string-match-p "Outline summary (compact context)"
@@ -1269,6 +1306,10 @@
   (should (equal (org-ai-skills--planner-constraints-for-run-state
                   '(:steps ((:skills ("gen-notes"))
                             (:skills ("article-compose-from-outline")))))
+                 '(:preserve-headlines t :omit-property-drawers t)))
+  (should (equal (org-ai-skills--planner-constraints-for-run-state
+                  '(:steps ((:skills ("gen-notes"))
+                            (:skills ("outline-driven-long-report")))))
                  '(:preserve-headlines t :omit-property-drawers t)))
   (should-not (org-ai-skills--planner-constraints-for-run-state
                '(:steps ((:skills ("article-compose-from-outline"))
@@ -2686,6 +2727,7 @@
                    '(:task "Polish this subtree" :steps nil :plan-revision 1)))
          (prompt (plist-get request :prompt)))
     (should (string-match-p "Output minimization rules:" prompt))
+    (should (string-match-p "Outline-expansion planning rule:" prompt))
     (should (string-match-p "Use at most 3 candidates and 2 steps" prompt))
     (should-not (string-match-p "\"file\":" prompt))))
 
@@ -3455,6 +3497,66 @@
     (should (string-match-p "without usable text payload"
                             (plist-get callback-run-state :fatal-error)))))
 
+(ert-deftest org-ai-skills-execute-plan-step-fails-on-terminal-metadata-without-text ()
+  "Execution step should fail when terminal metadata arrives without text."
+  (let (callback-run-state timer-fn)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (&rest _args) '(:skill-id "gen-notes" :title "Notes")))
+              ((symbol-function 'org-ai-skills-apply-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-exclude-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-build-step-request)
+               (lambda (&rest _args)
+                 '(:event-type step-execution :request-role execution :step-id "s1" :prompt "p")))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback nil '(:status "HTTP/2 200" :stop-reason "stop"))))
+              ((symbol-function 'run-at-time)
+               (lambda (_secs _repeat fn &rest _args)
+                 (setq timer-fn fn)
+                 'fake-timer))
+              ((symbol-function 'cancel-timer)
+               (lambda (_timer) nil)))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :skills ("gen-notes") :goal "g")
+       '(:task "task" :subtree (:text "* H\n") :plan-revision 1 :events nil)
+       (lambda (run-state _output)
+         (setq callback-run-state run-state))))
+    (should timer-fn)
+    (should (stringp (plist-get callback-run-state :fatal-error)))
+    (should (string-match-p "without usable text payload"
+                            (plist-get callback-run-state :fatal-error)))))
+
+(ert-deftest org-ai-skills-execute-plan-step-uses-terminal-text-from-info ()
+  "Execution step should accept terminal text carried in callback info payload."
+  (let (callback-run-state callback-output)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (&rest _args) '(:skill-id "gen-notes" :title "Notes")))
+              ((symbol-function 'org-ai-skills-apply-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-exclude-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-build-step-request)
+               (lambda (&rest _args)
+                 '(:event-type step-execution :request-role execution :step-id "s1" :prompt "p")))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback
+                          nil
+                          '(:status "HTTP/2 200"
+                            :stop-reason "stop"
+                            :data (:output_text "*** From info\nBody\n"))))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :skills ("gen-notes") :goal "g")
+       '(:task "task" :subtree (:text "*** Input\n") :plan-revision 1 :events nil)
+       (lambda (run-state output)
+         (setq callback-run-state run-state)
+         (setq callback-output output))))
+    (should-not (plist-get callback-run-state :fatal-error))
+    (should (stringp callback-output))
+    (should (string-match-p "^\\*\\*\\* From info" callback-output))))
+
 (ert-deftest org-ai-skills-execute-plan-step-times-out-without-callback ()
   "Execution step should fail explicitly on callback timeout."
   (let ((org-ai-skills-execution-request-timeout-seconds 1)
@@ -3578,6 +3680,41 @@
         (should (stringp (plist-get callback-run-state :fatal-error)))
         (should (string-match-p "Planner request timeout"
                                 (plist-get callback-run-state :fatal-error)))))))
+
+(ert-deftest org-ai-skills-execute-plan-step-refreshes-timeout-on-callback-events ()
+  "Execution step watchdog should refresh on each callback event."
+  (let (callback-run-state
+        callback-output
+        run-at-time-count)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (&rest _args) '(:skill-id "alpha" :title "A")))
+              ((symbol-function 'org-ai-skills-apply-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-exclude-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-build-step-request)
+               (lambda (&rest _args)
+                 '(:event-type step-execution :request-role execution :step-id "s1" :prompt "p")))
+              ((symbol-function 'run-at-time)
+               (lambda (_secs _repeat _fn &rest _args)
+                 (setq run-at-time-count (1+ (or run-at-time-count 0)))
+                 (intern (format "fake-timer-%d" run-at-time-count))))
+              ((symbol-function 'cancel-timer)
+               (lambda (_timer) nil))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback '(tool-result ((dummy . t))) '(:data (:dummy t)))
+                 (funcall callback "*** Final\nBody\n"
+                          '(:status "HTTP/2 200" :stop-reason "stop")))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :skills ("alpha") :goal "g")
+       '(:task "task" :subtree (:text "*** Input\n") :plan-revision 1 :events nil)
+       (lambda (run-state output)
+         (setq callback-run-state run-state)
+         (setq callback-output output))))
+    (should (>= (or run-at-time-count 0) 3))
+    (should-not (plist-get callback-run-state :fatal-error))
+    (should (stringp callback-output))))
 
 (ert-deftest org-ai-skills-normalize-provider-usage-supports-multiple-key-shapes ()
   "Usage adapter should normalize common provider usage key variants."
@@ -3760,7 +3897,8 @@
               ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
                (lambda (_request callback)
                  (funcall callback '(tool-result ((dummy . t))) '(:data (:dummy t)))
-                 (funcall callback "*** Final\nBody\n" '(:data (:dummy t))))))
+                 (funcall callback "*** Final\nBody\n"
+                          '(:status "HTTP/2 200" :stop-reason "stop")))))
       (org-ai-skills-execute-plan-step
        '(:step-id "s1" :goal "g" :skills ("fin-news-daily-report") :expected-output "o")
        '(:task "task" :subtree (:text "*** Input\n"))
@@ -3769,6 +3907,32 @@
          (setq callback-count (1+ (or callback-count 0))))))
     (should (= callback-count 1))
     (should (string-match-p "^\\*\\*\\* Final" callback-output))))
+
+(ert-deftest org-ai-skills-execute-plan-step-ignores-nonterminal-text-after-tool-callback ()
+  "Execution should not finalize on non-terminal text after tool callbacks."
+  (let (callback-run-state callback-output callback-count)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (skill-id &optional _directory)
+                 (list :skill-id skill-id :title "Skill" :description "desc")))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback '(tool-result ((dummy . t))) '(:data (:dummy t)))
+                 ;; Interim text should be ignored because tool callbacks already occurred.
+                 (funcall callback "I got some results, let me continue..."
+                          '(:status "HTTP/2 200"))
+                 (funcall callback '(tool-result ((dummy . t))) '(:data (:dummy t)))
+                 (funcall callback "*** Final\nSettled output\n"
+                          '(:status "HTTP/2 200" :stop-reason "stop")))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :goal "g" :skills ("alpha") :expected-output "o")
+       '(:task "task" :subtree (:text "*** Input\n"))
+       (lambda (run-state output)
+         (setq callback-run-state run-state)
+         (setq callback-output output)
+         (setq callback-count (1+ (or callback-count 0))))))
+    (should (= callback-count 1))
+    (should-not (plist-get callback-run-state :fatal-error))
+    (should (string-match-p "Settled output" callback-output))))
 
 (ert-deftest org-ai-skills-extract-tool-result-errors-detects-provider-failure ()
   "Tool-result parser should detect provider failures with error taxonomy."
@@ -3812,7 +3976,8 @@
                             (dummy-tool
                              (:directory "/blocked")
                              "(:ok nil :error-kind \"path-not-allowed\" :error-message \"blocked\")")))
-                 (funcall callback t nil))))
+                 (funcall callback "*** Final\nShould not be used\n"
+                          '(:status "HTTP/2 200" :stop-reason "stop")))))
       (org-ai-skills-execute-plan-step
        '(:step-id "s1" :goal "g" :skills ("alpha") :expected-output "o")
        '(:task "task" :subtree (:text "*** Input\n"))
@@ -3838,7 +4003,8 @@
                                            "desc" nil nil "org-ai-skills" nil t)
                              (:query "q")
                              "org-ai-skills-function-call-error Search1API request failed: no response buffer")))
-                 (funcall callback t nil))))
+                 (funcall callback "*** Final\nShould not be used\n"
+                          '(:status "HTTP/2 200" :stop-reason "stop")))))
       (org-ai-skills-execute-plan-step
        '(:step-id "s1" :goal "g" :skills ("alpha") :expected-output "o")
        '(:task "task" :subtree (:text "*** Input\n"))
@@ -3875,7 +4041,8 @@
                                            "desc" nil nil "org-ai-skills" nil t)
                              (:query "q2")
                              "{\"count\":8,\"items\":[{\"title\":\"ok\"}]}")))
-                 (funcall callback "*** Final\nRecovered output\n"))))
+                 (funcall callback "*** Final\nRecovered output\n"
+                          '(:status "HTTP/2 200" :stop-reason "stop")))))
       (org-ai-skills-execute-plan-step
        '(:step-id "s1" :goal "g" :skills ("alpha") :expected-output "o")
        '(:task "task" :subtree (:text "*** Input\n"))
