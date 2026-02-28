@@ -2332,6 +2332,58 @@
     (should (equal (plist-get (car edges) :from) "planning.request#1"))
     (should (equal (plist-get (car edges) :to) "planning.parse#1"))))
 
+(ert-deftest org-ai-skills-build-execution-dag-includes-call-level-nodes-under-step ()
+  "Event DAG should show api.call nodes linked from their parent step."
+  (let* ((run-state
+          '(:steps ((:step-id "s1" :status done :skills ("fin-news-daily-report") :goal "draft"))
+            :events ((:stage-id api.call
+                      :request-role execution
+                      :call-index 1
+                      :status success
+                      :duration-ms 12
+                      :step-id "s1"
+                      :usage (:input-tokens 3 :output-tokens 4 :total-tokens 7)))))
+         (dag (org-ai-skills-build-execution-dag run-state nil t))
+         (nodes (plist-get dag :nodes))
+         (edges (plist-get dag :edges))
+         (call-id "api.call:execution:s1:1#1")
+         (step-node (seq-find (lambda (n) (equal (plist-get n :id) "s1")) nodes))
+         (call-node (seq-find (lambda (n) (equal (plist-get n :id) call-id)) nodes))
+         (step-edge (seq-find (lambda (e)
+                                (and (equal (plist-get e :from) "s1")
+                                     (equal (plist-get e :to) call-id)))
+                              edges)))
+    (should step-node)
+    (should call-node)
+    (should step-edge)
+    (should (equal (plist-get (plist-get call-node :metrics) :total-tokens) 7))))
+
+(ert-deftest org-ai-skills-build-execution-dag-includes-tool-call-nodes-under-step ()
+  "Event DAG should show tool.call nodes linked from their parent step."
+  (let* ((run-state
+          '(:steps ((:step-id "s1" :status done :skills ("fin-news-daily-report") :goal "draft"))
+            :events ((:stage-id tool.call
+                      :request-role execution
+                      :tool-name "org-ai-skills-search1api-fetch-financial-news-raw"
+                      :call-index 2
+                      :status success
+                      :duration-ms 450
+                      :step-id "s1"))))
+         (dag (org-ai-skills-build-execution-dag run-state nil t))
+         (nodes (plist-get dag :nodes))
+         (edges (plist-get dag :edges))
+         (call-id "tool.call:org-ai-skills-search1api-fetch-financial-news-raw:s1:2#1")
+         (step-node (seq-find (lambda (n) (equal (plist-get n :id) "s1")) nodes))
+         (call-node (seq-find (lambda (n) (equal (plist-get n :id) call-id)) nodes))
+         (step-edge (seq-find (lambda (e)
+                                (and (equal (plist-get e :from) "s1")
+                                     (equal (plist-get e :to) call-id)))
+                              edges)))
+    (should step-node)
+    (should call-node)
+    (should step-edge)
+    (should (= (plist-get (plist-get call-node :metrics) :duration-ms) 450))))
+
 (ert-deftest org-ai-skills-build-execution-dag-treats-applied-as-success ()
   "DAG status mapping should treat applied step status as success."
   (let* ((run-state
@@ -2364,6 +2416,59 @@
       (goto-char (point-min))
       (should (re-search-forward "Execution DAG" nil t))
       (should (re-search-forward "\\[success\\] execution.step:s1#1" nil t)))))
+
+(ert-deftest org-ai-skills-render-execution-dag-text-indents-by-level ()
+  "DAG text should indent nodes based on dependency depth."
+  (let* ((dag '(:nodes ((:id "root"
+                         :status success
+                         :dependencies nil
+                         :skills nil
+                         :metrics (:duration-ms 1 :input-tokens 0 :output-tokens 0 :total-tokens 0 :estimated-cost-usd 0.0))
+                        (:id "child"
+                         :status success
+                         :dependencies ("root")
+                         :skills ("skill-a")
+                         :metrics (:duration-ms 2 :input-tokens 1 :output-tokens 2 :total-tokens 3 :estimated-cost-usd 0.001))
+                        (:id "grandchild"
+                         :status success
+                         :dependencies ("child")
+                         :skills ("skill-b")
+                         :metrics (:duration-ms 3 :input-tokens 2 :output-tokens 3 :total-tokens 5 :estimated-cost-usd 0.002)))
+                :edges ((:from "root" :to "child")
+                        (:from "child" :to "grandchild"))))
+         (text (org-ai-skills-render-execution-dag-text dag)))
+    (should (string-match-p "^- \\[success\\] root (L0)$" text))
+    (should (string-match-p "^  - \\[success\\] child (L1)$" text))
+    (should (string-match-p "^    - \\[success\\] grandchild (L2)$" text))))
+
+(ert-deftest org-ai-skills-render-execution-dag-text-allows-depth-to-return ()
+  "DAG text indentation should return to shallower levels for later branches."
+  (let* ((dag '(:nodes ((:id "s1"
+                         :status success
+                         :dependencies nil
+                         :skills ("a")
+                         :metrics (:duration-ms 1 :input-tokens 0 :output-tokens 0 :total-tokens 0 :estimated-cost-usd 0.0))
+                        (:id "api.call:execution:s1:1#1"
+                         :status success
+                         :dependencies ("s1")
+                         :skills ("a")
+                         :metrics (:duration-ms 2 :input-tokens 0 :output-tokens 0 :total-tokens 0 :estimated-cost-usd 0.0))
+                        (:id "s2"
+                         :status success
+                         :dependencies nil
+                         :skills ("b")
+                         :metrics (:duration-ms 1 :input-tokens 0 :output-tokens 0 :total-tokens 0 :estimated-cost-usd 0.0))
+                        (:id "api.call:execution:s2:1#1"
+                         :status success
+                         :dependencies ("api.call:execution:s1:1#1" "s2")
+                         :skills ("b")
+                         :metrics (:duration-ms 2 :input-tokens 0 :output-tokens 0 :total-tokens 0 :estimated-cost-usd 0.0)))
+                :edges nil))
+         (text (org-ai-skills-render-execution-dag-text dag)))
+    (should (string-match-p "^- \\[success\\] s1 (L0)$" text))
+    (should (string-match-p "^  - \\[success\\] api\\.call:execution:s1:1#1 (L1)$" text))
+    (should (string-match-p "^- \\[success\\] s2 (L0)$" text))
+    (should (string-match-p "^  - \\[success\\] api\\.call:execution:s2:1#1 (L1)$" text))))
 
 (ert-deftest org-ai-skills-rewrite-interactive-auto-opens-control-workspace ()
   "Interactive rewrite should auto-open control workspace when enabled."
@@ -2844,7 +2949,9 @@
                  (funcall callback chunk-1 '(:status "HTTP/2 200"))
                  (funcall callback chunk-2 '(:data (:payload t)))))
               ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
-               (lambda (&rest response) (car response))))
+               (lambda (&rest response)
+                 (let ((first (car response)))
+                   (and (stringp first) first)))))
       (org-ai-skills--request-planner-plan
        "task"
        metadata
@@ -2866,7 +2973,9 @@
                  (funcall callback chunk-1 '(:status "HTTP/2 200" :stop-reason "stop"))
                  (funcall callback chunk-2 '(:status "HTTP/2 200" :stop-reason "stop"))))
               ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
-               (lambda (&rest response) (car response))))
+               (lambda (&rest response)
+                 (let ((first (car response)))
+                   (and (stringp first) first)))))
       (org-ai-skills--request-planner-plan
        "task"
        metadata
@@ -2892,7 +3001,9 @@
                           "{\"candidates\":[{\"skill_id\":\"gen-notes\",\"why\":\"fit\",\"score\":0.9}],\"plan\":[{\"step_id\":\"s1\"}"
                           '(:status "HTTP/2 200" :stop-reason "stop" :data (:stream :json-false)))))
               ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
-               (lambda (&rest response) (car response))))
+               (lambda (&rest response)
+                 (let ((first (car response)))
+                   (and (stringp first) first)))))
       (org-ai-skills--request-planner-plan
        "task"
        metadata
@@ -2921,7 +3032,9 @@
                                               :data (:stream :json-false)))
                  (funcall callback t '(:status "HTTP/2 200" :stop-reason "stop"))))
               ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
-               (lambda (&rest response) (car response))))
+               (lambda (&rest response)
+                 (let ((first (car response)))
+                   (and (stringp first) first)))))
       (org-ai-skills--request-planner-plan
        "task"
        metadata
@@ -3104,9 +3217,13 @@
        (lambda (_parsed run-state) (setq callback-run-state run-state))))
     (let* ((events (plist-get callback-run-state :events))
            (parse-event (car events))
-           (request-event (cadr events)))
-      (should (= (length events) 2))
+           (call-event (cadr events))
+           (request-event (caddr events)))
+      (should (= (length events) 3))
       (should (eq (plist-get parse-event :stage-id) 'planning.parse))
+      (should (eq (plist-get call-event :stage-id) 'api.call))
+      (should (eq (plist-get call-event :request-role) 'planner))
+      (should (= (plist-get call-event :call-index) 1))
       (should (eq (plist-get request-event :stage-id) 'planning.request))
       (should (>= (plist-get parse-event :duration-ms) 1))
       (should (>= (plist-get request-event :duration-ms)
@@ -3149,7 +3266,7 @@
     (should (listp callback-state))))
 
 (ert-deftest org-ai-skills-execute-plan-step-records-timing-event ()
-  "Step execution should append execution timing event into run-state."
+  "Step execution should append call-level and step-level timing events."
   (let ((ticks '(0.010 0.015))
         callback-run-state
         (org-ai-skills-observability-now-function nil))
@@ -3177,16 +3294,131 @@
        '(:step-id "s1" :skills ("gen-notes") :goal "g")
        '(:task "task" :subtree (:text "* H\n") :plan-revision 1 :events nil)
        (lambda (run-state _output) (setq callback-run-state run-state))))
-    (let ((events (plist-get callback-run-state :events)))
-      (should (= (length events) 1))
-      (should (eq (plist-get (car events) :stage-id) 'execution.step))
-      (should (equal (plist-get (car events) :step-id) "s1"))
-      (should (= (plist-get (car events) :duration-ms) 5))
+    (let* ((events (plist-get callback-run-state :events))
+           (call-event (car events))
+           (step-event (cadr events)))
+      (should (= (length events) 2))
+      (should (eq (plist-get call-event :stage-id) 'api.call))
+      (should (eq (plist-get call-event :request-role) 'execution))
+      (should (= (plist-get call-event :call-index) 1))
+      (should (equal (plist-get call-event :step-id) "s1"))
+      (should (eq (plist-get step-event :stage-id) 'execution.step))
+      (should (equal (plist-get step-event :step-id) "s1"))
+      (should (= (plist-get step-event :duration-ms) 5))
       (should (equal
                (plist-get
                 (plist-get (plist-get callback-run-state :metrics) :usage-totals)
                 :total-tokens)
                7)))))
+
+(ert-deftest org-ai-skills-execute-plan-step-records-tool-call-timing-events ()
+  "Step execution should record tool.call timing separate from api.call."
+  (let ((ticks '(0.010 0.015 0.020 0.030 0.060))
+        callback-run-state)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (&rest _args) '(:skill-id "gen-notes" :title "Notes")))
+              ((symbol-function 'org-ai-skills-apply-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-exclude-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-build-step-request)
+               (lambda (&rest _args)
+                 '(:event-type step-execution :request-role execution :step-id "s1" :prompt "p")))
+              ((symbol-function 'org-ai-skills--observability-now-ms)
+               (lambda ()
+                 (truncate (* 1000.0
+                              (prog1 (or (car ticks) 0.060)
+                                (setq ticks (cdr ticks)))))))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback
+                          '(tool-call
+                            (#s(gptel-tool org-ai-skills-search1api-fetch-financial-news-raw
+                                           "org-ai-skills-search1api-fetch-financial-news-raw"
+                                           "desc" nil nil "org-ai-skills" nil t)
+                             (:query "q1")))
+                          nil)
+                 (funcall callback
+                          '(tool-result
+                            (#s(gptel-tool org-ai-skills-search1api-fetch-financial-news-raw
+                                           "org-ai-skills-search1api-fetch-financial-news-raw"
+                                           "desc" nil nil "org-ai-skills" nil t)
+                             (:query "q1")
+                             "{\"ok\":true}"))
+                          nil)
+                 (funcall callback "*** Final\nBody\n" nil)))
+              ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
+               (lambda (&rest response)
+                 (let ((first (car response)))
+                   (and (stringp first) first)))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :skills ("gen-notes") :goal "g")
+       '(:task "task" :subtree (:text "* H\n") :plan-revision 1 :events nil)
+       (lambda (run-state _output) (setq callback-run-state run-state))))
+    (let* ((events (plist-get callback-run-state :events))
+           (tool-event (seq-find (lambda (e) (eq (plist-get e :stage-id) 'tool.call)) events))
+           (api-event (seq-find (lambda (e) (eq (plist-get e :stage-id) 'api.call)) events))
+           (step-event (seq-find (lambda (e) (eq (plist-get e :stage-id) 'execution.step)) events)))
+      (should tool-event)
+      (should api-event)
+      (should step-event)
+      (should (equal (plist-get tool-event :tool-name)
+                     "org-ai-skills-search1api-fetch-financial-news-raw"))
+      (should (= (plist-get tool-event :call-index) 1))
+      (should (> (plist-get tool-event :duration-ms) 0))
+      (should (> (plist-get api-event :duration-ms)
+                 (plist-get tool-event :duration-ms))))))
+
+(ert-deftest org-ai-skills-execute-plan-step-tool-timing-pairs-when-args-reordered ()
+  "Tool timing should pair starts/results even when callback args shape changes."
+  (let ((ticks '(0.010 0.015 0.025 0.060))
+        callback-run-state)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (&rest _args) '(:skill-id "gen-notes" :title "Notes")))
+              ((symbol-function 'org-ai-skills-apply-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-exclude-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-build-step-request)
+               (lambda (&rest _args)
+                 '(:event-type step-execution :request-role execution :step-id "s1" :prompt "p")))
+              ((symbol-function 'org-ai-skills--observability-now-ms)
+               (lambda ()
+                 (truncate (* 1000.0
+                              (prog1 (or (car ticks) 0.060)
+                                (setq ticks (cdr ticks)))))))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback
+                          '(tool-call
+                            (#s(gptel-tool org-ai-skills-search1api-fetch-financial-news-raw
+                                           "org-ai-skills-search1api-fetch-financial-news-raw"
+                                           "desc" nil nil "org-ai-skills" nil t)
+                             (:query "q1" :limit "8")))
+                          nil)
+                 (funcall callback
+                          '(tool-result
+                            (#s(gptel-tool org-ai-skills-search1api-fetch-financial-news-raw
+                                           "org-ai-skills-search1api-fetch-financial-news-raw"
+                                           "desc" nil nil "org-ai-skills" nil t)
+                             (:limit "8" :query "q1")
+                             "{\"ok\":true}"))
+                          nil)
+                 (funcall callback "*** Final\nBody\n" nil)))
+              ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
+               (lambda (&rest response)
+                 (let ((first (car response)))
+                   (and (stringp first) first)))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :skills ("gen-notes") :goal "g")
+       '(:task "task" :subtree (:text "* H\n") :plan-revision 1 :events nil)
+       (lambda (run-state _output) (setq callback-run-state run-state))))
+    (let* ((events (plist-get callback-run-state :events))
+           (tool-events (seq-filter (lambda (e) (eq (plist-get e :stage-id) 'tool.call)) events))
+           (tool-event (car tool-events)))
+      (should (= (length tool-events) 1))
+      (should (eq (plist-get tool-event :status) 'success))
+      (should (= (plist-get tool-event :duration-ms) 10)))))
 
 (ert-deftest org-ai-skills-execute-plan-step-fails-on-terminal-without-text ()
   "Execution step should fail explicitly when terminal callback has no text payload."
@@ -3254,6 +3486,98 @@
     (should (stringp (plist-get callback-run-state :fatal-error)))
     (should (string-match-p "Execution step timeout"
                             (plist-get callback-run-state :fatal-error)))))
+
+(ert-deftest org-ai-skills-execute-plan-step-resets-watchdog-on-tool-progress ()
+  "Execution watchdog should reset on non-terminal tool-call progress."
+  (let ((org-ai-skills-execution-request-timeout-seconds 1)
+        callback-run-state
+        (timer-fns (make-hash-table :test 'equal))
+        (timer-order nil)
+        (canceled nil)
+        (timer-id 0))
+    (cl-labels
+        ((fire-timer (id)
+           (unless (member id canceled)
+             (let ((fn (gethash id timer-fns)))
+               (when (functionp fn)
+                 (funcall fn))))))
+      (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+                 (lambda (&rest _args) '(:skill-id "gen-notes" :title "Notes")))
+                ((symbol-function 'org-ai-skills-apply-skill-function-calls)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'org-ai-skills-exclude-skill-function-calls)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'org-ai-skills-build-step-request)
+                 (lambda (&rest _args)
+                   '(:event-type step-execution :request-role execution :step-id "s1" :prompt "p")))
+                ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+                 (lambda (_request callback)
+                   (funcall callback '(tool-call (:id "tc-1")) nil)))
+                ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
+                 (lambda (&rest _response) nil))
+                ((symbol-function 'run-at-time)
+                 (lambda (_secs _repeat fn &rest _args)
+                   (let ((id (format "t-%d" (setq timer-id (1+ timer-id)))))
+                     (puthash id fn timer-fns)
+                     (setq timer-order (append timer-order (list id)))
+                     id)))
+                ((symbol-function 'cancel-timer)
+                 (lambda (timer)
+                   (setq canceled (cons timer canceled)))))
+        (org-ai-skills-execute-plan-step
+         '(:step-id "s1" :skills ("gen-notes") :goal "g")
+         '(:task "task" :subtree (:text "* H\n") :plan-revision 1 :events nil)
+         (lambda (run-state _output)
+           (setq callback-run-state run-state)))
+        (should (= (length timer-order) 2))
+        (fire-timer (car timer-order))
+        (should-not callback-run-state)
+        (fire-timer (cadr timer-order))
+        (should (stringp (plist-get callback-run-state :fatal-error)))
+        (should (string-match-p "Execution step timeout"
+                                (plist-get callback-run-state :fatal-error)))))))
+
+(ert-deftest org-ai-skills-request-planner-plan-resets-watchdog-on-progress ()
+  "Planner watchdog should reset on non-terminal callback progress."
+  (let ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
+        callback-run-state
+        (timer-fns (make-hash-table :test 'equal))
+        (timer-order nil)
+        (canceled nil)
+        (timer-id 0))
+    (cl-labels
+        ((fire-timer (id)
+           (unless (member id canceled)
+             (let ((fn (gethash id timer-fns)))
+               (when (functionp fn)
+                 (funcall fn))))))
+      (cl-letf (((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+                 (lambda (_request callback)
+                   (funcall callback '(reasoning (:text "thinking")) nil)))
+                ((symbol-function 'run-at-time)
+                 (lambda (_secs _repeat fn &rest _args)
+                   (let ((id (format "p-%d" (setq timer-id (1+ timer-id)))))
+                     (puthash id fn timer-fns)
+                     (setq timer-order (append timer-order (list id)))
+                     id)))
+                ((symbol-function 'cancel-timer)
+                 (lambda (timer)
+                   (setq canceled (cons timer canceled))))
+                ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
+                 (lambda (&rest _response) nil)))
+        (org-ai-skills--request-planner-plan
+         "task"
+         metadata
+         '(:task "task" :steps nil :plan-revision 1 :events nil)
+         (lambda (_parsed run-state)
+           (setq callback-run-state run-state)))
+        (should (= (length timer-order) 2))
+        (fire-timer (car timer-order))
+        (should-not callback-run-state)
+        (fire-timer (cadr timer-order))
+        (should (stringp (plist-get callback-run-state :fatal-error)))
+        (should (string-match-p "Planner request timeout"
+                                (plist-get callback-run-state :fatal-error)))))))
 
 (ert-deftest org-ai-skills-normalize-provider-usage-supports-multiple-key-shapes ()
   "Usage adapter should normalize common provider usage key variants."
@@ -3488,7 +3812,7 @@
                             (dummy-tool
                              (:directory "/blocked")
                              "(:ok nil :error-kind \"path-not-allowed\" :error-message \"blocked\")")))
-                 (funcall callback "*** Final\nShould not be used\n"))))
+                 (funcall callback t nil))))
       (org-ai-skills-execute-plan-step
        '(:step-id "s1" :goal "g" :skills ("alpha") :expected-output "o")
        '(:task "task" :subtree (:text "*** Input\n"))
@@ -3514,7 +3838,7 @@
                                            "desc" nil nil "org-ai-skills" nil t)
                              (:query "q")
                              "org-ai-skills-function-call-error Search1API request failed: no response buffer")))
-                 (funcall callback "*** Final\nShould not be used\n"))))
+                 (funcall callback t nil))))
       (org-ai-skills-execute-plan-step
        '(:step-id "s1" :goal "g" :skills ("alpha") :expected-output "o")
        '(:task "task" :subtree (:text "*** Input\n"))
@@ -3552,6 +3876,82 @@
                              (:query "q2")
                              "{\"count\":8,\"items\":[{\"title\":\"ok\"}]}")))
                  (funcall callback "*** Final\nRecovered output\n"))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :goal "g" :skills ("alpha") :expected-output "o")
+       '(:task "task" :subtree (:text "*** Input\n"))
+       (lambda (run-state output)
+         (setq callback-run-state run-state)
+         (setq callback-output output))))
+    (should-not (plist-get callback-run-state :fatal-error))
+    (should (stringp callback-output))
+    (should (string-match-p "Recovered output" callback-output))))
+
+(ert-deftest org-ai-skills-execute-plan-step-does-not-fail-on-nonterminal-text-before-tool-recovery ()
+  "Execution should not fail early when text arrives before tool error is recovered."
+  (let (callback-run-state callback-output)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (skill-id &optional _directory)
+                 (list :skill-id skill-id :title "Skill" :description "desc")))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 ;; First tool attempt fails.
+                 (funcall callback
+                          '(tool-result
+                            (#s(gptel-tool org-ai-skills-search1api-fetch-financial-news-raw
+                                           "org-ai-skills-search1api-fetch-financial-news-raw"
+                                           "desc" nil nil "org-ai-skills" nil t)
+                             (:query "q1")
+                             "org-ai-skills-function-call-error Search1API request failed: no response buffer")))
+                 ;; Non-terminal text arrives while retry is still in progress.
+                 (funcall callback "Interim draft text chunk")
+                 ;; Later tool attempt succeeds and clears pending error.
+                 (funcall callback
+                          '(tool-result
+                            (#s(gptel-tool org-ai-skills-search1api-fetch-financial-news-raw
+                                           "org-ai-skills-search1api-fetch-financial-news-raw"
+                                           "desc" nil nil "org-ai-skills" nil t)
+                             (:query "q2")
+                             "{\"count\":8,\"items\":[{\"title\":\"ok\"}]}")))
+                 ;; Final text should now succeed.
+                 (funcall callback "*** Final\nRecovered output\n"))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :goal "g" :skills ("alpha") :expected-output "o")
+       '(:task "task" :subtree (:text "*** Input\n"))
+       (lambda (run-state output)
+         (setq callback-run-state run-state)
+         (setq callback-output output))))
+    (should-not (plist-get callback-run-state :fatal-error))
+    (should (stringp callback-output))
+    (should (string-match-p "Recovered output" callback-output))))
+
+(ert-deftest org-ai-skills-execute-plan-step-ignores-terminal-metadata-on-tool-result-events ()
+  "Execution should not treat tool-result callbacks as terminal via INFO stop-reason."
+  (let (callback-run-state callback-output)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (skill-id &optional _directory)
+                 (list :skill-id skill-id :title "Skill" :description "desc")))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 ;; Backend emits stop-reason on non-terminal tool-result callback.
+                 (funcall callback
+                          '(tool-result
+                            (#s(gptel-tool org-ai-skills-search1api-fetch-financial-news-raw
+                                           "org-ai-skills-search1api-fetch-financial-news-raw"
+                                           "desc" nil nil "org-ai-skills" nil t)
+                             (:query "q1")
+                             "org-ai-skills-function-call-error Search1API request failed: no response buffer"))
+                          '(:status "HTTP/2 200" :stop-reason "stop"))
+                 ;; Recovery arrives later.
+                 (funcall callback
+                          '(tool-result
+                            (#s(gptel-tool org-ai-skills-search1api-fetch-financial-news-raw
+                                           "org-ai-skills-search1api-fetch-financial-news-raw"
+                                           "desc" nil nil "org-ai-skills" nil t)
+                             (:query "q2")
+                             "{\"count\":8,\"items\":[{\"title\":\"ok\"}]}"))
+                          '(:status "HTTP/2 200" :stop-reason "stop"))
+                 (funcall callback "*** Final\nRecovered output\n"
+                          '(:status "HTTP/2 200" :stop-reason "stop")))))
       (org-ai-skills-execute-plan-step
        '(:step-id "s1" :goal "g" :skills ("alpha") :expected-output "o")
        '(:task "task" :subtree (:text "*** Input\n"))

@@ -3,12 +3,16 @@
 
 * Problem
 Current execution timeout is enforced at step lifecycle level, not per underlying API call. A single long step with many tool-call/tool-result rounds can time out even when progress is ongoing. Also, DAG visibility is currently step-centric, which makes it hard to inspect detailed cost/latency per API call within a step.
+In practice, this creates false timeouts for steps that are actively making progress through many tool calls.
 
 * Scope
 - In scope:
   - Redefine watchdog semantics from per-step timeout to per-API-call timeout for planner and execution requests.
   - Ensure long multi-call steps can continue as long as each individual API call completes within timeout.
+  - Treat timeout as an inactivity watchdog, not a cumulative step wall-clock limit.
+  - Reset watchdog window when a new tool call is issued (or equivalent call-progress event is observed) within the same step.
   - Extend run-state observability so each API call is represented under its parent step in DAG rendering.
+  - Add per-tool-invocation timing events so tool latency is visible separately from total execution API-call duration.
   - Include per-call timing and usage/cost fields where provider data is available.
   - Add ERT coverage for watchdog semantics and call-level DAG event recording.
   - Add/update BDD scenario(s) validating non-hanging behavior and detailed DAG visibility.
@@ -23,6 +27,7 @@ Current execution timeout is enforced at step lifecycle level, not per underlyin
   - Keep existing fail-fast behavior for terminal-empty payloads and tool errors.
   - Maintain compatibility with current planner/execution callback event shapes.
   - Preserve existing top-level step status transitions (`running -> success/error/canceled`).
+  - Do not enforce an additional cumulative per-step timeout when call-level progress is ongoing.
 - Process constraints:
   - PRD-first implementation only.
   - Add tests in =tests/org-ai-skills-test.el= and BDD under =tests/bdd/=.
@@ -31,32 +36,58 @@ Current execution timeout is enforced at step lifecycle level, not per underlyin
 * Expected Behavior
 - Behavior 1:
   - A long task with multiple API calls inside one step does not fail due to cumulative step duration alone.
-  - Timeout is evaluated per dispatched API call window.
+  - Timeout is evaluated as a call-level inactivity window, not as total elapsed step time.
 - Behavior 2:
-  - If one API call exceeds timeout without terminal callback, runtime fails that call explicitly and surfaces failure in run-state.
+  - If one API call exceeds timeout without terminal callback or progress signal, runtime fails that call explicitly and surfaces failure in run-state.
 - Behavior 3:
+  - When a tool call is emitted and execution continues, watchdog timing is reset/advanced to the new call boundary so active multi-call chains are not timed out.
+- Behavior 4:
   - DAG output includes call-level nodes/events nested under each step with:
     - call id/index
     - request role (planner/execution)
     - duration
     - usage/cost (when present)
     - status (success/error/timeout)
-- Behavior 4:
+- Behavior 5:
+  - DAG output includes tool-level timing nodes/events (for example =tool.call:search1api...=) distinct from =api.call= and =execution.step=.
+  - Tool-level duration reflects tool invocation lifecycle, not total step duration.
+- Behavior 6:
+  - Tool timing pairing remains stable when async callbacks reorder/reshape tool arg payloads between =tool-call= and =tool-result=.
+- Behavior 7:
   - Existing planner and execution regression tests remain passing.
+- Behavior 8:
+  - DAG text view shows dependency levels with visible indentation so parent/child layering is easier to scan.
+  - Indentation can return to shallower levels between independent/sibling branches.
 
 * Tasks
-- [ ] Define call-level watchdog contract and update implementation points for planner/execution dispatch flow.
-- [ ] Add run-state data model entries for per-call events and update DAG renderer to expose call-level detail under steps.
-- [ ] Add ERT tests for:
+- [x] Define call-level inactivity-watchdog contract and update implementation points for planner/execution dispatch flow.
+- [x] Implement watchdog reset behavior on new tool-call progress within the same step.
+- [x] Add run-state data model entries for per-call events and update DAG renderer to expose call-level detail under steps.
+- [x] Add run-state =tool.call= timing events and DAG rendering for per-tool invocation visibility.
+- [x] Fix tool timing pairing so async callback arg reordering cannot inflate =tool.call= duration to full step time.
+- [x] Improve DAG text layout with dependency-level indentation and add regression test coverage.
+- [x] Add ERT tests for:
   - per-call timeout behavior
   - long-step multi-call success path
+  - watchdog reset on repeated tool-call rounds
   - call-level DAG event generation and status transitions
-- [ ] Add/update BDD scenario(s) validating timeout behavior and DAG visibility requirements.
-- [ ] Update README timeout and DAG observability documentation.
+  - tool-level timing event generation and DAG visibility
+- [x] Add/update BDD scenario(s) validating timeout behavior and DAG visibility requirements.
+- [x] Update README timeout and DAG observability documentation.
 
 * Open Questions
 - Should per-call timeout reuse existing variables (=org-ai-skills-planner-request-timeout-seconds= and =org-ai-skills-execution-request-timeout-seconds=) with clarified semantics, or introduce new variable names and deprecate old ones?
 - For DAG presentation, should call-level nodes be always-on or gated by observability level?
+- Which callback event(s) are authoritative for "watchdog reset" (tool-call emission only, or any non-terminal progress event)?
 
 * Worklog
 - 2026-02-28 :: PRD drafted for call-level watchdog semantics and API-call DAG visibility. Test status: pending.
+- 2026-02-28 :: PRD updated to explicitly remove cumulative per-step timeout during active multi-tool-call execution and define watchdog reset on new tool-call progress. Test status: pending.
+- 2026-02-28 :: Implemented call-level inactivity watchdog reset for planner/execution callbacks, added =api.call= run-state events, and extended event DAG with step-linked call nodes. Added ERT coverage for watchdog reset and call-level DAG, added BDD 012 scenario, and updated README timeout/observability docs. Test status: ERT pass (219/219); live BDD/E2E not run in this batch.
+- 2026-02-28 :: Fixed async tool-callback ordering bug where non-terminal text could trigger premature failure while a prior tool error was still pending but later recovered by successful tool-result callbacks. Updated execution error gating to fail unresolved tool errors only at terminal callback and added regression ERT for =error -> text -> success -> final text= sequence. Test status: ERT pass (220/220); live BDD/E2E not run in this batch.
+- 2026-02-28 :: Fixed backend compatibility bug where non-terminal =tool-result= callbacks carrying =stop-reason= metadata were misclassified as terminal and could prematurely fail execution on transient tool errors. Execution now ignores terminal metadata on =tool-call/tool-result/reasoning= payloads and only treats terminal flags on final-text or explicit =t= callbacks. Added regression ERT for =tool-result(error+stop-reason) -> tool-result(success+stop-reason) -> final text= sequence. Test status: ERT pass (221/221); live BDD/E2E not run in this batch.
+- 2026-02-28 :: Added per-tool timing observability via =tool.call= events in execution callback lifecycle, including DAG node rendering under parent steps (tool duration separated from total =api.call= duration). Added ERT coverage for tool timing event emission and DAG rendering, and updated BDD 012 + README docs for =tool.call=. Test status: ERT pass (223/223); live BDD/E2E not run in this batch.
+- 2026-02-28 :: Fixed tool timing pairing bug for async callback payload drift by matching start/result via stable call-id when present and tool-name FIFO secondary pairing when payload args reorder. Added ERT regression for reordered args path to prevent inflated =tool.call= durations. Test status: ERT pass (224/224); live BDD/E2E not run in this batch.
+- 2026-02-28 :: Added PRD scope for DAG text readability: render dependency levels with indentation in DAG log output. Test status: pending.
+- 2026-02-28 :: Implemented level-indented DAG text rendering with explicit =(Lx)= depth markers based on dependency depth and stable sorting. Added ERT regression to assert indentation for parent/child/grandchild nodes. Test status: ERT pass (225/225); live BDD/E2E not run in this batch.
+- 2026-02-28 :: Refined DAG text layout to preserve node/event order and compute visual depth from nearest dependency, so indent levels can return for sibling branches (avoids misleading single deep chain). Added ERT regression for depth return behavior. Test status: ERT pass (226/226); live BDD/E2E not run in this batch.

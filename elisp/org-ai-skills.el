@@ -282,16 +282,17 @@ Set to nil to use gptel/backend default."
   :group 'org-ai-skills)
 
 (defcustom org-ai-skills-planner-request-timeout-seconds 90
-  "Maximum seconds to wait for planner callback completion.
-When no usable planner callback arrives within this time, planner run fails
-with explicit fatal error instead of remaining in running state."
+  "Inactivity timeout window for planner request callbacks.
+Timer resets when planner callback progress arrives. Planner fails only when
+no callback progress is observed within this window."
   :type 'integer
   :group 'org-ai-skills)
 
 (defcustom org-ai-skills-execution-request-timeout-seconds 90
-  "Maximum seconds to wait for one execution-step callback completion.
-When no usable execution callback arrives within this time, step fails with
-explicit fatal error instead of remaining in running state."
+  "Inactivity timeout window for one execution-step API call.
+Timer resets when callback progress arrives (for example tool-call/tool-result
+events). Step fails only when no callback progress is observed within this
+window."
   :type 'integer
   :group 'org-ai-skills)
 
@@ -1922,18 +1923,36 @@ When INCLUDE-EVENTS is non-nil, render one node per timing event occurrence."
            metric-table))))
     (if include-events
         (let ((occurrence-table (make-hash-table :test #'equal))
+              (emitted-step-table (make-hash-table :test #'equal))
               (prev-node-id nil))
           (dolist (event events)
             (let* ((stage-id (or (plist-get event :stage-id) 'unknown))
                    (stage-name (format "%s" stage-id))
-                   (count (1+ (or (gethash stage-name occurrence-table) 0)))
                    (raw-step-id (plist-get event :step-id))
                    (step-id (and raw-step-id (format "%s" raw-step-id)))
-                   (event-node-id
-                    (format "%s%s#%d"
-                            stage-name
-                            (if step-id (format ":%s" step-id) "")
-                            count))
+                   (request-role (plist-get event :request-role))
+                   (call-index (plist-get event :call-index))
+                   (event-node-base-id
+                    (cond
+                     ((eq stage-id 'api.call)
+                      (format "api.call:%s%s%s"
+                              (or request-role 'unknown)
+                              (if step-id (format ":%s" step-id) "")
+                              (if call-index (format ":%s" call-index) "")))
+                     ((eq stage-id 'tool.call)
+                      (format "tool.call:%s%s%s"
+                              (or (plist-get event :tool-name) "unknown-tool")
+                              (if step-id (format ":%s" step-id) "")
+                              (if call-index (format ":%s" call-index) "")))
+                     (t
+                      (format "%s%s"
+                              stage-name
+                              (if step-id (format ":%s" step-id) "")))))
+                   (count-key (if (memq stage-id '(api.call tool.call))
+                                  event-node-base-id
+                                stage-name))
+                   (count (1+ (or (gethash count-key occurrence-table) 0)))
+                   (event-node-id (format "%s#%d" event-node-base-id count))
                    (usage (or (plist-get event :usage) nil))
                    (resolved-step (and step-id (gethash step-id step-table)))
                    (status (cond
@@ -1948,18 +1967,49 @@ When INCLUDE-EVENTS is non-nil, render one node per timing event occurrence."
                                   :input-tokens (or (plist-get usage :input-tokens) 0)
                                   :output-tokens (or (plist-get usage :output-tokens) 0)
                                   :total-tokens (or (plist-get usage :total-tokens) 0)
-                                  :estimated-cost-usd
-                                  (or (plist-get event :estimated-cost-usd) 0.0))))
-              (puthash stage-name count occurrence-table)
+                                  :estimated-cost-usd (or (plist-get event :estimated-cost-usd) 0.0)))
+                   (event-deps nil))
+              (puthash count-key count occurrence-table)
+              (when (and (memq stage-id '(api.call tool.call))
+                         step-id
+                         (not (gethash step-id emitted-step-table)))
+                (let ((step-status (cond
+                                    ((null resolved-step) 'running)
+                                    ((memq (plist-get resolved-step :status)
+                                           '(done success applied))
+                                     'success)
+                                    ((memq (plist-get resolved-step :status)
+                                           '(failed failure error))
+                                     'failure)
+                                    (t 'running))))
+                  (puthash step-id t emitted-step-table)
+                  (push (list :id step-id
+                              :goal (or (plist-get resolved-step :goal) "")
+                              :skills (or (plist-get resolved-step :skills) nil)
+                              :status step-status
+                              :dependencies nil
+                              :metrics (or (gethash step-id metric-table)
+                                           (list :duration-ms 0
+                                                 :input-tokens 0
+                                                 :output-tokens 0
+                                                 :total-tokens 0
+                                                 :estimated-cost-usd 0.0)))
+                        nodes)))
+              (when prev-node-id
+                (push prev-node-id event-deps))
+              (when (and (memq stage-id '(api.call tool.call)) step-id)
+                (push step-id event-deps))
               (push (list :id event-node-id
                           :goal goal
                           :skills skills
                           :status status
-                          :dependencies (if prev-node-id (list prev-node-id) nil)
+                          :dependencies (nreverse event-deps)
                           :metrics metrics)
                     nodes)
               (when prev-node-id
                 (push (list :from prev-node-id :to event-node-id) edges))
+              (when (and (memq stage-id '(api.call tool.call)) step-id)
+                (push (list :from step-id :to event-node-id) edges))
               (setq prev-node-id event-node-id))))
       (let ((seen-step-ids nil))
         (dolist (step plan)
@@ -2021,25 +2071,59 @@ When INCLUDE-EVENTS is non-nil, render one node per timing event occurrence."
              (length nodes) (length edges))
      (if (null nodes)
          "No DAG nodes available.\n"
-       (mapconcat
-        (lambda (node)
-          (let* ((id (plist-get node :id))
-                 (status (plist-get node :status))
-                 (deps (or (plist-get node :dependencies) nil))
-                 (skills (or (plist-get node :skills) nil))
-                 (metrics (or (plist-get node :metrics) nil)))
-            (format "- [%s] %s\n  deps: %s\n  skills: %s\n  metrics: %dms, in:%d out:%d total:%d cost:$%.6f\n"
-                    status
-                    id
-                    (if deps (string-join deps ", ") "-")
-                    (if skills (string-join skills ", ") "-")
-                    (or (plist-get metrics :duration-ms) 0)
-                    (or (plist-get metrics :input-tokens) 0)
-                    (or (plist-get metrics :output-tokens) 0)
-                    (or (plist-get metrics :total-tokens) 0)
-                    (or (plist-get metrics :estimated-cost-usd) 0.0))))
-        nodes
-        "\n")))))
+       (let ((node-table (make-hash-table :test 'equal))
+             (depth-table (make-hash-table :test 'equal))
+             (depth-stack (make-hash-table :test 'equal)))
+         (cl-loop for node in nodes
+                  do (let ((id (plist-get node :id)))
+                       (puthash id node node-table)))
+         (cl-labels
+             ((known-deps (id)
+                (seq-filter (lambda (dep) (gethash dep node-table))
+                            (or (plist-get (gethash id node-table) :dependencies) nil)))
+              (node-depth (id)
+                (or (gethash id depth-table)
+                    (if (gethash id depth-stack)
+                        0
+                      (progn
+                        (puthash id t depth-stack)
+                        (let* ((deps (known-deps id))
+                               ;; Visual layout depth prefers the closest known
+                               ;; dependency so sibling branches can return to
+                               ;; shallower levels in chronological output.
+                              (depth (if deps
+                                          (1+ (apply #'min (mapcar #'node-depth deps)))
+                                        0)))
+                          (remhash id depth-stack)
+                          (puthash id depth depth-table)
+                          depth)))))
+              (render-node (node)
+                (let* ((id (plist-get node :id))
+                       (depth (node-depth id))
+                       (indent (make-string (* 2 depth) ?\s))
+                       (status (plist-get node :status))
+                       (deps (or (plist-get node :dependencies) nil))
+                       (skills (or (plist-get node :skills) nil))
+                       (metrics (or (plist-get node :metrics) nil)))
+                  (format
+                   "%s- [%s] %s (L%d)\n%s  deps: %s\n%s  skills: %s\n%s  metrics: %dms, in:%d out:%d total:%d cost:$%.6f\n"
+                   indent
+                   status
+                   id
+                   depth
+                   indent
+                   (if deps (string-join deps ", ") "-")
+                   indent
+                   (if skills (string-join skills ", ") "-")
+                   indent
+                   (or (plist-get metrics :duration-ms) 0)
+                   (or (plist-get metrics :input-tokens) 0)
+                   (or (plist-get metrics :output-tokens) 0)
+                   (or (plist-get metrics :total-tokens) 0)
+                   (or (plist-get metrics :estimated-cost-usd) 0.0)))))
+           ;; Keep original node order for timeline readability while using
+           ;; computed depth for indentation.
+           (mapconcat #'render-node nodes "\n")))))))
 
 (defun org-ai-skills-ui-show-dag (&optional run-state)
   "Show execution DAG for RUN-STATE or current UI planner run."
@@ -2278,6 +2362,8 @@ Returns plist with keys:
 Only skills referenced by STEP are loaded from DIRECTORY."
   (let* ((skill-ids (or (plist-get step :skills) nil))
          (stage-start-ms (org-ai-skills--observability-now-ms))
+         (watchdog-seconds (max 1 (or org-ai-skills-execution-request-timeout-seconds 90)))
+         (call-index 1)
          (loaded-skills (mapcar (lambda (skill-id)
                                   (org-ai-skills-load-skill-by-id skill-id directory))
                                 skill-ids))
@@ -2286,12 +2372,148 @@ Only skills referenced by STEP are loaded from DIRECTORY."
          (failed nil)
          (done nil)
          (watchdog-timer nil)
-         (pending-tool-errors (make-hash-table :test 'equal)))
+         (pending-tool-errors (make-hash-table :test 'equal))
+         (tool-start-table (make-hash-table :test 'equal))
+         (tool-call-counters (make-hash-table :test 'equal))
+         (tool-timing-records nil))
     (cl-labels
         ((cancel-watchdog ()
            (when watchdog-timer
              (cancel-timer watchdog-timer))
            (setq watchdog-timer nil))
+         (reset-watchdog ()
+           (cancel-watchdog)
+           (setq watchdog-timer
+                 (run-at-time
+                  watchdog-seconds
+                  nil
+                  (lambda ()
+                    (finish-error
+                     (format "Execution step timeout after %ss without callback progress"
+                             watchdog-seconds))))))
+         (next-tool-call-index (tool-name)
+           (let ((next (1+ (or (gethash tool-name tool-call-counters) 0))))
+             (puthash tool-name next tool-call-counters)
+             next))
+         (tool-item-call-key (item)
+           (let* ((args (nth 1 item))
+                  (call-id
+                   (and (listp args)
+                        (or (plist-get args :tool_call_id)
+                            (plist-get args :tool-call-id)
+                            (plist-get args :call_id)
+                            (plist-get args :call-id)
+                            (plist-get args :id)))))
+             (cond
+              ((and (stringp call-id) (not (string-empty-p call-id)))
+               (format "id:%s" call-id))
+              ((and call-id (symbolp call-id))
+               (format "id:%s" (symbol-name call-id)))
+              (t
+               (format "args:%s" (prin1-to-string (or args nil)))))))
+         (enqueue-tool-start (item)
+           (let* ((tool-name (org-ai-skills--tool-name-from-result-item item))
+                  (queue (or (gethash tool-name tool-start-table) nil))
+                  (entry (list :tool-name tool-name
+                               :tool-key (tool-item-call-key item)
+                               :call-index (next-tool-call-index tool-name)
+                               :start-ms (org-ai-skills--observability-now-ms))))
+             (puthash tool-name (append queue (list entry)) tool-start-table)))
+         (dequeue-tool-start (item)
+           (let* ((tool-name (org-ai-skills--tool-name-from-result-item item))
+                  (tool-key (tool-item-call-key item))
+                  (queue (or (gethash tool-name tool-start-table) nil))
+                  (entry nil)
+                  (next-queue nil))
+             (if (null queue)
+                 nil
+               (progn
+                 (if tool-key
+                     (let ((remaining queue)
+                           (matched nil))
+                       (while remaining
+                         (let ((candidate (car remaining)))
+                           (if (and (not matched)
+                                    (equal (plist-get candidate :tool-key) tool-key))
+                               (progn
+                                 (setq entry candidate
+                                       matched t))
+                             (setq next-queue (append next-queue (list candidate)))))
+                         (setq remaining (cdr remaining))))
+                   (setq entry (car queue)
+                         next-queue (cdr queue)))
+                 (unless entry
+                   ;; Secondary deterministic pairing strategy for async backends
+                   ;; that reorder or reshape args between callbacks.
+                   (setq entry (car queue)
+                         next-queue (cdr queue)))
+                 (puthash tool-name next-queue tool-start-table)
+                 entry))))
+         (record-tool-result-timing (item)
+           (let* ((tool-name (org-ai-skills--tool-name-from-result-item item))
+                  (raw-result (nth 2 item))
+                  (parsed (org-ai-skills--parse-provider-tool-result raw-result))
+                  (start-entry (dequeue-tool-start item))
+                  (end-ms (org-ai-skills--observability-now-ms))
+                  (status (if (and parsed
+                                   (plist-member parsed :ok)
+                                   (null (plist-get parsed :ok)))
+                              'error
+                            'success))
+                  (error-message (and (eq status 'error)
+                                      (or (plist-get parsed :error-message)
+                                          "Provider tool execution failed")))
+                  (call-idx (or (plist-get start-entry :call-index)
+                                (next-tool-call-index tool-name)))
+                  (start-ms (or (plist-get start-entry :start-ms) end-ms)))
+             (push (list :tool-name tool-name
+                         :call-index call-idx
+                         :status status
+                         :error error-message
+                         :start-ms start-ms
+                         :end-ms end-ms)
+                   tool-timing-records)))
+         (update-tool-timing-from-callback (first)
+           (when (and (consp first) (eq (car first) 'tool-call))
+             (dolist (item (cdr first))
+               (enqueue-tool-start item)))
+           (when (and (consp first) (eq (car first) 'tool-result))
+             (dolist (item (cdr first))
+               (record-tool-result-timing item))))
+         (append-tool-timing-events (state stage-end-ms &optional pending-status pending-error)
+           (let ((combined (or tool-timing-records nil)))
+             (maphash
+              (lambda (_tool-key queue)
+                (dolist (entry queue)
+                  (push (list :tool-name (or (plist-get entry :tool-name) "unknown-tool")
+                              :call-index (or (plist-get entry :call-index) 0)
+                              :status (or pending-status 'error)
+                              :error pending-error
+                              :start-ms (or (plist-get entry :start-ms) stage-end-ms)
+                              :end-ms stage-end-ms)
+                        combined)))
+              tool-start-table)
+             (let* ((records
+                     (sort (copy-sequence combined)
+                           (lambda (a b)
+                             (< (or (plist-get a :start-ms) 0)
+                                (or (plist-get b :start-ms) 0)))))
+                    (next-state state))
+               (dolist (record records)
+                 (setq next-state
+                       (org-ai-skills--run-state-append-timing-event
+                        next-state
+                        'tool.call
+                        (or (plist-get record :start-ms) stage-end-ms)
+                        (or (plist-get record :end-ms) stage-end-ms)
+                        (list :status (or (plist-get record :status) 'success)
+                              :request-role 'execution
+                              :step-id (plist-get step :step-id)
+                              :skill-ids (plist-get step :skills)
+                              :tool-name (or (plist-get record :tool-name) "unknown-tool")
+                              :call-index (or (plist-get record :call-index) 0)
+                              :error (plist-get record :error)))))
+               next-state)))
          (finish-error (message)
            (unless done
              (setq failed t
@@ -2300,13 +2522,28 @@ Only skills referenced by STEP are loaded from DIRECTORY."
              (let* ((stage-end-ms (org-ai-skills--observability-now-ms))
                     (usage (org-ai-skills--normalize-provider-usage
                             (and request (plist-get request :provider-data))))
+                    (tools-run-state
+                     (append-tool-timing-events run-state stage-end-ms 'error message))
                     (timed-run-state
                      (org-ai-skills--run-state-append-timing-event
-                      run-state
+                      (org-ai-skills--run-state-append-timing-event
+                       tools-run-state
+                       'api.call
+                       stage-start-ms
+                       stage-end-ms
+                       (list :status 'error
+                             :request-role 'execution
+                             :call-index call-index
+                             :step-id (plist-get step :step-id)
+                             :usage usage
+                             :estimated-cost-usd (plist-get usage :estimated-cost-usd)
+                             :error message))
                       'execution.step
                       stage-start-ms
                       stage-end-ms
                       (list :status 'error
+                            :request-role 'execution
+                            :call-index call-index
                             :step-id (plist-get step :step-id)
                             :skill-ids (plist-get step :skills)
                             :plan-revision (or (plist-get run-state :plan-revision) 1)
@@ -2321,48 +2558,76 @@ Only skills referenced by STEP are loaded from DIRECTORY."
             (dolist (skill loaded-skills)
               (org-ai-skills-apply-skill-function-calls skill))
             (setq request (org-ai-skills-build-step-request step run-state loaded-skills))
-            (setq watchdog-timer
-                  (run-at-time
-                   (max 1 (or org-ai-skills-execution-request-timeout-seconds 90))
-                   nil
-                   (lambda ()
-                     (finish-error
-                      (format "Execution step timeout after %ss without terminal callback"
-                              (max 1 (or org-ai-skills-execution-request-timeout-seconds 90)))))))
+            (reset-watchdog)
             (org-ai-skills-gptel-dispatch-rewrite
              request
              (lambda (&rest response)
                (unwind-protect
                    (unless (or failed done)
                      (condition-case err
-                         (let ((raw (apply #'org-ai-skills--extract-gptel-response-text-if-ready response)))
-                           (let ((first (car response))
-                                 (info (cadr response)))
-                             (org-ai-skills--update-pending-tool-errors first pending-tool-errors)
-                             (setq request
-                                   (plist-put
-                                    request
-                                    :provider-data
-                                    (org-ai-skills--select-provider-usage-source
-                                     first info (plist-get request :provider-data)))))
+                         (let* ((first (car response))
+                                (info (cadr response))
+                                (raw (apply #'org-ai-skills--extract-gptel-response-text-if-ready response))
+                                (non-text-event-p
+                                 (and (consp first)
+                                      (memq (car first) '(tool-call tool-result reasoning))))
+                                (terminal-signal
+                                 (or (eq first t)
+                                     (and (not non-text-event-p)
+                                          (org-ai-skills--gptel-callback-terminal-p info))))
+                                (progress-signal
+                                 (org-ai-skills--gptel-callback-progress-p first info raw)))
+                           (update-tool-timing-from-callback first)
+                           (org-ai-skills--update-pending-tool-errors first pending-tool-errors)
+                           (setq request
+                                 (plist-put
+                                  request
+                                  :provider-data
+                                  (org-ai-skills--select-provider-usage-source
+                                   first info (plist-get request :provider-data))))
+                           (when (and (not terminal-signal) progress-signal)
+                             (reset-watchdog))
                            (if raw
                                (let ((pending-message
                                       (org-ai-skills--first-pending-tool-error
                                        pending-tool-errors)))
-                                 (if (stringp pending-message)
-                                     (finish-error pending-message)
+                                 (cond
+                                  ((and (stringp pending-message)
+                                        terminal-signal)
+                                   (finish-error pending-message))
+                                  ((stringp pending-message)
+                                   ;; Non-terminal text can arrive before tool retries finish.
+                                   ;; Keep waiting unless terminal callback still has unresolved tool error.
+                                   nil)
+                                  (t
                                    (let* ((output (org-ai-skills--extract-subtree-body raw))
                                           (usage (org-ai-skills--normalize-provider-usage
                                                   (plist-get request :provider-data)))
                                           (updated-run-state (org-ai-skills--record-run-step run-state step output))
                                           (stage-end-ms (org-ai-skills--observability-now-ms))
+                                          (tools-run-state
+                                           (append-tool-timing-events updated-run-state stage-end-ms 'error
+                                                                      "Tool call not completed before step success"))
                                           (timed-run-state
                                            (org-ai-skills--run-state-append-timing-event
-                                            updated-run-state
+                                            (org-ai-skills--run-state-append-timing-event
+                                             tools-run-state
+                                             'api.call
+                                             stage-start-ms
+                                             stage-end-ms
+                                             (list :status 'success
+                                                   :request-role 'execution
+                                                   :call-index call-index
+                                                   :step-id (plist-get step :step-id)
+                                                   :usage usage
+                                                   :estimated-cost-usd
+                                                   (plist-get usage :estimated-cost-usd)))
                                             'execution.step
                                             stage-start-ms
                                             stage-end-ms
                                             (list :status 'success
+                                                  :request-role 'execution
+                                                  :call-index call-index
                                                   :step-id (plist-get step :step-id)
                                                   :skill-ids (plist-get step :skills)
                                                   :plan-revision (or (plist-get run-state :plan-revision) 1)
@@ -2373,8 +2638,8 @@ Only skills referenced by STEP are loaded from DIRECTORY."
                                            (org-ai-skills--run-state-accumulate-usage timed-run-state usage)))
                                      (setq done t)
                                      (cancel-watchdog)
-                                     (funcall callback metered-run-state output))))
-                             (when (eq (car response) t)
+                                     (funcall callback metered-run-state output)))))
+                             (when terminal-signal
                                (let ((pending-message
                                       (org-ai-skills--first-pending-tool-error
                                        pending-tool-errors)))
@@ -2464,6 +2729,15 @@ status metadata on non-terminal callbacks."
              (or (plist-get data :done)
                  (plist-get data :stop-reason))))))
 
+(defun org-ai-skills--gptel-callback-progress-p (first info text)
+  "Return non-nil when callback carries non-terminal progress."
+  (or (and (consp first)
+           (memq (car first) '(tool-call tool-result reasoning)))
+      (and (stringp text)
+           (not (string-empty-p text)))
+      (and (not (eq first t))
+           (not (org-ai-skills--gptel-callback-terminal-p info)))))
+
 (defun org-ai-skills--planner-json-truncated-error-p (message)
   "Return non-nil when MESSAGE indicates truncated planner JSON."
   (and (stringp message)
@@ -2475,6 +2749,8 @@ status metadata on non-terminal callbacks."
 CALLBACK receives (PLANNER-RESPONSE UPDATED-RUN-STATE)."
   (let ((request (org-ai-skills-build-planner-request task metadata run-state))
         (request-start-ms (org-ai-skills--observability-now-ms))
+        (watchdog-seconds (max 1 (or org-ai-skills-planner-request-timeout-seconds 90)))
+        (call-index (1+ (or retry-attempt 0)))
         (planner-text "")
         (provider-data nil)
         (retry-attempt (or retry-attempt 0))
@@ -2486,17 +2762,39 @@ CALLBACK receives (PLANNER-RESPONSE UPDATED-RUN-STATE)."
            (when watchdog-timer
              (cancel-timer watchdog-timer))
            (setq watchdog-timer nil))
+         (reset-watchdog ()
+           (cancel-watchdog)
+           (setq watchdog-timer
+                 (run-at-time
+                  watchdog-seconds
+                  nil
+                  (lambda ()
+                    (unless done
+                      (finish-fatal
+                       (format "Planner request timeout after %ss without callback progress"
+                               watchdog-seconds)))))))
          (finish-success (parsed &optional recovered)
            (let* ((end-ms (org-ai-skills--observability-now-ms))
                   (usage (org-ai-skills--normalize-provider-usage provider-data))
                   (timed-run-state
                    (org-ai-skills--run-state-append-timing-event
                     (org-ai-skills--run-state-append-timing-event
-                     run-state
-                     'planning.parse
+                     (org-ai-skills--run-state-append-timing-event
+                      run-state
+                      'planning.parse
+                      request-start-ms
+                      end-ms
+                      (list :status 'success
+                            :plan-revision (or (plist-get run-state :plan-revision) 1)
+                            :usage usage
+                            :estimated-cost-usd (plist-get usage :estimated-cost-usd)
+                            :recovered recovered))
+                     'api.call
                      request-start-ms
                      end-ms
                      (list :status 'success
+                           :request-role 'planner
+                           :call-index call-index
                            :plan-revision (or (plist-get run-state :plan-revision) 1)
                            :usage usage
                            :estimated-cost-usd (plist-get usage :estimated-cost-usd)
@@ -2505,6 +2803,8 @@ CALLBACK receives (PLANNER-RESPONSE UPDATED-RUN-STATE)."
                     request-start-ms
                     end-ms
                     (list :status 'success
+                          :request-role 'planner
+                          :call-index call-index
                           :plan-revision (or (plist-get run-state :plan-revision) 1)
                           :usage usage
                           :estimated-cost-usd (plist-get usage :estimated-cost-usd)
@@ -2520,11 +2820,24 @@ CALLBACK receives (PLANNER-RESPONSE UPDATED-RUN-STATE)."
                   (usage (org-ai-skills--normalize-provider-usage provider-data))
                   (timed-run-state
                    (org-ai-skills--run-state-append-timing-event
-                    run-state
+                    (org-ai-skills--run-state-append-timing-event
+                     run-state
+                     'api.call
+                     request-start-ms
+                     end-ms
+                     (list :status 'error
+                           :request-role 'planner
+                           :call-index call-index
+                           :plan-revision (or (plist-get run-state :plan-revision) 1)
+                           :usage usage
+                           :estimated-cost-usd (plist-get usage :estimated-cost-usd)
+                           :error message))
                     'planning.request
                     request-start-ms
                     end-ms
                     (list :status 'error
+                          :request-role 'planner
+                          :call-index call-index
                           :plan-revision (or (plist-get run-state :plan-revision) 1)
                           :usage usage
                           :estimated-cost-usd (plist-get usage :estimated-cost-usd)
@@ -2535,15 +2848,7 @@ CALLBACK receives (PLANNER-RESPONSE UPDATED-RUN-STATE)."
                    run-state metered-run-state)
              (cancel-watchdog)
              (funcall callback nil (plist-put metered-run-state :fatal-error message)))))
-      (setq watchdog-timer
-            (run-at-time
-             (max 1 (or org-ai-skills-planner-request-timeout-seconds 90))
-             nil
-             (lambda ()
-               (unless done
-                 (finish-fatal
-                  (format "Planner request timeout after %ss without terminal callback"
-                          (max 1 (or org-ai-skills-planner-request-timeout-seconds 90))))))))
+      (reset-watchdog)
       (org-ai-skills-gptel-dispatch-rewrite
        request
          (lambda (&rest response)
@@ -2587,6 +2892,9 @@ CALLBACK receives (PLANNER-RESPONSE UPDATED-RUN-STATE)."
                             terminal-signal)))
              (setq provider-data
                    (org-ai-skills--select-provider-usage-source first info provider-data))
+             (when (and (not final-event)
+                        (org-ai-skills--gptel-callback-progress-p first info text))
+               (reset-watchdog))
              (when (and final-event
                         (string-empty-p (or text ""))
                         (string-empty-p planner-text))

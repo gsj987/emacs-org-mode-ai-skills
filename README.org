@@ -92,6 +92,7 @@ Phase 1 adds Org-based BDD scenarios under =tests/bdd/= and a live E2E runner th
   - =tests/bdd/009-planner-multiline-json-parse.org=
   - =tests/bdd/010-tool-call-buffer-lifecycle.org=
   - =tests/bdd/011-execution-stall-fail-fast.org=
+  - =tests/bdd/012-call-level-watchdog-and-dag-visibility.org=
 - Scenario file keeps fixture data inline via sections:
   - =* Fixture Input=
 - Scenario and fixture headings can include Org property drawers for richer cases.
@@ -463,7 +464,11 @@ Role-scoped model and system prompt routing:
   - =org-ai-skills-planner-allow-schema-fallback= is deprecated and ignored.
     Planner no longer retries with schema disabled.
   - =org-ai-skills-planner-request-timeout-seconds= (default =90=)
+    - Inactivity watchdog window per planner API call.
+    - Timer resets on callback progress; no cumulative step wall-clock timeout.
   - =org-ai-skills-execution-request-timeout-seconds= (default =90=)
+    - Inactivity watchdog window per execution API call.
+    - Timer resets on callback progress events (including tool-call/tool-result).
 - System prompt overrides:
   - =org-ai-skills-system-prompt-planner=
   - =org-ai-skills-system-prompt-execution=
@@ -508,6 +513,8 @@ Debug observability:
 Run-state timing observability:
 - Planner and execution flows append timing events to =run-state :events=.
 - Current stage ids:
+  - =api.call= (call-level planner/execution timing)
+  - =tool.call= (per-tool invocation timing within execution callbacks)
   - =planning.request=
   - =planning.parse=
   - =execution.step=
@@ -538,11 +545,21 @@ Execution DAG observability:
 - View DAG interactively:
   - =M-x org-ai-skills-ui-show-dag=
   - In control panel: press =v=
-- DAG nodes include:
+  - DAG nodes include:
   - =:id=, =:status=, =:dependencies=, =:skills=, =:metrics=
+  - Text rendering is level-indented by dependency depth (=L0/L1/L2...=) while
+    preserving event/node order, so indentation can return to shallower levels
+    between branches instead of forcing one continuously deep chain.
   - Interactive view auto-switches to event-instance DAG when run-state has timing events,
     so planner/replan calls appear as separate nodes (e.g., =planning.request#2=,
-    =execution.step:step-2#1=).
+    =execution.step:step-2#1=, =api.call:execution:step-2:1#1=,
+    =tool.call:org-ai-skills-search1api-fetch-financial-news-raw:step-2:1#1=).
+  - In event-instance mode, =api.call= nodes for execution include parent step edge
+    (=step-id -> api.call=) for call-level visibility under each step.
+  - In event-instance mode, =tool.call= nodes expose tool invocation duration separate
+    from total execution request latency.
+  - Tool timing pairing prefers stable call IDs from callback args and then uses
+    per-tool FIFO matching when async backends reorder argument fields.
 
 Embark integration:
 - Requires Embark installed.

@@ -1,0 +1,23 @@
+#+TITLE: BDD 012 - Call-level watchdog and DAG visibility
+
+* Feature
+Long multi-tool-call execution should use inactivity watchdog semantics and expose call-level DAG nodes.
+
+* Scenario: Planner run reports call-level DAG visibility without step-level cumulative timeout semantics
+Given target heading "Call-level Watchdog Validation"
+And fixture source is "inline section: Fixture Input"
+And planner task "生成今天的金融日报"
+And model "minimax/minimax-m2.5"
+And provider mode "live"
+When user runs command "org-ai-skills-plan-run"
+Then run status should be one of "applied,success,done,failed"
+And dag info should contain "Execution DAG"
+And dag info should contain "api.call"
+And dag info should contain "tool.call"
+
+* Fixture Input
+** Call-level Watchdog Validation
+ :PROPERTIES:
+ :PURPOSE: Validate call-level watchdog and DAG visibility.
+ :END:
+This subtree validates that long planner/execution runs remain bounded by callback inactivity windows and surface api.call DAG nodes.
