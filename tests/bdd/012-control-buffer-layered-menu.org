@@ -1,0 +1,33 @@
+#+TITLE: BDD 012 - Control buffer layered menu key routing
+
+* Feature
+Control workspace uses layered menus so keys are conflict-free within each menu.
+
+* Scenario: Key `v` routes by menu layer instead of global collision
+ :PROPERTIES:
+ :SCENARIO_ID: bdd-012-layered-menu-v-routing
+ :PRIORITY: p1
+ :END:
+Given control workspace is open for a completed run
+And control menu is "Top"
+When user opens menu "Proposal"
+And user presses key "v"
+Then proposal preview buffer should open
+And control menu should remain "Proposal"
+When user goes back to "Top"
+And user opens menu "Observability"
+And user presses key "v"
+Then DAG buffer should open
+And control menu should remain "Observability"
+
+* Scenario: Disabled action is visible in layer and blocked by state
+ :PROPERTIES:
+ :SCENARIO_ID: bdd-012-layered-menu-disabled-guard
+ :PRIORITY: p1
+ :END:
+Given control workspace is open for a running run
+And control menu is "Run"
+Then key row "g rerun" should be disabled
+When user presses key "g"
+Then rerun should not be dispatched
+And control status should remain "running"

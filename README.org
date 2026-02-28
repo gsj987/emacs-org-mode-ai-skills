@@ -300,22 +300,33 @@ Interactive flow:
   - Runtime also caps control width at half of current frame.
 
 Control workspace keys (in =*org-ai-skills-control*=):
-- =s=: stop current run (enabled only while status is =running=)
-- =g=: rerun with same context (dispatches a new run; unavailable while running)
-- =t=: adjust planner task / rewrite instruction, then rerun (unavailable while running)
-- =v=: view execution DAG for current planner run
-- =c=: open minibuffer candidate selector
-- =a=: apply currently selected candidate (unavailable while running)
-- =d=: mark selected candidate as discarded (unavailable while running)
-- =x=: manually extract reusable patterns from selected/latest candidate into proposal artifact (unavailable while running)
-- =p=: select proposal from current slot (minibuffer)
-- =v=: preview selected proposal details in =*org-ai-skills-proposal*=
-- =y=: approve selected proposal (unavailable while running; only =proposed= proposals)
-- =n=: reject selected proposal (unavailable while running; supports =proposed= or =approved= proposals)
-- =m=: apply selected proposal (artifact-only apply; requires =approved=)
-- =M=: apply selected proposal to target skill file (confirmed; requires =approved=; unavailable while running)
-- =q=: close workspace (run continues in background; use =s= to stop)
-- =r=: refresh control buffer
+- Top menu:
+  - =r=: open Run menu
+  - =c=: open Candidate menu
+  - =p=: open Proposal menu
+  - =o=: open Observability menu
+- Common keys (all menus):
+  - =b=: back to Top menu
+  - =R=: refresh control buffer
+  - =q=: close workspace (run continues in background; use Run menu =s= to stop)
+- Run menu:
+  - =s=: stop current run (enabled only while status is =running=)
+  - =g=: rerun with same context (dispatches a new run; unavailable while running)
+  - =t=: adjust planner task / rewrite instruction, then rerun (unavailable while running)
+- Candidate menu:
+  - =c=: open minibuffer candidate selector
+  - =a=: apply currently selected candidate (unavailable while running)
+  - =d=: mark selected candidate as discarded (unavailable while running)
+- Proposal menu:
+  - =x=: manually extract reusable patterns from selected/latest candidate into proposal artifact (unavailable while running)
+  - =p=: select proposal from current slot (minibuffer)
+  - =v=: preview selected proposal details in =*org-ai-skills-proposal*=
+  - =y=: approve selected proposal (unavailable while running; only =proposed= proposals)
+  - =n=: reject selected proposal (unavailable while running; supports =proposed= or =approved= proposals)
+  - =m=: apply selected proposal (artifact-only apply; requires =approved=)
+  - =M=: apply selected proposal to target skill file (confirmed; requires =approved=; unavailable while running)
+- Observability menu:
+  - =v=: view execution DAG for current planner run
 
 Control panel details:
 - On first workspace activation, focus moves to control panel for key-driven operation.

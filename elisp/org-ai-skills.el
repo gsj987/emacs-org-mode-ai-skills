@@ -448,25 +448,22 @@ Each entry is a plist with at least :timestamp, :event-type, :log-level,
 (defvar org-ai-skills--ui-run-state nil
   "Runtime UI state for current run and control workspace.")
 
+(defconst org-ai-skills--ui-control-layers
+  '(top run candidate proposal observability)
+  "Supported control buffer menu layers.")
+
+(defconst org-ai-skills--ui-control-dispatch-keys
+  '("a" "b" "c" "C" "d" "g" "m" "M" "n" "o" "O" "p" "P" "q" "r" "R" "s" "t" "v" "x" "y")
+  "Keys handled by layered control menu dispatch.")
+
+(defun org-ai-skills--ui-control-install-keymap-bindings (map)
+  "Install layered dispatch key bindings into MAP."
+  (dolist (key org-ai-skills--ui-control-dispatch-keys)
+    (define-key map (kbd key) #'org-ai-skills-ui-control-dispatch))
+  map)
+
 (defvar org-ai-skills-control-mode-map
-  (let ((map (make-sparse-keymap)))
-    (define-key map (kbd "s") #'org-ai-skills-ui-stop-run)
-    (define-key map (kbd "g") #'org-ai-skills-ui-rerun)
-    (define-key map (kbd "t") #'org-ai-skills-ui-adjust-task-or-instruction)
-    (define-key map (kbd "v") #'org-ai-skills-ui-show-dag)
-    (define-key map (kbd "c") #'org-ai-skills-ui-select-candidate)
-    (define-key map (kbd "a") #'org-ai-skills-ui-apply-selected-candidate)
-    (define-key map (kbd "d") #'org-ai-skills-ui-discard-selected-candidate)
-    (define-key map (kbd "x") #'org-ai-skills-ui-extract-pattern-proposal)
-    (define-key map (kbd "p") #'org-ai-skills-ui-select-proposal)
-    (define-key map (kbd "y") #'org-ai-skills-ui-approve-selected-proposal)
-    (define-key map (kbd "n") #'org-ai-skills-ui-reject-selected-proposal)
-    (define-key map (kbd "m") #'org-ai-skills-ui-apply-selected-proposal)
-    (define-key map (kbd "M") #'org-ai-skills-ui-apply-selected-proposal-to-skill-file)
-    (define-key map (kbd "v") #'org-ai-skills-ui-preview-selected-proposal)
-    (define-key map (kbd "q") #'org-ai-skills-ui-close-workspace)
-    (define-key map (kbd "r") #'org-ai-skills-ui-refresh-control-buffer)
-    map)
+  (org-ai-skills--ui-control-install-keymap-bindings (make-sparse-keymap))
   "Keymap for `org-ai-skills-control-mode'.")
 
 (defface org-ai-skills-ui-overlay-running-face
@@ -3824,15 +3821,7 @@ Return an alist where each item is (DISPLAY . SUBTREE-PLIST)."
   (setq-local truncate-lines t))
 
 ;; Ensure key bindings are refreshed even when map already exists in a live session.
-(define-key org-ai-skills-control-mode-map (kbd "s") #'org-ai-skills-ui-stop-run)
-(define-key org-ai-skills-control-mode-map (kbd "g") #'org-ai-skills-ui-rerun)
-(define-key org-ai-skills-control-mode-map (kbd "t") #'org-ai-skills-ui-adjust-task-or-instruction)
-(define-key org-ai-skills-control-mode-map (kbd "v") #'org-ai-skills-ui-show-dag)
-(define-key org-ai-skills-control-mode-map (kbd "c") #'org-ai-skills-ui-select-candidate)
-(define-key org-ai-skills-control-mode-map (kbd "a") #'org-ai-skills-ui-apply-selected-candidate)
-(define-key org-ai-skills-control-mode-map (kbd "d") #'org-ai-skills-ui-discard-selected-candidate)
-(define-key org-ai-skills-control-mode-map (kbd "q") #'org-ai-skills-ui-close-workspace)
-(define-key org-ai-skills-control-mode-map (kbd "r") #'org-ai-skills-ui-refresh-control-buffer)
+(org-ai-skills--ui-control-install-keymap-bindings org-ai-skills-control-mode-map)
 
 (defun org-ai-skills--ui-control-buffer ()
   "Return control buffer."
@@ -3897,11 +3886,24 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
             status-mark
             (truncate-string-to-width preview (max 16 preview-width) nil nil t))))
 
-(defun org-ai-skills-ui-refresh-control-buffer ()
-  "Re-render control buffer content from current runtime state."
-  (interactive)
-  (let* ((buffer (org-ai-skills--ui-control-buffer))
-         (status (or (org-ai-skills--ui-run-get :status) 'idle))
+(defun org-ai-skills--ui-control-current-layer ()
+  "Return current control menu layer symbol."
+  (let ((layer (org-ai-skills--ui-run-get :control-layer)))
+    (if (memq layer org-ai-skills--ui-control-layers)
+        layer
+      'top)))
+
+(defun org-ai-skills--ui-control-set-layer (layer)
+  "Set current control menu LAYER and refresh control buffer."
+  (unless (memq layer org-ai-skills--ui-control-layers)
+    (org-ai-skills--signal-org-context-error
+     (format "Unknown control layer: %s" layer)))
+  (org-ai-skills--ui-run-set :control-layer layer)
+  (org-ai-skills-ui-refresh-control-buffer))
+
+(defun org-ai-skills--ui-control-context ()
+  "Build control panel render/dispatch context from UI run state."
+  (let* ((status (or (org-ai-skills--ui-run-get :status) 'idle))
          (progress (or (org-ai-skills--ui-run-get :progress) "idle"))
          (error-detail (org-ai-skills--ui-run-get :error-detail))
          (error-text (when (and (stringp error-detail)
@@ -3927,6 +3929,9 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
          (selected-proposal-id (or (and selected-proposal
                                         (plist-get selected-proposal :proposal-id))
                                    "none"))
+         (selected-proposal-status (or (and selected-proposal
+                                            (plist-get selected-proposal :status))
+                                       ""))
          (rerun-enabled (and (functionp (org-ai-skills--ui-run-get :rerun-fn))
                              (not running)))
          (adjust-enabled (and (memq run-type '(planner rewrite))
@@ -3947,21 +3952,204 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
          (preview-enabled (and proposal-enabled (not running)))
          (approve-enabled (and proposal-enabled
                                (not running)
-                               (let ((status* (and selected-proposal
-                                                   (plist-get selected-proposal :status))))
-                                 (equal status* "proposed"))))
+                               (equal selected-proposal-status "proposed")))
          (reject-enabled (and proposal-enabled
                               (not running)
-                              (let ((status* (and selected-proposal
-                                                  (plist-get selected-proposal :status))))
-                                (member status* '("proposed" "approved")))))
+                              (member selected-proposal-status
+                                      '("proposed" "approved"))))
          (proposal-apply-enabled (and proposal-enabled
                                      (not running)
-                                     (let ((status* (and selected-proposal
-                                                         (plist-get selected-proposal :status))))
-                                       (equal status* "approved"))))
-         (proposal-file-apply-enabled proposal-apply-enabled)
-         (stop-enabled running)
+                                     (equal selected-proposal-status "approved")))
+         (stop-enabled running))
+    (list :status status
+          :progress progress
+          :error-text error-text
+          :task task
+          :preset preset
+          :heading heading
+          :selected-id selected-id
+          :selected-proposal-id selected-proposal-id
+          :candidates candidates
+          :proposals proposals
+          :stop-enabled stop-enabled
+          :rerun-enabled rerun-enabled
+          :adjust-enabled adjust-enabled
+          :candidate-enabled candidate-enabled
+          :apply-enabled apply-enabled
+          :discard-enabled discard-enabled
+          :extract-enabled extract-enabled
+          :proposal-enabled proposal-enabled
+          :preview-enabled preview-enabled
+          :approve-enabled approve-enabled
+          :reject-enabled reject-enabled
+          :proposal-apply-enabled proposal-apply-enabled
+          :proposal-file-apply-enabled proposal-apply-enabled
+          :dag-enabled dag-enabled)))
+
+(defun org-ai-skills--ui-control-layer-title (layer)
+  "Return display title for control menu LAYER."
+  (pcase layer
+    ('top "Top")
+    ('run "Run")
+    ('candidate "Candidate")
+    ('proposal "Proposal")
+    ('observability "Observability")
+    (_ "Top")))
+
+(defun org-ai-skills--ui-control-render-key-line (key label enabled key-face)
+  "Render one key line for KEY LABEL with ENABLED state using KEY-FACE."
+  (insert (propertize (format "  %s %s" key label)
+                      'face (funcall key-face enabled))
+          "\n"))
+
+(defun org-ai-skills--ui-control-insert-keys (layer context key-face)
+  "Insert key section for menu LAYER using CONTEXT and KEY-FACE."
+  (insert (format "Keys (%s):\n" (org-ai-skills--ui-control-layer-title layer)))
+  (if (eq layer 'top)
+      (progn
+        (org-ai-skills--ui-control-render-key-line "r" "open run menu" t key-face)
+        (org-ai-skills--ui-control-render-key-line "c" "open candidate menu" t key-face)
+        (org-ai-skills--ui-control-render-key-line "p" "open proposal menu" t key-face)
+        (org-ai-skills--ui-control-render-key-line "o" "open observability menu" t key-face))
+    (org-ai-skills--ui-control-render-key-line "b" "back to top menu" t key-face))
+  (pcase layer
+    ('run
+     (org-ai-skills--ui-control-render-key-line "s" "stop run" (plist-get context :stop-enabled) key-face)
+     (org-ai-skills--ui-control-render-key-line "g" "rerun" (plist-get context :rerun-enabled) key-face)
+     (org-ai-skills--ui-control-render-key-line "t" "adjust task/instruction" (plist-get context :adjust-enabled) key-face))
+    ('candidate
+     (org-ai-skills--ui-control-render-key-line "c" "select candidate (minibuffer)" (plist-get context :candidate-enabled) key-face)
+     (org-ai-skills--ui-control-render-key-line "a" "apply selected candidate" (plist-get context :apply-enabled) key-face)
+     (org-ai-skills--ui-control-render-key-line "d" "discard selected candidate" (plist-get context :discard-enabled) key-face))
+    ('proposal
+     (org-ai-skills--ui-control-render-key-line "x" "extract pattern proposal (manual)" (plist-get context :extract-enabled) key-face)
+     (org-ai-skills--ui-control-render-key-line "p" "select proposal (minibuffer)" (plist-get context :proposal-enabled) key-face)
+     (org-ai-skills--ui-control-render-key-line "v" "preview selected proposal" (plist-get context :preview-enabled) key-face)
+     (org-ai-skills--ui-control-render-key-line "y" "approve selected proposal" (plist-get context :approve-enabled) key-face)
+     (org-ai-skills--ui-control-render-key-line "n" "reject selected proposal" (plist-get context :reject-enabled) key-face)
+     (org-ai-skills--ui-control-render-key-line "m" "apply selected proposal" (plist-get context :proposal-apply-enabled) key-face)
+     (org-ai-skills--ui-control-render-key-line "M"
+                                                "apply proposal to target skill file (confirm)"
+                                                (plist-get context :proposal-file-apply-enabled)
+                                                key-face))
+    ('observability
+     (org-ai-skills--ui-control-render-key-line "v" "view DAG" (plist-get context :dag-enabled) key-face)))
+  (org-ai-skills--ui-control-render-key-line "R" "refresh" t key-face)
+  (org-ai-skills--ui-control-render-key-line "q" "close workspace" t key-face))
+
+(defun org-ai-skills--ui-control-action-spec (layer key context)
+  "Return action spec plist for LAYER KEY from CONTEXT."
+  (pcase layer
+    ('run
+     (pcase key
+       ("s" (list :enabled (plist-get context :stop-enabled)
+                  :command #'org-ai-skills-ui-stop-run
+                  :message "org-ai-skills: stop unavailable for current state"))
+       ("g" (list :enabled (plist-get context :rerun-enabled)
+                  :command #'org-ai-skills-ui-rerun
+                  :message "org-ai-skills: rerun unavailable for current state"))
+       ("t" (list :enabled (plist-get context :adjust-enabled)
+                  :command #'org-ai-skills-ui-adjust-task-or-instruction
+                  :message "org-ai-skills: adjust unavailable for current state"))))
+    ('candidate
+     (pcase key
+       ("c" (list :enabled (plist-get context :candidate-enabled)
+                  :command #'org-ai-skills-ui-select-candidate
+                  :message "org-ai-skills: candidate selection unavailable for current state"))
+       ("a" (list :enabled (plist-get context :apply-enabled)
+                  :command #'org-ai-skills-ui-apply-selected-candidate
+                  :message "org-ai-skills: apply unavailable for current state"))
+       ("d" (list :enabled (plist-get context :discard-enabled)
+                  :command #'org-ai-skills-ui-discard-selected-candidate
+                  :message "org-ai-skills: discard unavailable for current state"))))
+    ('proposal
+     (pcase key
+       ("x" (list :enabled (plist-get context :extract-enabled)
+                  :command #'org-ai-skills-ui-extract-pattern-proposal
+                  :message "org-ai-skills: extract unavailable for current state"))
+       ("p" (list :enabled (plist-get context :proposal-enabled)
+                  :command #'org-ai-skills-ui-select-proposal
+                  :message "org-ai-skills: proposal selection unavailable for current state"))
+       ("v" (list :enabled (plist-get context :preview-enabled)
+                  :command #'org-ai-skills-ui-preview-selected-proposal
+                  :message "org-ai-skills: proposal preview unavailable for current state"))
+       ("y" (list :enabled (plist-get context :approve-enabled)
+                  :command #'org-ai-skills-ui-approve-selected-proposal
+                  :message "org-ai-skills: proposal approve unavailable for current state"))
+       ("n" (list :enabled (plist-get context :reject-enabled)
+                  :command #'org-ai-skills-ui-reject-selected-proposal
+                  :message "org-ai-skills: proposal reject unavailable for current state"))
+       ("m" (list :enabled (plist-get context :proposal-apply-enabled)
+                  :command #'org-ai-skills-ui-apply-selected-proposal
+                  :message "org-ai-skills: proposal apply unavailable for current state"))
+       ("M" (list :enabled (plist-get context :proposal-file-apply-enabled)
+                  :command #'org-ai-skills-ui-apply-selected-proposal-to-skill-file
+                  :message "org-ai-skills: skill-file apply unavailable for current state"))))
+    ('observability
+     (pcase key
+       ("v" (list :enabled (plist-get context :dag-enabled)
+                  :command #'org-ai-skills-ui-show-dag
+                  :message "org-ai-skills: DAG view unavailable for current state"))))))
+
+(defun org-ai-skills--ui-control-dispatch-key (key)
+  "Dispatch layered control KEY."
+  (let ((layer (org-ai-skills--ui-control-current-layer))
+        (context (org-ai-skills--ui-control-context)))
+    (cl-labels ((run-layer-action
+                 ()
+                 (let ((action (org-ai-skills--ui-control-action-spec layer key context)))
+                   (if (not action)
+                       (message "org-ai-skills: key `%s` is not active in %s menu"
+                                key (org-ai-skills--ui-control-layer-title layer))
+                     (if (plist-get action :enabled)
+                         (call-interactively (plist-get action :command))
+                       (message "%s" (plist-get action :message)))))))
+    (pcase key
+      ("q" (org-ai-skills-ui-close-workspace))
+      ("R" (org-ai-skills-ui-refresh-control-buffer))
+      ("b" (if (eq layer 'top)
+               (message "org-ai-skills: already in top menu")
+             (org-ai-skills--ui-control-set-layer 'top)))
+      ("r" (if (eq layer 'top)
+               (org-ai-skills--ui-control-set-layer 'run)
+             (run-layer-action)))
+      ("c" (if (eq layer 'top)
+               (org-ai-skills--ui-control-set-layer 'candidate)
+             (run-layer-action)))
+      ("p" (if (eq layer 'top)
+               (org-ai-skills--ui-control-set-layer 'proposal)
+             (run-layer-action)))
+      ("o" (if (eq layer 'top)
+               (org-ai-skills--ui-control-set-layer 'observability)
+             (run-layer-action)))
+      ;; Backward-compatible aliases for previous release key docs.
+      ("C" (org-ai-skills--ui-control-set-layer 'candidate))
+      ("P" (org-ai-skills--ui-control-set-layer 'proposal))
+      ("O" (org-ai-skills--ui-control-set-layer 'observability))
+      (_ (run-layer-action))))))
+
+(defun org-ai-skills-ui-control-dispatch ()
+  "Dispatch current control key according to active menu layer."
+  (interactive)
+  (org-ai-skills--ui-control-dispatch-key
+   (key-description (this-command-keys-vector))))
+
+(defun org-ai-skills-ui-refresh-control-buffer ()
+  "Re-render control buffer content from current runtime state."
+  (interactive)
+  (let* ((buffer (org-ai-skills--ui-control-buffer))
+         (layer (org-ai-skills--ui-control-current-layer))
+         (context (org-ai-skills--ui-control-context))
+         (status (plist-get context :status))
+         (progress (plist-get context :progress))
+         (error-text (plist-get context :error-text))
+         (heading (plist-get context :heading))
+         (task (plist-get context :task))
+         (preset (plist-get context :preset))
+         (selected-id (plist-get context :selected-id))
+         (selected-proposal-id (plist-get context :selected-proposal-id))
+         (candidates (plist-get context :candidates))
+         (proposals (plist-get context :proposals))
          (key-face (lambda (enabled)
                      (if enabled
                          'font-lock-keyword-face
@@ -3983,25 +4171,11 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
                             " / "
                           "")
                         preset))
+        (insert (format "Menu: %s\n"
+                        (org-ai-skills--ui-control-layer-title layer)))
         (insert (format "Selected candidate: %s\n" selected-id))
         (insert (format "Selected proposal: %s\n\n" selected-proposal-id))
-        (insert "Keys:\n")
-        (insert (propertize "  s stop run" 'face (funcall key-face stop-enabled)) "\n")
-        (insert (propertize "  g rerun" 'face (funcall key-face rerun-enabled)) "\n")
-        (insert (propertize "  t adjust task/instruction" 'face (funcall key-face adjust-enabled)) "\n")
-        (insert (propertize "  v view DAG" 'face (funcall key-face dag-enabled)) "\n")
-        (insert (propertize "  c select candidate (minibuffer)" 'face (funcall key-face candidate-enabled)) "\n")
-        (insert (propertize "  a apply selected candidate" 'face (funcall key-face apply-enabled)) "\n")
-        (insert (propertize "  d discard selected candidate" 'face (funcall key-face discard-enabled)) "\n")
-        (insert (propertize "  x extract pattern proposal (manual)" 'face (funcall key-face extract-enabled)) "\n")
-        (insert (propertize "  p select proposal (minibuffer)" 'face (funcall key-face proposal-enabled)) "\n")
-        (insert (propertize "  v preview selected proposal" 'face (funcall key-face preview-enabled)) "\n")
-        (insert (propertize "  y approve selected proposal" 'face (funcall key-face approve-enabled)) "\n")
-        (insert (propertize "  n reject selected proposal" 'face (funcall key-face reject-enabled)) "\n")
-        (insert (propertize "  m apply selected proposal" 'face (funcall key-face proposal-apply-enabled)) "\n")
-        (insert (propertize "  M apply proposal to target skill file (confirm)" 'face (funcall key-face proposal-file-apply-enabled)) "\n")
-        (insert (propertize "  r refresh" 'face (funcall key-face t)) "\n")
-        (insert (propertize "  q close workspace" 'face (funcall key-face t)) "\n")
+        (org-ai-skills--ui-control-insert-keys layer context key-face)
         (insert "\n")
         (insert (format "Candidates (%d):\n" (length candidates)))
         (if (null candidates)
@@ -4099,7 +4273,9 @@ PREVIEW-WIDTH bounds preview text width. SELECTED-ID marks selected row."
 (defun org-ai-skills--ui-start-run (run-state)
   "Start new UI RUN-STATE and render workspace."
   (org-ai-skills--ui-clear-overlay)
-  (setq org-ai-skills--ui-run-state (plist-put run-state :error-detail nil))
+  (setq org-ai-skills--ui-run-state
+        (plist-put (plist-put run-state :error-detail nil)
+                   :control-layer 'top))
   (when (and org-ai-skills-ui-auto-open
              (org-ai-skills--ui-run-get :interactive-run))
     (org-ai-skills-ui-open-workspace (org-ai-skills--ui-run-get :source-buffer)))

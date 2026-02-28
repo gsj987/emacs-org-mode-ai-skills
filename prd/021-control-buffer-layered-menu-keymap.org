@@ -1,0 +1,83 @@
+#+TITLE: PRD 021 - Control Buffer Layered Menu Keymap (Magit-like)
+#+STARTUP: overview
+
+* Problem
+The control buffer currently binds many commands in a single keymap, which has produced key conflicts (for example, =v= is assigned to both DAG view and proposal preview). As more planner/execution/proposal actions are added, collisions and discoverability issues will increase.
+
+* Scope
+- In scope:
+  - Introduce a Magit-like layered control menu model where each layer has its own local keybindings.
+  - Define initial layers and command ownership (for example: run/execution, candidates, proposals, observability).
+  - Provide a clear entry flow from the control buffer into layered menus and back.
+  - Remove same-layer key collisions by construction.
+  - Keep command availability guards (running-state, proposal-state, etc.) visible in menu rendering.
+  - Add migration mapping for existing control keys to layered equivalents.
+- Out of scope:
+  - Redesign of run-state engine, planner logic, or proposal governance logic.
+  - New proposal/planner features unrelated to menu architecture.
+  - Full UI rewrite outside control/menu interaction surfaces.
+
+* Ownership Boundary
+- Primary ownership area:
+  - =elisp/org-ai-skills.el= control buffer keymap/menu dispatch/rendering paths.
+  - =tests/org-ai-skills-test.el= control buffer key/menu tests.
+  - =tests/bdd/= control/menu behavior scenarios.
+  - =README.org= control key/menu usage docs.
+- Expected conflict points:
+  - Existing single-key bindings documented in README and tests.
+
+* Constraints
+- Technical constraints:
+  - No duplicate keybinding within the same layer.
+  - Same key may be reused across different layers only when layer context is explicit.
+  - Layer transitions must be deterministic and must not mutate run/proposal state implicitly.
+  - Keep control buffer responsive; menu rendering overhead must remain low.
+  - Preserve strict spec vs run-state separation.
+- Process constraints:
+  - PRD-first workflow: no implementation before this PRD.
+  - Add both ERT and BDD coverage for behavior changes.
+  - Update README when key/menu behavior changes.
+
+* Expected Behavior
+- Behavior 1:
+  - Control buffer exposes a top-level menu that routes into named sub-menus (layers).
+- Behavior 2:
+  - Each sub-menu has an independent key space; collisions are prevented within that sub-menu.
+- Behavior 3:
+  - Overloaded keys (for example =v=) are disambiguated by layer context, not by hidden precedence.
+- Behavior 4:
+  - Disabled actions remain visible with reason/disabled styling when preconditions are not met (running-state/proposal-state guards remain intact).
+- Behavior 5:
+  - Users can return to top-level menu from any sub-menu with a consistent back/quit flow.
+- Behavior 6:
+  - Existing operator workflows (rerun, stop, candidate apply/discard, extraction, proposal review/apply, DAG/observability actions) remain reachable through the new menu architecture.
+
+* Design Notes
+- Initial layer proposal (to validate during implementation):
+  - Top layer: global navigation and high-frequency run controls.
+  - Run layer: =s=, =g=, =t=, refresh/status operations.
+  - Candidate layer: =c=, =a=, =d=.
+  - Proposal layer: =x=, =p=, preview, approve/reject/apply actions.
+  - Observability layer: DAG and log/inspection actions.
+- Key design objective:
+  - Keep mnemonic keys within each layer while avoiding single-map global collisions.
+
+* Open Questions
+- Should proposal preview and DAG remain both on =v= but in different layers, or should one be renamed for stronger mnemonic separation?
+- Should we keep temporary legacy top-level aliases during one release window, or perform a hard switch immediately?
+
+* Tasks
+- [X] Define layered menu architecture and layer registry contract for control buffer.
+- [X] Implement top-level menu and submenu dispatch/back navigation.
+- [X] Migrate existing single-map bindings into layer-scoped bindings.
+- [X] Implement/validate disabled-state rendering in each layer.
+- [X] Remove/resolve current key conflicts (including =v= collision) via layer ownership.
+- [X] Add ERT tests for layer navigation, key dispatch, guard behavior, and collision prevention.
+- [X] Add BDD scenario(s) for multi-layer control workflow and conflict-free key usage.
+- [X] Update README control usage and key reference for layered menus.
+- [X] Append worklog with implementation and test results.
+
+* Worklog
+- 2026-02-28 :: PRD drafted for Magit-like layered control menu to eliminate keybinding collisions and support future growth. Test status: not run.
+- 2026-02-28 :: Implemented layered control buffer menu architecture (Top/Run/Candidate/Proposal/Observability) with single-key dispatcher, explicit submenu navigation (=R/C/P/O=, =b= back), and layer-scoped action routing so =v= is conflict-free by context (proposal preview vs DAG view). Updated control-panel rendering to show active menu and layer-local key availability with guards. Added ERT coverage for layered dispatch/routing and submenu transitions, added BDD scenario file =tests/bdd/012-control-buffer-layered-menu.org=, and updated README usage keys for the new menu model. Test status: pass (213/213, =emacs -Q --batch --eval '(setq load-prefer-newer t)' -L elisp -l tests/org-ai-skills-test.el -f ert-run-tests-batch-and-exit=).
+- 2026-02-28 :: Updated top-level menu shortcuts to lowercase for faster common navigation (=r/c/p/o=) per UX feedback, moved refresh to =R= to avoid collision with run-menu entry, and retained uppercase =C/P/O= aliases for compatibility. Updated ERT assertions and README key docs. Test status: pass (213/213, =emacs -Q --batch --eval '(setq load-prefer-newer t)' -L elisp -l tests/org-ai-skills-test.el -f ert-run-tests-batch-and-exit=).

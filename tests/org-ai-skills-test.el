@@ -1648,10 +1648,63 @@
         (org-ai-skills-ui-close-workspace)
         (should (= (length (window-list)) 1))))))
 
-(ert-deftest org-ai-skills-control-mode-map-includes-dag-key ()
-  "Control mode map should bind `v` to DAG view command."
+(ert-deftest org-ai-skills-control-mode-map-uses-layered-dispatch ()
+  "Control mode map should route layered keys through one dispatcher."
   (should (eq (lookup-key org-ai-skills-control-mode-map (kbd "v"))
-              #'org-ai-skills-ui-show-dag)))
+              #'org-ai-skills-ui-control-dispatch))
+  (should (eq (lookup-key org-ai-skills-control-mode-map (kbd "r"))
+              #'org-ai-skills-ui-control-dispatch))
+  (should (eq (lookup-key org-ai-skills-control-mode-map (kbd "c"))
+              #'org-ai-skills-ui-control-dispatch))
+  (should (eq (lookup-key org-ai-skills-control-mode-map (kbd "p"))
+              #'org-ai-skills-ui-control-dispatch))
+  (should (eq (lookup-key org-ai-skills-control-mode-map (kbd "o"))
+              #'org-ai-skills-ui-control-dispatch)))
+
+(ert-deftest org-ai-skills-ui-control-dispatch-v-routes-by-layer ()
+  "Key `v` should dispatch to different commands by active control menu layer."
+  (let ((calls nil)
+        (org-ai-skills--ui-run-state
+         (list :status 'ready
+               :slot-key "slot-1"
+               :planner-run-state '(:steps ((:step-id "s1"))))))
+    (cl-letf (((symbol-function 'org-ai-skills-ui-show-dag)
+               (lambda () (interactive) (push 'dag calls)))
+              ((symbol-function 'org-ai-skills-ui-preview-selected-proposal)
+               (lambda () (interactive) (push 'preview calls)))
+              ((symbol-function 'org-ai-skills--load-proposals)
+               (lambda (_slot-key)
+                 (list '(:proposal-id "p1" :status "proposed"))))
+              ((symbol-function 'message)
+               (lambda (&rest _args) nil)))
+      (setq org-ai-skills--ui-run-state
+            (plist-put org-ai-skills--ui-run-state :control-layer 'observability))
+      (org-ai-skills--ui-control-dispatch-key "v")
+      (setq org-ai-skills--ui-run-state
+            (plist-put org-ai-skills--ui-run-state :control-layer 'proposal))
+      (org-ai-skills--ui-run-set :selected-proposal '(:proposal-id "p1" :status "proposed"))
+      (org-ai-skills--ui-control-dispatch-key "v")
+      (setq org-ai-skills--ui-run-state
+            (plist-put org-ai-skills--ui-run-state :control-layer 'top))
+      (org-ai-skills--ui-control-dispatch-key "v"))
+    (should (equal calls '(preview dag)))))
+
+(ert-deftest org-ai-skills-ui-control-dispatch-lowercase-opens-submenus ()
+  "Top-layer lowercase menu keys should switch to the expected submenu."
+  (let ((org-ai-skills--ui-run-state (list :status 'ready :control-layer 'top)))
+    (org-ai-skills--ui-control-dispatch-key "r")
+    (should (eq (plist-get org-ai-skills--ui-run-state :control-layer) 'run))
+    (org-ai-skills--ui-control-dispatch-key "b")
+    (org-ai-skills--ui-control-dispatch-key "c")
+    (should (eq (plist-get org-ai-skills--ui-run-state :control-layer) 'candidate))
+    (org-ai-skills--ui-control-dispatch-key "b")
+    (org-ai-skills--ui-control-dispatch-key "p")
+    (should (eq (plist-get org-ai-skills--ui-run-state :control-layer) 'proposal))
+    (org-ai-skills--ui-control-dispatch-key "b")
+    (org-ai-skills--ui-control-dispatch-key "o")
+    (should (eq (plist-get org-ai-skills--ui-run-state :control-layer) 'observability))
+    (org-ai-skills--ui-control-dispatch-key "b")
+    (should (eq (plist-get org-ai-skills--ui-run-state :control-layer) 'top))))
 
 (ert-deftest org-ai-skills-ui-overlay-lifecycle-running-ready-stop ()
   "Overlay should support running/ready states and clear on stop."
@@ -2149,7 +2202,8 @@
               (org-ai-skills-ui-refresh-control-buffer)
               (with-current-buffer (get-buffer org-ai-skills-control-buffer-name)
                 (goto-char (point-min))
-                (should (re-search-forward "v view DAG" nil t))
+                (should (re-search-forward "Keys (Top):" nil t))
+                (should (re-search-forward "o open observability menu" nil t))
                 (goto-char (point-min))
                 (should (re-search-forward "Candidates (2):" nil t))
                 (should-not (re-search-forward
@@ -2186,7 +2240,8 @@
                :heading "Leaf"
                :task "task"
                :selected-candidate nil
-               :planner-run-state nil)))
+               :planner-run-state nil
+               :control-layer 'observability)))
     (org-ai-skills-ui-refresh-control-buffer)
     (with-current-buffer (get-buffer org-ai-skills-control-buffer-name)
       (goto-char (point-min))
