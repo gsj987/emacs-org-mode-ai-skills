@@ -3167,6 +3167,14 @@ or stream completion markers are ignored and return nil."
          (split-string text "\n")
          "\n")))))
 
+(defun org-ai-skills--force-root-heading-line (text target-level target-heading)
+  "Force first Org heading line in TEXT to TARGET-LEVEL and TARGET-HEADING."
+  (if (string-match "^\\*+\\s-+.*$" (or text ""))
+      (replace-match
+       (format "%s %s" (make-string target-level ?*) target-heading)
+       t t text)
+    text))
+
 (defun org-ai-skills--sanitize-rewrite-output (rewritten-text subtree)
   "Sanitize REWRITTEN-TEXT and normalize heading levels for SUBTREE."
   (if (eq (plist-get subtree :context-mode) 'buffer)
@@ -3181,7 +3189,10 @@ or stream completion markers are ignored and return nil."
                       (make-string target-level ?*)
                       target-heading
                       (string-trim-left cleaned)))))
-      (org-ai-skills--normalize-subtree-levels with-heading target-level))))
+      (org-ai-skills--force-root-heading-line
+       (org-ai-skills--normalize-subtree-levels with-heading target-level)
+       target-level
+       target-heading))))
 
 (defun org-ai-skills--strip-property-drawers-from-text (text)
   "Return TEXT with Org property drawers removed."

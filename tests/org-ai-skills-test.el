@@ -946,8 +946,16 @@
          (raw "Here is the rewrite:\n*** Child Revised\n**** Sub\nBody\n")
          (cleaned (org-ai-skills--sanitize-rewrite-output raw subtree)))
     (should-not (string-match-p "Here is the rewrite" cleaned))
-    (should (string-prefix-p "** Child Revised" cleaned))
+    (should (string-prefix-p "** Child" cleaned))
     (should (string-match-p "^\\*\\*\\* Sub$" cleaned))))
+
+(ert-deftest org-ai-skills-sanitize-rewrite-output-restores-root-heading ()
+  "Sanitizer should force root heading text back to target heading."
+  (let* ((subtree '(:level 2 :heading "Draft From Outline"))
+         (raw "** Renamed Heading\nBody paragraph.\n")
+         (cleaned (org-ai-skills--sanitize-rewrite-output raw subtree)))
+    (should (string-prefix-p "** Draft From Outline" cleaned))
+    (should-not (string-match-p "^\\*\\* Renamed Heading$" cleaned))))
 
 (ert-deftest org-ai-skills-strip-property-drawers-from-text-removes-drawers ()
   "Property drawer stripping helper should remove all drawer blocks."
