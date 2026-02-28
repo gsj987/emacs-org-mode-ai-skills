@@ -1,0 +1,24 @@
+#+TITLE: BDD 008 - Planner callback compatibility across model response styles
+
+* Feature
+Planner runs should complete for both thinking/chunked responses and non-thinking terminal callbacks.
+
+* Scenario: Planner run should not freeze when model returns terminal-only completion callback
+Given target heading "Planner Callback Compatibility"
+And fixture source is "inline section: Fixture Input"
+And planner task "生成今天的金融日报"
+And model "google/gemini-2.5-flash-lite"
+And provider mode "live"
+When user runs command "org-ai-skills-plan-run"
+Then run status should be one of "applied,success,done"
+And debug log should contain "planner"
+And debug log should contain ":effective-schema t"
+And dag info should contain "planning.request"
+And dag info should contain "planning.parse"
+
+* Fixture Input
+** Planner Callback Compatibility
+ :PROPERTIES:
+ :PURPOSE: Validate planner completion handling for callback shape differences.
+ :END:
+This subtree is used to validate planner callback compatibility behavior.

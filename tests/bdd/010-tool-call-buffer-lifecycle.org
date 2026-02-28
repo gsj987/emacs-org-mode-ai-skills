@@ -1,0 +1,22 @@
+#+TITLE: BDD 010 - Tool call buffer lifecycle safety
+
+* Feature
+Tool-calling execution should not crash when the original source buffer is no longer live.
+
+* Scenario: Dispatch uses a stable live request buffer for tool-call runs
+Given target heading "Tool Call Buffer Lifecycle"
+And fixture source is "inline section: Fixture Input"
+And planner task "生成今天的金融日报"
+And model "minimax/minimax-m2.5"
+And provider mode "live"
+When user runs command "org-ai-skills-plan-run"
+Then run status should be one of "applied,success,done"
+And debug log should contain "gptel-request-data"
+And dag info should contain "execution.step"
+
+* Fixture Input
+** Tool Call Buffer Lifecycle
+ :PROPERTIES:
+ :PURPOSE: Validate tool-call buffer lifecycle safety.
+ :END:
+This subtree is used to validate request buffer lifecycle behavior during tool calls.

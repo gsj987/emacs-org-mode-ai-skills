@@ -1,0 +1,21 @@
+#+TITLE: BDD 009 - Planner multiline JSON parse integrity
+
+* Feature
+Planner parsing should preserve full multiline JSON objects from callback accumulation.
+
+* Scenario: Planner parse should not truncate at first line-ending closing brace
+Given target heading "Planner Multiline JSON Parse"
+And fixture source is "inline section: Fixture Input"
+And planner task "生成今天的金融日报"
+And model "google/gemini-2.5-flash-lite"
+And provider mode "live"
+When user runs command "org-ai-skills-plan-run"
+Then run status should be one of "applied,success,done"
+And dag info should contain "planning.parse"
+
+* Fixture Input
+** Planner Multiline JSON Parse
+ :PROPERTIES:
+ :PURPOSE: Validate multiline planner JSON extraction/parsing behavior.
+ :END:
+This subtree is used to validate planner multiline JSON parse integrity.

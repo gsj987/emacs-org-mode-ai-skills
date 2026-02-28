@@ -88,6 +88,7 @@ Append to the prd file in worklog section:
 ## 4. Execution Quality Rules
 
 - Prioritize root-cause analysis and direct fixes; do not default to fallback or downgraded solutions unless constraints are explicitly documented in the PRD.
+- **Never add fallback logic.** If root cause is unresolved, continue investigation and fix the cause directly instead of adding fallback paths.
 - The agent may raise clarifying questions in the PRD file when requirements, constraints, or expected behavior are ambiguous.
 
 ## 5. Self-Check Before Completion
@@ -166,3 +167,46 @@ When multiple features are developed in parallel, all agents must follow this pr
 - [ ] README updated when behavior changes.
 - [ ] PRD worklog appended with implementation and test status.
 - [ ] No unplanned edits outside declared ownership area.
+
+## 8. Debugging and Observability Protocol
+
+### 8.1 Non-Negotiable Rules
+
+- Do not rely on assumptions when debugging asynchronous/runtime issues; verify each assumption with concrete logs or reproducible tests.
+- Never jump to late-stage hypotheses first; debug must proceed by calling stage order.
+- Never add fallback or downgrade paths to "make it work." Keep contracts strict and fix root cause directly.
+
+### 8.2 Stage-First Debug Flow (Required)
+
+For planner/execution/callback issues, follow this order and do not skip stages:
+
+1. Stage A — Dispatch correctness
+- Verify request payload, model, schema/response format, stream flag, tools, and timeout settings.
+- Confirm runtime actually sends the expected request once.
+
+2. Stage B — Callback transport/lifecycle
+- Verify callback events arrive and classify each event shape (text/tool/reasoning/terminal).
+- Verify terminal condition detection logic against real callback sequence.
+
+3. Stage C — Response extraction
+- Verify exact text chosen for parsing (and what was ignored).
+- Confirm request-echo metadata is never treated as model output.
+
+4. Stage D — Parser boundary/contract
+- Verify parser input string is complete and matches contract.
+- Validate JSON/object extraction boundaries and schema constraints.
+
+5. Stage E — State transition/UI completion
+- Verify run-state transitions (`running -> success/error/canceled`) and timeout behavior.
+- Verify callback completion cannot leave control state stuck.
+
+6. Stage F — Regression proof
+- Add focused ERT for the root cause.
+- Add/update BDD when behavior contract changed.
+- Record exact failure signature and fix in PRD worklog.
+
+### 8.3 Observability Baseline
+
+- Keep default logs concise, but ensure each stage (A-E) has at least one inspectable signal.
+- Add temporary deep logs only when needed for active incident diagnosis, and remove them during cleanup.
+- If a bug required deep logs to solve, convert the minimum necessary signals into stable observability flags/settings.

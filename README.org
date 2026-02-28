@@ -420,6 +420,9 @@ gptel tool registration behavior:
 - Planner still decides skill selection and step execution order.
 - Runtime passes registered tools via =gptel-tools= and =gptel-use-tools= during
   each =gptel-request= dispatch.
+- Dispatch now passes a dedicated hidden live =:buffer/= :position= snapshot to
+  =gptel-request=, so async tool-call handling does not depend on the original
+  user buffer remaining alive.
 
 Role-scoped model and system prompt routing:
 - Planner requests use role =planner=.
@@ -431,8 +434,16 @@ Role-scoped model and system prompt routing:
 - Planner generation stability controls:
   - =org-ai-skills-planner-temperature= (default =0.0=)
   - =org-ai-skills-planner-max-tokens= (default =2048=, or =nil= for backend default)
-  - Planner requests also use gptel structured output schema (= :schema =)
-    to enforce JSON shape at provider/backend level.
+  - =org-ai-skills-planner-use-streaming= (default =t=)
+  - Planner requests use structured output schema (= :schema =) when schema mode is enabled.
+  - =org-ai-skills-planner-schema-mode=
+    - =strict=: always send schema
+    - =auto=: alias of =strict= (kept for compatibility)
+    - =off=: never send schema
+  - =org-ai-skills-planner-allow-schema-fallback= is deprecated and ignored.
+    Planner no longer retries with schema disabled.
+  - =org-ai-skills-planner-request-timeout-seconds= (default =90=)
+  - =org-ai-skills-execution-request-timeout-seconds= (default =90=)
 - System prompt overrides:
   - =org-ai-skills-system-prompt-planner=
   - =org-ai-skills-system-prompt-execution=
@@ -465,17 +476,14 @@ Debug observability:
   - =org-ai-skills-debug-enabled=
   - =org-ai-skills-debug-property-retention=
   - =org-ai-skills-debug-buffer-name=
+  - =org-ai-skills-observability-level= (=minimal/standard/verbose=)
+  - =org-ai-skills-observability-max-payload-chars= (payload cap for non-verbose modes)
   - =org-ai-skills-debug-filter-level= (=nil/debug/info/warn/error=)
   - =org-ai-skills-debug-filter-step= (step id or stage id string, or =nil=)
 - Debug entry includes timestamp, request role, effective model, system prompt
-  fingerprint, log level, stage id, buffer/file, target headline/path, final
-  prompt, and full request plist passed to =gptel-request=.
-- Additional debug events:
-  - =gptel-request-data= includes request payload data captured from gptel callback info.
-  - =tool-call= and =tool-result= events are logged when gptel emits tool-calling callbacks.
-  - =property-retention= logs subtree property collect/restore diagnostics:
-    matching strategy per heading (=path=, =exact-level-title=, =title=,
-    =level-order=, =fuzzy-level-title=, or =unmatched=) and restored keys.
+  fingerprint, log level, stage id, buffer/file, target headline/path, and request summary.
+- In =minimal= and =standard= modes, payload fields are truncated; use =verbose=
+  only when deeper diagnosis is needed.
 
 Run-state timing observability:
 - Planner and execution flows append timing events to =run-state :events=.
@@ -609,10 +617,8 @@ Behavior notes:
 - If planner returns too many skills in one step:
   - =reject=: signal planner validation error.
   - =split=: auto-split one oversized step into bounded step parts.
-- If initial planner response returns empty =plan= but includes candidates:
-  - Runtime synthesizes a one-step fallback plan from the top candidate.
-  - If both =plan= and =candidates= are empty, runtime synthesizes fallback
-    from metadata (preferred: suggest+pure skill, else first available skill).
+- Planner output must include a valid plan JSON object that satisfies runtime constraints.
+  Invalid or empty planner output fails explicitly and should be fixed at source.
 - Planner apply behavior:
   - Interactive planner commands (=org-ai-skills-plan-run=,
     =...-repeat-task=, =...-preset=, and fixed-task commands from
