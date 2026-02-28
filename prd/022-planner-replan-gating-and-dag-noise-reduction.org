@@ -1,0 +1,48 @@
+#+TITLE: PRD 022 - Planner replan gating and DAG noise reduction
+#+STARTUP: overview
+
+* Problem
+Planner execution currently issues a planner request after every executed step when =org-ai-skills-planner-auto-replan= is enabled. This causes excessive planning nodes in DAG output (for example planning.parse/request repeated after each step) and avoidable latency/cost, even when no replan signal exists.
+
+* Scope
+- In scope:
+- Add explicit replan trigger policy for planner runs.
+- Change default planner step-loop behavior to avoid intermediate replans unless trigger policy requests it.
+- Preserve existing strict no-fallback planner parsing/execution contracts.
+- Add ERT coverage for replan trigger gating behavior.
+- Add BDD scenario documenting expected planner DAG behavior under reduced replanning.
+- Update README planner configuration/behavior notes.
+- Out of scope:
+- Changing planner JSON schema contract.
+- Changing execution skill behavior.
+- Changing provider/tool-call integrations.
+
+* Constraints
+- Technical constraints:
+- No fallback logic.
+- Keep replan max-limit enforcement intact.
+- Keep run-state/DAG observability compatible with existing fields.
+- Process constraints:
+- PRD-first implementation.
+- Add tests in =tests/org-ai-skills-test.el= and =tests/bdd/=.
+
+* Expected Behavior
+- Behavior 1:
+- Intermediate steps should not trigger planner re-requests when replan trigger policy does not require it.
+- Behavior 2:
+- Replan should still be possible at plan boundary (or when marker trigger appears), subject to =org-ai-skills-planner-max-replans=.
+- Behavior 3:
+- DAG output should show fewer redundant planning nodes for the same run.
+
+* Tasks
+- [X] Add replan trigger policy variable and helper predicate.
+- [X] Update planner step loop to call planner only when trigger predicate returns true.
+- [X] Add ERT tests for: skip intermediate planner request, request at plan boundary, marker-trigger path.
+- [X] Add/update BDD scenario for planner DAG behavior expectation.
+- [X] Update README planner section with new trigger policy and behavior.
+- [X] Run relevant ERT tests and record status.
+
+* Worklog
+- 2026-02-28 :: PRD created for planner replan gating/noise reduction. Test status: pending.
+- 2026-02-28 :: Implemented replan-trigger policy =org-ai-skills-planner-replan-trigger= (default =marker-or-boundary=) and wired step loop gating via =org-ai-skills--should-request-replan-p= so planner is no longer re-requested after every intermediate step by default. Added ERT regressions =org-ai-skills-should-request-replan-p-marker-or-boundary=, =org-ai-skills-run-plan-steps-replans-only-at-boundary-by-default=, and =org-ai-skills-run-plan-steps-marker-only-triggers-on-marker=. Added BDD scenario =tests/bdd/013-planner-replan-gating.org=. Updated README planner controls/behavior notes. Test status: full ERT batch pass (=216/216=).
+- 2026-02-28 :: Updated new BDD scenario model to =qwen/qwen3-8b= to align with project BDD default/template and reran live scenario. Test status: =tests/bdd/013-planner-replan-gating.org= pass (status=applied, failures=nil).

@@ -4042,6 +4042,99 @@
       '(:replan-signal (:enabled t) :plan ((:step-id "s2" :skills ("gen-notes")))))
      :type 'org-ai-skills-planner-error)))
 
+(ert-deftest org-ai-skills-should-request-replan-p-marker-or-boundary ()
+  "Replan predicate should gate intermediate steps unless marker/boundary is present."
+  (let ((org-ai-skills-planner-auto-replan t)
+        (org-ai-skills-planner-replan-trigger 'marker-or-boundary))
+    (should-not
+     (org-ai-skills--should-request-replan-p
+      '(:latest-output "*** output")
+      '((:step-id "s2"))))
+    (should
+     (org-ai-skills--should-request-replan-p
+      '(:latest-output "*** output")
+      nil))
+    (should
+     (org-ai-skills--should-request-replan-p
+      '(:latest-output "*** output [[REPLAN]]")
+      '((:step-id "s2"))))))
+
+(ert-deftest org-ai-skills-run-plan-steps-replans-only-at-boundary-by-default ()
+  "Step runner should avoid intermediate planner requests with marker-or-boundary trigger."
+  (let ((org-ai-skills-planner-auto-replan t)
+        (org-ai-skills-planner-replan-trigger 'marker-or-boundary)
+        (planner-calls 0)
+        final-state)
+    (cl-letf (((symbol-function 'org-ai-skills-execute-plan-step)
+               (lambda (step run-state callback &optional _directory)
+                 (let* ((step-id (plist-get step :step-id))
+                        (output (format "*** output-%s" step-id))
+                        (entry (list :step-id step-id
+                                     :status 'success
+                                     :skills (plist-get step :skills)
+                                     :output output))
+                        (next-state (plist-put
+                                     (plist-put run-state
+                                                :steps
+                                                (append (or (plist-get run-state :steps) nil)
+                                                        (list entry)))
+                                     :latest-output output)))
+                   (funcall callback next-state output))))
+              ((symbol-function 'org-ai-skills--request-planner-plan)
+               (lambda (_task _metadata run-state callback &optional _retry-attempt)
+                 (setq planner-calls (1+ planner-calls))
+                 (funcall callback
+                          '(:replan-signal (:enabled nil) :plan nil)
+                          run-state))))
+      (org-ai-skills--run-plan-steps
+       "task"
+       nil
+       '(:run-id "r1" :task "task" :steps nil :latest-output nil :plan-revision 1 :replans 0)
+       '((:step-id "s1" :skills ("a"))
+         (:step-id "s2" :skills ("b")))
+       (lambda (run-state) (setq final-state run-state))))
+    (should (= planner-calls 1))
+    (should (= (length (plist-get final-state :steps)) 2))))
+
+(ert-deftest org-ai-skills-run-plan-steps-marker-only-triggers-on-marker ()
+  "Marker-only trigger should request planner only when latest output includes [[REPLAN]]."
+  (let ((org-ai-skills-planner-auto-replan t)
+        (org-ai-skills-planner-replan-trigger 'marker-only)
+        (planner-calls 0)
+        final-state)
+    (cl-letf (((symbol-function 'org-ai-skills-execute-plan-step)
+               (lambda (step run-state callback &optional _directory)
+                 (let* ((step-id (plist-get step :step-id))
+                        (output (if (equal step-id "s1")
+                                    "*** output-s1 [[REPLAN]]"
+                                  "*** output-s2"))
+                        (entry (list :step-id step-id
+                                     :status 'success
+                                     :skills (plist-get step :skills)
+                                     :output output))
+                        (next-state (plist-put
+                                     (plist-put run-state
+                                                :steps
+                                                (append (or (plist-get run-state :steps) nil)
+                                                        (list entry)))
+                                     :latest-output output)))
+                   (funcall callback next-state output))))
+              ((symbol-function 'org-ai-skills--request-planner-plan)
+               (lambda (_task _metadata run-state callback &optional _retry-attempt)
+                 (setq planner-calls (1+ planner-calls))
+                 (funcall callback
+                          '(:replan-signal (:enabled nil) :plan nil)
+                          run-state))))
+      (org-ai-skills--run-plan-steps
+       "task"
+       nil
+       '(:run-id "r2" :task "task" :steps nil :latest-output nil :plan-revision 1 :replans 0)
+       '((:step-id "s1" :skills ("a"))
+         (:step-id "s2" :skills ("b")))
+       (lambda (run-state) (setq final-state run-state))))
+    (should (= planner-calls 1))
+    (should (= (length (plist-get final-state :steps)) 2))))
+
 (ert-deftest org-ai-skills-org-src-block-at-point-resolves-parent-block ()
   "Src block resolver should work when point is inside block body."
   (with-temp-buffer

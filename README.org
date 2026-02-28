@@ -629,6 +629,10 @@ Balancing controls:
 - =org-ai-skills-planner-max-steps= (default 6)
 - =org-ai-skills-planner-max-replans= (default 2)
 - =org-ai-skills-planner-auto-replan= (default t)
+- =org-ai-skills-planner-replan-trigger= (default =marker-or-boundary=)
+  - =always=: re-request planner after every executed step
+  - =marker-only=: re-request planner only when latest output contains =[[REPLAN]]=
+  - =marker-or-boundary=: re-request planner when marker exists or current plan steps are exhausted
 - =org-ai-skills-planner-max-skills-per-step= (default 2)
 - =org-ai-skills-planner-batching-mode= (=quality-first=, =balanced=, =speed-first=)
 - =org-ai-skills-planner-overflow-strategy= (=reject= or =split=)
@@ -639,6 +643,9 @@ Behavior notes:
   - =split=: auto-split one oversized step into bounded step parts.
 - Planner output must include a valid plan JSON object that satisfies runtime constraints.
   Invalid or empty planner output fails explicitly and should be fixed at source.
+- Replan request behavior is trigger-driven (not unconditional per step):
+  - Intermediate steps can skip planner re-request when trigger policy does not require replanning.
+  - Boundary/marker-triggered replans remain subject to =org-ai-skills-planner-max-replans=.
 - Planner apply behavior:
   - Interactive planner commands (=org-ai-skills-plan-run=,
     =...-repeat-task=, =...-preset=, and fixed-task commands from

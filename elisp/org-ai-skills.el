@@ -126,6 +126,17 @@ When nil, include all steps and stages."
   :type 'boolean
   :group 'org-ai-skills)
 
+(defcustom org-ai-skills-planner-replan-trigger 'marker-or-boundary
+  "Trigger policy for requesting planner replan during execution.
+- always: request planner after every completed step.
+- marker-only: request planner only when latest output contains [[REPLAN]].
+- marker-or-boundary: request planner on [[REPLAN]] marker or when remaining
+  steps in the current plan are exhausted."
+  :type '(choice (const :tag "Always after each step" always)
+                 (const :tag "Marker only ([[REPLAN]])" marker-only)
+                 (const :tag "Marker or plan boundary" marker-or-boundary))
+  :group 'org-ai-skills)
+
 (defcustom org-ai-skills-planner-max-skills-per-step 2
   "Maximum number of skills allowed in one execution step."
   :type 'integer
@@ -2393,6 +2404,24 @@ Only skills referenced by STEP are loaded from DIRECTORY."
                               org-ai-skills-planner-max-replans))))
       (plist-get planner-response :plan))))
 
+(defun org-ai-skills--run-state-has-replan-marker-p (run-state)
+  "Return non-nil when RUN-STATE latest output requests replan marker."
+  (let ((latest-output (or (org-ai-skills--run-state-latest-output run-state) "")))
+    (string-match-p "\\[\\[REPLAN\\]\\]" latest-output)))
+
+(defun org-ai-skills--should-request-replan-p (run-state pending-tail)
+  "Return non-nil when planner should be requested for replan.
+RUN-STATE is the updated execution state after a completed step.
+PENDING-TAIL is the remaining unexecuted steps from current plan."
+  (and org-ai-skills-planner-auto-replan
+       (pcase org-ai-skills-planner-replan-trigger
+         ('always t)
+         ('marker-only
+          (org-ai-skills--run-state-has-replan-marker-p run-state))
+         (_
+          (or (org-ai-skills--run-state-has-replan-marker-p run-state)
+              (null pending-tail))))))
+
 (defun org-ai-skills--completed-step-ids (run-state)
   "Return completed step id list from RUN-STATE."
   (mapcar (lambda (step) (plist-get step :step-id))
@@ -2643,31 +2672,36 @@ Invoke CALLBACK with final run-state when done."
            (org-ai-skills--run-plan-steps
             task metadata updated-run-state (cdr pending) callback directory))
           (t
-           (org-ai-skills--request-planner-plan
-            task
-            metadata
-            updated-run-state
-            (lambda (planner-response replanned-run-state)
-              (let ((revised-plan
-                     (org-ai-skills-maybe-replan replanned-run-state planner-response)))
-                (if revised-plan
-                    (let* ((next-revision (1+ (or (plist-get replanned-run-state
-                                                             :plan-revision)
-                                                 1)))
-                           (next-state
-                            (org-ai-skills--run-state-record-plan
-                             (plist-put
-                              (plist-put replanned-run-state
-                                         :plan-revision
-                                         next-revision)
-                              :replans (1+ (or (plist-get replanned-run-state :replans) 0)))
-                             revised-plan
-                             next-revision
-                             'replan)))
-                      (org-ai-skills--run-plan-steps
-                       task metadata next-state revised-plan callback directory))
-                  (org-ai-skills--run-plan-steps
-                   task metadata replanned-run-state (cdr pending) callback directory))))))))
+           (let ((pending-tail (cdr pending)))
+             (if (org-ai-skills--should-request-replan-p updated-run-state pending-tail)
+                 (org-ai-skills--request-planner-plan
+                  task
+                  metadata
+                  updated-run-state
+                  (lambda (planner-response replanned-run-state)
+                    (let ((revised-plan
+                           (org-ai-skills-maybe-replan
+                            replanned-run-state planner-response)))
+                      (if revised-plan
+                          (let* ((next-revision
+                                  (1+ (or (plist-get replanned-run-state :plan-revision)
+                                          1)))
+                                 (next-state
+                                  (org-ai-skills--run-state-record-plan
+                                   (plist-put
+                                    (plist-put replanned-run-state
+                                               :plan-revision
+                                               next-revision)
+                                    :replans (1+ (or (plist-get replanned-run-state :replans) 0)))
+                                   revised-plan
+                                   next-revision
+                                   'replan)))
+                            (org-ai-skills--run-plan-steps
+                             task metadata next-state revised-plan callback directory))
+                        (org-ai-skills--run-plan-steps
+                         task metadata replanned-run-state pending-tail callback directory)))))
+               (org-ai-skills--run-plan-steps
+                task metadata updated-run-state pending-tail callback directory))))))
        directory))))
 
 (defun org-ai-skills-run-task-with-planner (task subtree &optional options callback)

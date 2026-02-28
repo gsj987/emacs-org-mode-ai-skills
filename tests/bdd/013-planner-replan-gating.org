@@ -1,0 +1,27 @@
+#+TITLE: BDD 013 - Planner replan gating avoids unnecessary intermediate replans
+
+* Feature
+Planner runs should avoid redundant planner requests between steps unless replan trigger conditions are met.
+
+* Scenario: Planner run should complete with bounded planning DAG events
+ :PROPERTIES:
+ :SCENARIO_ID: bdd-013
+ :PRIORITY: p2
+ :END:
+Given target heading "Planner Replan Gating"
+And fixture source is "inline section: Fixture Input"
+And planner task "抓取新闻，总结和分析"
+And model "qwen/qwen3-8b"
+And provider mode "live"
+When user runs command "org-ai-skills-plan-run"
+Then run status should be one of "applied,success,done,failed"
+And dag info should contain "Execution DAG"
+And dag info should contain "planning.request"
+And dag info should contain "execution.step"
+
+* Fixture Input
+** Planner Replan Gating
+ :PROPERTIES:
+ :PURPOSE: Validate planner replan trigger gating behavior in DAG output.
+ :END:
+This subtree is used to verify planner DAG behavior under replan gating.
