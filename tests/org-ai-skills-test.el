@@ -363,6 +363,10 @@
     (should (string-match-p "Outline summary (compact context)"
                             (plist-get request :prompt)))
     (should (string-match-p "Strict compose constraints"
+                            (plist-get request :prompt)))
+    (should (string-match-p "Tool path contract"
+                            (plist-get request :prompt)))
+    (should (string-match-p "Do not prepend parent roots again"
                             (plist-get request :prompt)))))
 
 (ert-deftest org-ai-skills-core-read-tools-enabled-by-default ()
@@ -502,6 +506,86 @@
           (should (string= (string-trim (plist-get result :stdout))
                            (directory-file-name dir))))
       (delete-directory dir t))))
+
+(ert-deftest org-ai-skills-core-provider-list-files-resolves-relative-path-via-context-directory ()
+  "Relative DIRECTORY should resolve from context directory, not current default-directory."
+  (let* ((base (make-temp-file "org-ai-skills-context-base-" t))
+         (nested (expand-file-name "qbot" base))
+         (org-ai-skills-core-provider-allowed-paths nil)
+         (org-ai-skills--core-provider-context-directory base)
+         (org-ai-skills-core-provider-allowed-commands '(file-list)))
+    (unwind-protect
+        (progn
+          (make-directory nested t)
+          (with-temp-file (expand-file-name "README.md" nested)
+            (insert "qbot"))
+          (let ((default-directory "/tmp/"))
+            (let ((result (org-ai-skills-core-provider-list-files "qbot/" 20)))
+              (should (plist-get result :ok))
+              (should (string= (directory-file-name (plist-get result :cwd))
+                               (directory-file-name nested)))
+              (should (member "README.md" (plist-get result :entries))))))
+      (delete-directory base t))))
+
+(ert-deftest org-ai-skills-core-provider-read-file-requires-discovered-path-when-guard-active ()
+  "When discovery guard is active, read-file requires prior list/search discovery."
+  (let* ((base (make-temp-file "org-ai-skills-discovery-guard-" t))
+         (file (expand-file-name "note.txt" base))
+         (org-ai-skills-core-provider-allowed-paths (list base))
+         (org-ai-skills-core-provider-allowed-commands '(file-read file-list))
+         (org-ai-skills--core-provider-context-directory base))
+    (unwind-protect
+        (progn
+          (with-temp-file file
+            (insert "hello"))
+          (org-ai-skills--core-provider-reset-discovery-context base)
+          (let ((first (org-ai-skills-core-provider-read-file "note.txt")))
+            (should (plist-get first :ok))
+            (should (equal (plist-get first :error-kind) "path-not-discovered"))
+            (should (plist-get first :discovery-required)))
+          (let ((listed (org-ai-skills-core-provider-list-files "." 20)))
+            (should (plist-get listed :ok)))
+          (let ((second (org-ai-skills-core-provider-read-file "note.txt")))
+            (should (plist-get second :ok))
+            (should (equal (plist-get second :content) "hello"))))
+      (delete-directory base t))))
+
+(ert-deftest org-ai-skills-core-provider-list-files-missing-directory-is-nonfatal-advisory ()
+  "Missing directory in list-files should return advisory payload without hard failure."
+  (let* ((base (make-temp-file "org-ai-skills-list-miss-" t))
+         (org-ai-skills-core-provider-allowed-paths (list base))
+         (org-ai-skills-core-provider-allowed-commands '(file-list))
+         (org-ai-skills--core-provider-context-directory base))
+    (unwind-protect
+        (let ((result (org-ai-skills-core-provider-list-files "does-not-exist" 20)))
+          (should (plist-get result :ok))
+          (should (equal (plist-get result :error-kind) "directory-not-found"))
+          (should (= (or (plist-get result :entry-count) -1) 0)))
+      (delete-directory base t))))
+
+(ert-deftest org-ai-skills-core-provider-search-files-missing-directory-is-nonfatal-advisory ()
+  "Missing directory in search-files should return advisory payload without hard failure."
+  (let* ((base (make-temp-file "org-ai-skills-search-miss-" t))
+         (org-ai-skills-core-provider-allowed-paths (list base))
+         (org-ai-skills-core-provider-allowed-commands '(file-search))
+         (org-ai-skills--core-provider-context-directory base))
+    (unwind-protect
+        (let ((result (org-ai-skills-core-provider-search-files "needle" "does-not-exist" 20)))
+          (should (plist-get result :ok))
+          (should (equal (plist-get result :error-kind) "directory-not-found"))
+          (should (= (or (plist-get result :match-count) -1) 0)))
+      (delete-directory base t))))
+
+(ert-deftest org-ai-skills-core-provider-resolve-path-drops-redundant-base-prefix ()
+  "Relative paths should not repeat context-directory basename prefix."
+  (let* ((base "/tmp/example/qbot_code")
+         (org-ai-skills--core-provider-context-directory base))
+    (should (string= (org-ai-skills--core-provider-resolve-path "qbot_code")
+                     "/tmp/example/qbot_code"))
+    (should (string= (org-ai-skills--core-provider-resolve-path "qbot_code/qbot")
+                     "/tmp/example/qbot_code/qbot"))
+    (should (string= (org-ai-skills--core-provider-resolve-path "qbot")
+                     "/tmp/example/qbot_code/qbot"))))
 
 (ert-deftest org-ai-skills-resolve-subtree-from-slot-prefers-slot-id-over-markers ()
   "Target resolution should locate subtree by slot ID even if markers drift."
@@ -1314,6 +1398,227 @@
   (should-not (org-ai-skills--planner-constraints-for-run-state
                '(:steps ((:skills ("article-compose-from-outline"))
                          (:skills ("article-polish-editorial")))))))
+
+(ert-deftest org-ai-skills-rewrite-constraints-for-skill-ids-merges-outline-rules ()
+  "Skill-id constraint merge should include strict outline rewrite constraints."
+  (should (equal (org-ai-skills--rewrite-constraints-for-skill-ids
+                  '("gen-notes" "outline-driven-long-report"))
+                 '(:preserve-headlines t :omit-property-drawers t)))
+  (should-not (org-ai-skills--rewrite-constraints-for-skill-ids
+               '("gen-notes" "article-polish-editorial"))))
+
+(ert-deftest org-ai-skills-normalize-planner-final-output-outline-preserves-descendants ()
+  "Planner final output normalization should preserve descendant headings for outline steps."
+  (let* ((slot '(:text "* Root\n** Parent\nSeed.\n*** Child\nKeep.\n"
+                 :heading "Root"
+                 :level 1
+                 :context-mode current))
+         (run-state '(:steps ((:step-id "s1"
+                              :goal "Expand headline: ** Parent"
+                              :skills ("outline-driven-long-report")))))
+         (constraints '(:preserve-headlines t :omit-property-drawers t))
+         (rewritten (org-ai-skills--normalize-planner-final-output
+                     run-state
+                     slot
+                     "** Parent\nUpdated parent body.\n"
+                     constraints)))
+    (should (string-match-p "^\\*\\* Parent\nUpdated parent body\\." rewritten))
+    (should (string-match-p "^\\*\\*\\* Child\nKeep\\." rewritten))))
+
+(ert-deftest org-ai-skills-normalize-planner-final-output-outline-errors-on-missing-heading ()
+  "Planner final output normalization should fail when target heading is missing."
+  (let* ((slot '(:text "* Root\n** Parent\nSeed.\n*** Child\nKeep.\n"
+                 :heading "Root"
+                 :level 1
+                 :context-mode current))
+         (run-state '(:steps ((:step-id "s1"
+                              :goal "Expand headline: ** Missing"
+                              :skills ("outline-driven-long-report")))))
+         (constraints '(:preserve-headlines t :omit-property-drawers t)))
+    (should-error
+     (org-ai-skills--normalize-planner-final-output
+      run-state
+      slot
+      "** Parent\nUpdated parent body.\n"
+      constraints)
+     :type 'org-ai-skills-org-context-error)))
+
+(ert-deftest org-ai-skills-normalize-outline-step-output-uses-latest-output-as-merge-base ()
+  "Outline step normalization should accumulate on latest output, not original subtree."
+  (let* ((run-state '(:subtree (:text "* Root\n** A\nSeed A.\n** B\nSeed B.\n"
+                              :heading "Root"
+                              :level 1
+                              :context-mode current)
+                     :latest-output "* Root\n** A\nExpanded A.\n** B\nSeed B.\n"))
+         (step '(:step-id "s2"
+                :goal "Expand headline: ** B"
+                :skills ("outline-driven-long-report")))
+         (constraints '(:preserve-headlines t :omit-property-drawers t))
+         (rewritten (org-ai-skills--normalize-outline-step-output
+                     step run-state "** B\nExpanded B.\n" constraints)))
+    (should (string-match-p "^\\*\\* A\nExpanded A\\." rewritten))
+    (should (string-match-p "^\\*\\* B\nExpanded B\\." rewritten))))
+
+(ert-deftest org-ai-skills-normalize-outline-step-output-drops-rogue-org-headings-from-step-body ()
+  "Outline step normalization should ignore rogue org heading lines in section body output."
+  (let* ((run-state '(:subtree (:text "* Root\n** A\nSeed A.\n** B\nSeed B.\n"
+                              :heading "Root"
+                              :level 1
+                              :context-mode current)))
+         (step '(:step-id "s1"
+                :goal "Expand headline: ** A"
+                :skills ("outline-driven-long-report")))
+         (constraints '(:preserve-headlines t :omit-property-drawers t))
+         (raw "** A\nNew A text.\n* Rogue heading\nMore text.\n")
+         (rewritten (org-ai-skills--normalize-outline-step-output
+                     step run-state raw constraints)))
+    (should (string-match-p "^\\*\\* A\nNew A text\\." rewritten))
+    (should-not (string-match-p "^\\* Rogue heading" rewritten))
+    (should (string-match-p "^\\*\\* B\nSeed B\\." rewritten))))
+
+(ert-deftest org-ai-skills-normalize-outline-step-output-handles-root-and-peer-heading-payload ()
+  "Outline step normalization should merge content when model emits root+peer headings."
+  (let* ((run-state '(:subtree (:text "* Root\n** A\nSeed A.\n** B\nSeed B.\n"
+                              :heading "Root"
+                              :level 1
+                              :context-mode current)))
+         (step '(:step-id "s1"
+                :goal "Expand headline: ** A"
+                :skills ("outline-driven-long-report")))
+         (constraints '(:preserve-headlines t :omit-property-drawers t))
+         (raw "* Root\n** Other\nDetails from malformed payload.\n")
+         (rewritten (org-ai-skills--normalize-outline-step-output
+                     step run-state raw constraints)))
+    (should (string-match-p "^\\*\\* A\nDetails from malformed payload\\." rewritten))
+    (should (string-match-p "^\\*\\* B\nSeed B\\." rewritten))))
+
+(ert-deftest org-ai-skills-outline-long-report-task-keyword-detection ()
+  "Task keyword matcher should detect long-report outline intent."
+  (should (org-ai-skills--outline-long-report-task-p "根据提纲逐节生成长报告"))
+  (should (org-ai-skills--outline-long-report-task-p "expand outline into long report"))
+  (should-not (org-ai-skills--outline-long-report-task-p "polish editorial tone only")))
+
+(ert-deftest org-ai-skills-normalize-outline-long-report-plan-forces-headline-steps ()
+  "Normalizer should enforce one-step-per-heading outline expansion plan."
+  (let* ((run-state '(:task "根据提纲逐节生成长报告"
+                     :subtree (:text "* Root\n** Intro\n** Architecture\n*** Components\n")
+                     :steps nil))
+         (metadata '((:skill-id "outline-driven-long-report" :title "Outline")
+                     (:skill-id "article-compose-from-outline" :title "Compose")))
+         (planner-plan '((:step-id "s1"
+                         :goal "compose"
+                         :skills ("article-compose-from-outline"))))
+         (effective-plan
+          (org-ai-skills--normalize-outline-long-report-plan
+           "根据提纲逐节生成长报告"
+           run-state
+           metadata
+           planner-plan)))
+    (should (= (length effective-plan) 3))
+    (dolist (step effective-plan)
+      (should (equal (plist-get step :skills)
+                     '("outline-driven-long-report"))))
+    (should (string-match-p "^Expand headline: \\*\\* Intro"
+                            (plist-get (car effective-plan) :goal)))))
+
+(ert-deftest org-ai-skills-build-outline-long-report-plan-not-capped-by-planner-max-steps ()
+  "Deterministic outline plan should cover all pending headings, not planner max-steps."
+  (let ((org-ai-skills-planner-max-steps 2)
+        (run-state '(:subtree (:text "* Root\n** H1\n** H2\n** H3\n** H4\n")
+                     :steps nil)))
+    (let ((plan (org-ai-skills--build-outline-long-report-plan run-state)))
+      (should (= (length plan) 4))
+      (should (string-match-p "^Expand headline: \\*\\* H1"
+                              (plist-get (nth 0 plan) :goal)))
+      (should (string-match-p "^Expand headline: \\*\\* H4"
+                              (plist-get (nth 3 plan) :goal))))))
+
+(ert-deftest org-ai-skills-normalize-outline-long-report-plan-resumes-next-heading ()
+  "Normalizer should skip already-completed heading steps on replan."
+  (let* ((run-state '(:task "根据提纲逐节生成长报告"
+                     :subtree (:text "* Root\n** Intro\n** Architecture\n*** Components\n")
+                     :steps ((:step-id "s1"
+                              :goal "Expand headline: ** Intro"
+                              :skills ("outline-driven-long-report")
+                              :status done))))
+         (metadata '((:skill-id "outline-driven-long-report" :title "Outline")
+                     (:skill-id "article-compose-from-outline" :title "Compose")))
+         (effective-plan
+          (org-ai-skills--normalize-outline-long-report-plan
+           "根据提纲逐节生成长报告"
+           run-state
+           metadata
+           nil)))
+    (should (= (length effective-plan) 2))
+    (should (string-match-p "^Expand headline: \\*\\* Architecture"
+                            (plist-get (car effective-plan) :goal)))))
+
+(ert-deftest org-ai-skills-replace-subtree-by-heading-line-replaces-only-target-section ()
+  "Partial heading merge should replace only the target heading subtree."
+  (let* ((full "* Root\n** Intro\nSeed intro.\n** Body\nSeed body.\n")
+         (merged (org-ai-skills--replace-subtree-by-heading-line
+                  full
+                  "** Intro"
+                  "** Intro\nExpanded intro.\n")))
+    (should (stringp merged))
+    (should (string-match-p "^\\*\\* Intro\nExpanded intro\\." merged))
+    (should (string-match-p "^\\*\\* Body\nSeed body\\." merged))))
+
+(ert-deftest org-ai-skills-replace-subtree-by-heading-line-matches-trimmed-title ()
+  "Heading replacement should tolerate trailing spaces in planner heading labels."
+  (let* ((full "* Root\n** Intro\nSeed intro.\n** Body\nSeed body.\n")
+         (merged (org-ai-skills--replace-subtree-by-heading-line
+                  full
+                  "** Intro   "
+                  "** Intro\nExpanded intro.\n")))
+    (should (stringp merged))
+    (should (string-match-p "^\\*\\* Intro\nExpanded intro\\." merged))))
+
+(ert-deftest org-ai-skills-replace-subtree-by-heading-line-returns-nil-when-missing ()
+  "Partial heading merge should fail when target heading is absent."
+  (should-not
+   (org-ai-skills--replace-subtree-by-heading-line
+    "* Root\n** Intro\nSeed.\n"
+    "** Missing"
+    "** Missing\nNew.\n")))
+
+(ert-deftest org-ai-skills-replace-heading-body-preserve-children-keeps-descendants ()
+  "Parent heading expansion should keep existing descendant headings unchanged."
+  (let* ((full "* Root\n** Parent\nOld summary.\n*** Child\nKeep child.\n")
+         (merged (org-ai-skills--replace-heading-body-preserve-children
+                  full
+                  "** Parent"
+                  "** Parent\nNew summary line.\n")))
+    (should (stringp merged))
+    (should (string-match-p "^\\*\\* Parent\nNew summary line\\." merged))
+    (should (string-match-p "^\\*\\*\\* Child\nKeep child\\." merged))))
+
+(ert-deftest org-ai-skills-replace-heading-body-preserve-children-matches-trimmed-title ()
+  "Body replacement should match headings by level+trimmed title."
+  (let* ((full "* Root\n** Parent\nOld summary.\n*** Child\nKeep child.\n")
+         (merged (org-ai-skills--replace-heading-body-preserve-children
+                  full
+                  "** Parent   "
+                  "** Parent\nNew summary line.\n")))
+    (should (stringp merged))
+    (should (string-match-p "^\\*\\* Parent\nNew summary line\\." merged))
+    (should (string-match-p "^\\*\\*\\* Child\nKeep child\\." merged))))
+
+(ert-deftest org-ai-skills-partial-heading-body-before-descendants-stops-at-first-heading ()
+  "Body extraction should stop at the first following heading line of any level."
+  (let* ((body (org-ai-skills--partial-heading-body-before-descendants
+                "** Parent"
+                "** Parent\nIntro text.\n* Rogue headline\nMore text.\n")))
+    (should (string-match-p "Intro text\\." body))
+    (should-not (string-match-p "Rogue headline" body))))
+
+(ert-deftest org-ai-skills-outline-section-body-for-merge-strips-heading-only-output ()
+  "Section merge body builder should drop heading lines when no direct section body exists."
+  (let ((body (org-ai-skills--outline-section-body-for-merge
+               "** Parent"
+               "* Root\n** Other\nDetails.\n")))
+    (should (string-match-p "Details\\." body))
+    (should-not (string-match-p "^\\*+" body))))
 
 (ert-deftest org-ai-skills-org-apply-rewrite-result-subtree-scope-keeps-siblings ()
   "Subtree apply should not modify sibling subtree content."
@@ -2271,6 +2576,29 @@
       (should (re-search-forward "^Progress: tool-error$" nil t))
       (should (re-search-forward "^Error: Provider tool failed" nil t)))))
 
+(ert-deftest org-ai-skills-ui-control-buffer-renders-running-substep-progress-detail ()
+  "Control buffer should show sub-step counters while a run is active."
+  (let ((org-ai-skills--ui-run-state
+         (list :run-id "run-progress"
+               :status 'running
+               :progress "executing step s2"
+               :run-type 'planner
+               :heading "Leaf"
+               :task "task"))
+        (org-ai-skills--debug-events
+         (list (list :event-type 'gptel-request-data :request-role 'execution :step-id "s1")
+               (list :event-type 'step-execution :request-role 'execution :step-id "s1")
+               (list :event-type 'tool-call :request-role 'execution :step-id "s1")
+               (list :event-type 'tool-result :request-role 'execution :step-id "s1")
+               (list :event-type 'step-execution :request-role 'execution :step-id "s2"))))
+    (org-ai-skills-ui-refresh-control-buffer)
+    (with-current-buffer (get-buffer org-ai-skills-control-buffer-name)
+      (goto-char (point-min))
+      (should (re-search-forward "^Progress: executing step s2$" nil t))
+      (should (re-search-forward
+               "^Progress detail: substeps=5 started=2 tool=2 api=1$"
+               nil t)))))
+
 (ert-deftest org-ai-skills-ui-control-buffer-disables-dag-key-when-empty ()
   "Control buffer should dim DAG key when no DAG data is available yet."
   (let ((org-ai-skills--ui-run-state
@@ -2767,6 +3095,70 @@
     (should (stringp prompt))
     (should (string-match-p "\"skills\":\\[\"gen-notes\"\\]" prompt))))
 
+(ert-deftest org-ai-skills-build-planner-request-adds-strict-outline-rule-when-triggered ()
+  "Planner prompt should include strict outline-long-report rule when task triggers it."
+  (let* ((metadata (org-ai-skills-load-skill-metadata
+                    (expand-file-name "skills" org-ai-skills-test--project-root)))
+         (run-state '(:task "根据提纲逐节生成长报告"
+                     :plan-revision 1
+                     :steps nil
+                     :subtree (:text "* Root\n** Intro\n** Body\n")))
+         (request (org-ai-skills-build-planner-request
+                   "根据提纲逐节生成长报告"
+                   metadata
+                   run-state))
+         (prompt (plist-get request :prompt)))
+    (should (string-match-p "Strict outline-long-report rule" prompt))
+    (should (string-match-p "Do not use \"article-compose-from-outline\"" prompt))
+    (should (string-match-p "do not cap plan steps below outline-heading-count" prompt))
+    (should-not (string-match-p "Use at most 3 candidates and 2 steps" prompt))
+    (should (string-match-p "\"outline-heading-count\":2" prompt))))
+
+(ert-deftest org-ai-skills-request-planner-plan-bypasses-dispatch-for-outline-long-report ()
+  "Planner request should bypass remote dispatch for deterministic outline-long-report plan."
+  (let* ((metadata '((:skill-id "outline-driven-long-report" :title "Outline")))
+         (run-state '(:task "根据提纲逐节生成长报告"
+                     :plan-revision 1
+                     :steps nil
+                     :subtree (:text "* Root\n** Intro\n** Body\n")))
+         (dispatch-called nil)
+         (captured-response nil)
+         (captured-state nil))
+    (cl-letf (((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (&rest _args)
+                 (setq dispatch-called t))))
+      (org-ai-skills--request-planner-plan
+       "根据提纲逐节生成长报告"
+       metadata
+       run-state
+       (lambda (response updated-run-state)
+         (setq captured-response response
+               captured-state updated-run-state))))
+    (should-not dispatch-called)
+    (should (listp captured-response))
+    (should (= (length (plist-get captured-response :plan)) 2))
+    (should (equal (plist-get (car (plist-get captured-response :plan)) :skills)
+                   '("outline-driven-long-report")))
+    (should-not (plist-get captured-state :fatal-error))))
+
+(ert-deftest org-ai-skills-request-planner-plan-still-dispatches-for-non-outline-task ()
+  "Planner request should still use remote dispatch when outline deterministic rule is not required."
+  (let* ((metadata '((:skill-id "outline-driven-long-report" :title "Outline")))
+         (run-state '(:task "polish this subtree"
+                     :plan-revision 1
+                     :steps nil
+                     :subtree (:text "* Root\n** Intro\n")))
+         (dispatch-called nil))
+    (cl-letf (((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (&rest _args)
+                 (setq dispatch-called t))))
+      (org-ai-skills--request-planner-plan
+       "polish this subtree"
+       metadata
+       run-state
+       (lambda (_response _updated-run-state) nil)))
+    (should dispatch-called)))
+
 (ert-deftest org-ai-skills-parse-planner-response-validates-known-skills ()
   "Planner response parser should reject unknown skill ids."
   (let* ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
@@ -2843,6 +3235,42 @@
                         [(:role "system" :content "planner-system-prompt")
                          (:role "user" :content "planner-user-prompt")])))))
     (should-not text)))
+
+(ert-deftest org-ai-skills-gptel-status-transport-detail-parses-status-tuple-string ()
+  "Transport detail parser should extract request id and header bytes from status tuple string."
+  (let* ((detail (org-ai-skills--gptel-status-transport-detail
+                  "((fb53854cab33f2e4536951e5898c7b0d . 0)) Could not parse HTTP response.")))
+    (should (equal (plist-get detail :transport-request-id)
+                   "fb53854cab33f2e4536951e5898c7b0d"))
+    (should (= (plist-get detail :transport-header-bytes) 0))
+    (should (string-match-p "Could not parse HTTP response"
+                            (or (plist-get detail :status-text) "")))))
+
+(ert-deftest org-ai-skills-extract-gptel-response-text-parse-error-includes-transport-details ()
+  "Parse-error fatal message should include transport identifiers for diagnosis."
+  (condition-case err
+      (progn
+        (org-ai-skills--extract-gptel-response-text
+         nil
+         '(:status "((fb53854cab33f2e4536951e5898c7b0d . 0)) Could not parse HTTP response."
+           :error "Could not parse HTTP response."
+           :data (:error "upstream reset")))
+        (should nil))
+    (org-ai-skills-gptel-error
+     (let ((msg (error-message-string err)))
+       (should (string-match-p "request_id=fb53854cab33f2e4536951e5898c7b0d" msg))
+       (should (string-match-p "header_bytes=0" msg))
+       (should (string-match-p "data_error=.*upstream reset" msg))))))
+
+(ert-deftest org-ai-skills-gptel-info-summary-for-debug-includes-transport-details ()
+  "Debug info summary should expose parsed transport fields from callback info."
+  (let* ((summary (org-ai-skills--gptel-info-summary-for-debug
+                   '(:status "((abc123 . 56)) Could not parse HTTP response."
+                     :error "Could not parse HTTP response."
+                     :data (:error "upstream timeout")))))
+    (should (equal (plist-get summary :transport-request-id) "abc123"))
+    (should (= (plist-get summary :transport-header-bytes) 56))
+    (should (equal (plist-get summary :data-error) "upstream timeout"))))
 
 (ert-deftest org-ai-skills-request-planner-plan-fails-on-malformed-json ()
   "Planner request should return fatal run-state when planner JSON is malformed."
@@ -3557,6 +3985,75 @@
     (should (stringp callback-output))
     (should (string-match-p "^\\*\\*\\* From info" callback-output))))
 
+(ert-deftest org-ai-skills-execute-plan-step-outline-constraints-keep-full-subtree ()
+  "Outline-long-report step should preserve full subtree in recorded output."
+  (let (callback-run-state callback-output)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (&rest _args)
+                 '(:skill-id "outline-driven-long-report" :title "Outline")))
+              ((symbol-function 'org-ai-skills-apply-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-exclude-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-build-step-request)
+               (lambda (&rest _args)
+                 '(:event-type step-execution :request-role execution :step-id "s1" :prompt "p")))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback
+                          "** Intro\nExpanded intro.\n"
+                          '(:status "HTTP/2 200" :stop-reason "stop")))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :skills ("outline-driven-long-report") :goal "Expand headline: ** Intro")
+       '(:task "根据提纲逐节生成长报告"
+         :subtree (:text "* Root\n** Intro\nSeed.\n** Body\nSeed.\n"
+                  :heading "Root"
+                  :level 1
+                  :context-mode current)
+         :plan-revision 1
+         :events nil)
+       (lambda (run-state output)
+         (setq callback-run-state run-state)
+         (setq callback-output output))))
+    (should-not (plist-get callback-run-state :fatal-error))
+    (should (string-match-p "^\\* Root\n\\*\\* Intro" callback-output))
+    (should (string-match-p "^\\*\\* Body\nSeed\\." callback-output))))
+
+(ert-deftest org-ai-skills-execute-plan-step-outline-constraint-violation-fails-gracefully ()
+  "Outline-long-report constraint violations should become fatal run-state errors."
+  (let (callback-run-state callback-output)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (&rest _args)
+                 '(:skill-id "outline-driven-long-report" :title "Outline")))
+              ((symbol-function 'org-ai-skills-apply-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-exclude-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-build-step-request)
+               (lambda (&rest _args)
+                 '(:event-type step-execution :request-role execution :step-id "s1" :prompt "p")))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback
+                          "** Unknown\nExpanded intro only.\n"
+                          '(:status "HTTP/2 200" :stop-reason "stop")))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :skills ("outline-driven-long-report") :goal "Expand headline: ** Missing")
+       '(:task "根据提纲逐节生成长报告"
+         :subtree (:text "* Root\n** Intro\nSeed.\n** Body\nSeed.\n"
+                  :heading "Root"
+                  :level 1
+                  :context-mode current)
+         :plan-revision 1
+         :events nil)
+       (lambda (run-state output)
+         (setq callback-run-state run-state)
+         (setq callback-output output))))
+    (should (stringp (plist-get callback-run-state :fatal-error)))
+    (should (string-match-p "Strict rewrite rejected: headline lines changed"
+                            (plist-get callback-run-state :fatal-error)))
+    (should-not callback-output)))
+
 (ert-deftest org-ai-skills-execute-plan-step-times-out-without-callback ()
   "Execution step should fail explicitly on callback timeout."
   (let ((org-ai-skills-execution-request-timeout-seconds 1)
@@ -3639,6 +4136,40 @@
         (should (string-match-p "Execution step timeout"
                                 (plist-get callback-run-state :fatal-error)))))))
 
+(ert-deftest org-ai-skills-execute-plan-step-uses-tool-timeout-when-tool-call-is-pending ()
+  "Execution watchdog should switch to tool timeout window while waiting tool-result."
+  (let ((org-ai-skills-execution-request-timeout-seconds 1)
+        (org-ai-skills-execution-tool-result-timeout-seconds 7)
+        callback-run-state
+        (timer-seconds nil))
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (&rest _args) '(:skill-id "gen-notes" :title "Notes")))
+              ((symbol-function 'org-ai-skills-apply-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-exclude-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-build-step-request)
+               (lambda (&rest _args)
+                 '(:event-type step-execution :request-role execution :step-id "s1" :prompt "p")))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (funcall callback '(tool-call (:id "tc-1")) nil)))
+              ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
+               (lambda (&rest _response) nil))
+              ((symbol-function 'run-at-time)
+               (lambda (secs _repeat _fn &rest _args)
+                 (setq timer-seconds (append timer-seconds (list secs)))
+                 (intern (format "fake-timer-%d" (length timer-seconds)))))
+              ((symbol-function 'cancel-timer)
+               (lambda (_timer) nil)))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :skills ("gen-notes") :goal "g")
+       '(:task "task" :subtree (:text "* H\n") :plan-revision 1 :events nil)
+       (lambda (run-state _output)
+         (setq callback-run-state run-state))))
+    (should-not callback-run-state)
+    (should (equal timer-seconds '(1 7)))))
+
 (ert-deftest org-ai-skills-request-planner-plan-resets-watchdog-on-progress ()
   "Planner watchdog should reset on non-terminal callback progress."
   (let ((metadata (list '(:skill-id "gen-notes" :title "Notes" :summary "S")))
@@ -3713,8 +4244,98 @@
          (setq callback-run-state run-state)
          (setq callback-output output))))
     (should (>= (or run-at-time-count 0) 3))
-    (should-not (plist-get callback-run-state :fatal-error))
-    (should (stringp callback-output))))
+     (should-not (plist-get callback-run-state :fatal-error))
+     (should (stringp callback-output))))
+
+(ert-deftest org-ai-skills-execute-plan-step-fails-fast-on-callback-event-limit ()
+  "Execution step should fail fast when callback event count exceeds limit."
+  (let ((org-ai-skills-execution-max-callback-events 3)
+        (org-ai-skills-execution-max-tool-events nil)
+        (org-ai-skills-execution-max-nonterminal-callbacks-without-text nil)
+        callback-run-state)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (&rest _args) '(:skill-id "alpha" :title "A")))
+              ((symbol-function 'org-ai-skills-apply-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-exclude-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-build-step-request)
+               (lambda (&rest _args)
+                 '(:event-type step-execution :request-role execution :step-id "s1" :prompt "p")))
+              ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
+               (lambda (&rest _response) nil))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (dotimes (_ 5)
+                   (funcall callback '(reasoning (:text "thinking")) nil)))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :skills ("alpha") :goal "g")
+       '(:task "task" :subtree (:text "*** Input\n") :plan-revision 1 :events nil)
+       (lambda (run-state _output)
+         (setq callback-run-state run-state))))
+    (should (stringp (plist-get callback-run-state :fatal-error)))
+    (should (string-match-p "callback event limit exceeded"
+                            (plist-get callback-run-state :fatal-error)))))
+
+(ert-deftest org-ai-skills-execute-plan-step-fails-fast-on-tool-event-limit ()
+  "Execution step should fail fast when tool event count exceeds limit."
+  (let ((org-ai-skills-execution-max-callback-events nil)
+        (org-ai-skills-execution-max-tool-events 2)
+        (org-ai-skills-execution-max-nonterminal-callbacks-without-text nil)
+        callback-run-state)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (&rest _args) '(:skill-id "alpha" :title "A")))
+              ((symbol-function 'org-ai-skills-apply-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-exclude-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-build-step-request)
+               (lambda (&rest _args)
+                 '(:event-type step-execution :request-role execution :step-id "s1" :prompt "p")))
+              ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
+               (lambda (&rest _response) nil))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (dotimes (_ 3)
+                   (funcall callback '(tool-result ((dummy . t))) nil)))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :skills ("alpha") :goal "g")
+       '(:task "task" :subtree (:text "*** Input\n") :plan-revision 1 :events nil)
+       (lambda (run-state _output)
+         (setq callback-run-state run-state))))
+    (should (stringp (plist-get callback-run-state :fatal-error)))
+    (should (string-match-p "tool event limit exceeded"
+                            (plist-get callback-run-state :fatal-error)))))
+
+(ert-deftest org-ai-skills-execute-plan-step-fails-fast-on-nonterminal-streak-limit ()
+  "Execution step should fail fast on long non-terminal no-text callback streak."
+  (let ((org-ai-skills-execution-max-callback-events nil)
+        (org-ai-skills-execution-max-tool-events nil)
+        (org-ai-skills-execution-max-nonterminal-callbacks-without-text 2)
+        callback-run-state)
+    (cl-letf (((symbol-function 'org-ai-skills-load-skill-by-id)
+               (lambda (&rest _args) '(:skill-id "alpha" :title "A")))
+              ((symbol-function 'org-ai-skills-apply-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-exclude-skill-function-calls)
+               (lambda (&rest _args) nil))
+              ((symbol-function 'org-ai-skills-build-step-request)
+               (lambda (&rest _args)
+                 '(:event-type step-execution :request-role execution :step-id "s1" :prompt "p")))
+              ((symbol-function 'org-ai-skills--extract-gptel-response-text-if-ready)
+               (lambda (&rest _response) nil))
+              ((symbol-function 'org-ai-skills-gptel-dispatch-rewrite)
+               (lambda (_request callback)
+                 (dotimes (_ 4)
+                   (funcall callback '(reasoning (:text "thinking")) nil)))))
+      (org-ai-skills-execute-plan-step
+       '(:step-id "s1" :skills ("alpha") :goal "g")
+       '(:task "task" :subtree (:text "*** Input\n") :plan-revision 1 :events nil)
+       (lambda (run-state _output)
+         (setq callback-run-state run-state))))
+    (should (stringp (plist-get callback-run-state :fatal-error)))
+    (should (string-match-p "non-terminal callback streak without text exceeded"
+                            (plist-get callback-run-state :fatal-error)))))
 
 (ert-deftest org-ai-skills-normalize-provider-usage-supports-multiple-key-shapes ()
   "Usage adapter should normalize common provider usage key variants."
@@ -4259,6 +4880,43 @@
        #'ignore))
     (should-not captured-use-tools)
     (should-not captured-tools)))
+
+(ert-deftest org-ai-skills-gptel-dispatch-persists-core-provider-context-for-async-tools ()
+  "Dispatch should persist working-directory for async provider tool execution."
+  (let* ((base (make-temp-file "org-ai-skills-dispatch-context-" t))
+         (nested (expand-file-name "qbot" base))
+         (org-ai-skills-debug-enabled nil)
+         (org-ai-skills--core-provider-context-directory nil)
+         (org-ai-skills-core-provider-allowed-commands '(file-list))
+         (org-ai-skills-core-provider-allowed-paths nil)
+         (orig-featurep (symbol-function 'featurep))
+         (orig-fboundp (symbol-function 'fboundp)))
+    (unwind-protect
+        (progn
+          (make-directory nested t)
+          (with-temp-file (expand-file-name "README.md" nested)
+            (insert "ok"))
+          (cl-letf (((symbol-function 'featurep)
+                     (lambda (feature)
+                       (if (eq feature 'gptel) t (funcall orig-featurep feature))))
+                    ((symbol-function 'fboundp)
+                     (lambda (symbol)
+                       (if (eq symbol 'gptel-request)
+                           t
+                         (funcall orig-fboundp symbol))))
+                    ((symbol-function 'gptel-request)
+                     (lambda (&rest _args) t)))
+            (org-ai-skills-gptel-dispatch-rewrite
+             (list :prompt "test"
+                   :request-role 'execution
+                   :working-directory base)
+             #'ignore))
+          ;; Simulate provider tool invocation happening later/asynchronously.
+          (let ((default-directory "/tmp/"))
+            (let ((result (org-ai-skills-core-provider-list-files "qbot" 10)))
+              (should (plist-get result :ok))
+              (should (member "README.md" (plist-get result :entries))))))
+      (delete-directory base t))))
 
 (ert-deftest org-ai-skills-build-gptel-rewrite-request-tags-execution-role ()
   "Rewrite request builder should annotate execution request role."
@@ -4843,6 +5501,24 @@
     (should (= (length passed) 1))
     (should (null failed))))
 
+(ert-deftest org-ai-skills-bdd-assertions-support-dag-not-contain ()
+  "BDD assertions should support `dag info should not contain ...` grammar."
+  (let* ((steps (list (list :phase 'then
+                            :text "dag info should not contain \"article-compose-from-outline\"")))
+         (result (org-ai-skills-bdd--assertions-from-steps
+                  steps
+                  'success
+                  "Heading"
+                  "* Heading\nBody"
+                  ""
+                  "Execution DAG\nskills: outline-driven-long-report"
+                  "qwen/qwen3-8b"
+                  "* Heading\nFixture"))
+         (passed (car result))
+         (failed (cdr result)))
+    (should (= (length passed) 1))
+    (should (null failed))))
+
 (ert-deftest org-ai-skills-bdd-run-file-supports-planner-command ()
   "BDD runner should execute planner scenarios without requiring skill id."
   (let* ((scenario-file (make-temp-file "org-ai-skills-bdd-planner-" nil ".org"))
@@ -4937,5 +5613,104 @@
            #'string<)))
     (dolist (skill-id skill-ids)
       (should (member skill-id scenario-skill-ids)))))
+
+(ert-deftest org-ai-skills-bdd-timeout-progress-summary-reports-step-progress ()
+  "Timeout progress summary should include done/total and step ids."
+  (let ((org-ai-skills--debug-events
+         '((:event-type step-execution :request-role execution :step-id "s2")
+           (:event-type tool-result :request-role execution :step-id "s2")
+           (:event-type gptel-request-data :request-role execution :step-id "s2")))
+        (org-ai-skills--ui-run-state
+         '(:run-id "r1"
+           :status running
+           :planner-run-state
+           (:steps ((:step-id "s1") (:step-id "s2"))
+            :active-plan ((:step-id "s1") (:step-id "s2") (:step-id "s3"))))))
+    (let ((summary (org-ai-skills--bdd-timeout-progress-summary "r1")))
+      (should (string-match-p "completed=2/3" summary))
+      (should (string-match-p "last_step=s2" summary))
+      (should (string-match-p "next_step=s3" summary))
+      (should (string-match-p "substeps=3" summary)))))
+
+(ert-deftest org-ai-skills-bdd-substep-progress-snapshot-counts-execution-events ()
+  "Sub-step snapshot should count execution step/tool/api events semantically."
+  (let ((org-ai-skills--debug-events
+         '((:event-type gptel-request-data :request-role execution :step-id "s1")
+           (:event-type tool-call :request-role execution :step-id "s1")
+           (:event-type tool-result :request-role execution :step-id "s1")
+           (:event-type step-execution :request-role execution :step-id "s1")
+           (:event-type step-execution :request-role execution :step-id "s2")
+           (:event-type gptel-request-data :request-role planner :step-id "p1"))))
+    (let ((snapshot (org-ai-skills--bdd-substep-progress-snapshot "r1")))
+      (should (= (plist-get snapshot :substep-events) 5))
+      (should (= (plist-get snapshot :started-steps) 2))
+      (should (= (plist-get snapshot :tool-events) 2))
+      (should (= (plist-get snapshot :api-events) 1))
+      (should (equal (plist-get snapshot :last-started-step-id) "s1")))))
+
+(ert-deftest org-ai-skills-bdd-wait-for-run-completion-timeout-includes-progress-summary ()
+  "BDD timeout error should include run progress details."
+  (let ((org-ai-skills--ui-run-state
+         '(:run-id "r1"
+           :status running
+           :planner-run-state
+           (:steps ((:step-id "s1"))
+            :active-plan ((:step-id "s1") (:step-id "s2"))))))
+    (condition-case err
+        (progn
+          (org-ai-skills-bdd--wait-for-run-completion "r1" 1)
+          (should nil))
+      (org-ai-skills-gptel-error
+       (let ((msg (error-message-string err)))
+         (should (string-match-p "completed=1/2" msg))
+         (should (string-match-p "next_step=s2" msg)))))))
+
+(ert-deftest org-ai-skills-bdd-wait-for-run-completion-refreshes-deadline-on-step-progress ()
+  "BDD wait timeout should refresh per completed step progress."
+  (let* ((fake-now 0.0)
+         (poll-count 0)
+         (org-ai-skills--ui-run-state
+          '(:run-id "r1"
+            :status running
+            :planner-run-state
+            (:steps nil
+             :active-plan ((:step-id "s1") (:step-id "s2"))))))
+    (cl-letf (((symbol-function 'float-time)
+               (lambda (&optional _time) fake-now))
+              ((symbol-function 'accept-process-output)
+               (lambda (&rest _args)
+                 (setq poll-count (1+ poll-count))
+                 (setq fake-now (+ fake-now 0.6))
+                 (when (= poll-count 2)
+                   (setf (plist-get (plist-get org-ai-skills--ui-run-state :planner-run-state) :steps)
+                         '((:step-id "s1" :status done))))
+                 (when (= poll-count 4)
+                   (setf (plist-get org-ai-skills--ui-run-state :status) 'success))
+                 t)))
+      (should (eq (org-ai-skills-bdd--wait-for-run-completion "r1" 1) 'success)))))
+
+(ert-deftest org-ai-skills-bdd-wait-for-run-completion-refreshes-deadline-on-debug-progress ()
+  "BDD wait timeout should refresh when debug events grow even if step count is unchanged."
+  (let* ((fake-now 0.0)
+         (poll-count 0)
+         (org-ai-skills--debug-events nil)
+         (org-ai-skills--ui-run-state
+          '(:run-id "r1"
+            :status running
+            :planner-run-state
+            (:steps nil
+             :active-plan ((:step-id "s1") (:step-id "s2"))))))
+    (cl-letf (((symbol-function 'float-time)
+               (lambda (&optional _time) fake-now))
+              ((symbol-function 'accept-process-output)
+               (lambda (&rest _args)
+                 (setq poll-count (1+ poll-count))
+                 (setq fake-now (+ fake-now 0.6))
+                 (when (= poll-count 2)
+                   (push '(:event-type step-execution) org-ai-skills--debug-events))
+                 (when (= poll-count 4)
+                   (setf (plist-get org-ai-skills--ui-run-state :status) 'success))
+                 t)))
+      (should (eq (org-ai-skills-bdd--wait-for-run-completion "r1" 1) 'success)))))
 
 ;;; org-ai-skills-test.el ends here

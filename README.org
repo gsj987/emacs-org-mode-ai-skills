@@ -94,11 +94,17 @@ Phase 1 adds Org-based BDD scenarios under =tests/bdd/= and a live E2E runner th
   - =tests/bdd/011-execution-stall-fail-fast.org=
   - =tests/bdd/012-call-level-watchdog-and-dag-visibility.org=
   - =tests/bdd/014-outline-driven-long-report-subtree.org=
+  - =tests/bdd/015-outline-plan-run-headline-by-headline.org=
 - Scenario file keeps fixture data inline via sections:
   - =* Fixture Input=
 - Scenario and fixture headings can include Org property drawers for richer cases.
 - Optional fallback remains supported:
   - Given =fixture file "..."=
+- Live BDD wait timeout behavior:
+  - =org-ai-skills-bdd-live-timeout-seconds= is a per-window timeout, not a hard total wall-clock cap.
+  - The wait deadline is refreshed whenever a planner step completes, so long multi-step runs can continue while making progress.
+  - The wait deadline is also refreshed on semantic execution sub-step progress (step-execution/tool/api events), not only top-level completed steps.
+  - Timeout errors include progress summary (completed/total, last_step, next_step).
 
 Simple live E2E command:
 
@@ -433,6 +439,7 @@ gptel tool registration behavior:
   - =org-ai-skills-core-provider-allowed-paths=
 - Provider directory resolution:
   - If a tool call omits =directory=, runtime uses request =:working-directory= when available.
+  - If a tool call provides a relative =directory= or =file_path=, runtime resolves it against request =:working-directory= (not buffer =default-directory=).
   - Working directory is inferred from subtree context (priority: path in =:PURPOSE:= text, then =:SOURCE_FILE_PATH:=).
 - Provider error propagation:
   - If provider tool-result returns =:ok nil= with =:error-kind= (for example =path-not-allowed=), rewrite/planner execution fails fast and does not auto-apply generated content.
@@ -472,6 +479,9 @@ Role-scoped model and system prompt routing:
   - =org-ai-skills-execution-request-timeout-seconds= (default =90=)
     - Inactivity watchdog window per execution API call.
     - Timer resets on callback progress events (including tool-call/tool-result).
+  - =org-ai-skills-execution-tool-result-timeout-seconds= (default =180=)
+    - Inactivity watchdog window while tool calls are pending and runtime is waiting for matching =tool-result= callbacks.
+    - Separates tool-execution sub-step timeout from the regular execution callback timeout window.
 - System prompt overrides:
   - =org-ai-skills-system-prompt-planner=
   - =org-ai-skills-system-prompt-execution=
@@ -510,8 +520,14 @@ Debug observability:
   - =org-ai-skills-debug-filter-step= (step id or stage id string, or =nil=)
 - Debug entry includes timestamp, request role, effective model, system prompt
   fingerprint, log level, stage id, buffer/file, target headline/path, and request summary.
+- Transport parse failures now include extracted identifiers when available:
+  -=request_id= (provider request tuple id)
+  -=header_bytes= (curl-reported response header size from status tuple)
+  -=data_error= (best-effort provider payload error field)
 - In =minimal= and =standard= modes, payload fields are truncated; use =verbose=
   only when deeper diagnosis is needed.
+- Control panel live progress:
+  - Running state now shows =Progress detail: substeps=… started=… tool=… api=…= for semantic sub-step heartbeat visibility.
 
 Run-state timing observability:
 - Planner and execution flows append timing events to =run-state :events=.
@@ -628,6 +644,8 @@ Article workflow recommendation:
 - Outline long-report defaults (=outline-driven-long-report=):
   - Uses same strict outline lock and compact outline-summary context.
   - Planner prompt prefers one heading section per step for bounded expansion.
+  - Runtime normalizer enforces one heading per step when task intent matches
+    outline-long-report triggers (e.g. "根据提纲", "expand outline", "long report").
 - Subtree apply ensures resulting headings have =:ID:= for rerun targeting.
 
 Core model:
@@ -659,6 +677,10 @@ Balancing controls:
 - =org-ai-skills-planner-max-skills-per-step= (default 2)
 - =org-ai-skills-planner-batching-mode= (=quality-first=, =balanced=, =speed-first=)
 - =org-ai-skills-planner-overflow-strategy= (=reject= or =split=)
+- Execution callback loop guards:
+  - =org-ai-skills-execution-max-callback-events= (default 240)
+  - =org-ai-skills-execution-max-tool-events= (default 160)
+  - =org-ai-skills-execution-max-nonterminal-callbacks-without-text= (default 80)
 
 Behavior notes:
 - If planner returns too many skills in one step:

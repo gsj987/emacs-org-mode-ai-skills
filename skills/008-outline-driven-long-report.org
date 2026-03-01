@@ -24,11 +24,13 @@ Expand an approved outline subtree into a long-form report section-by-section, p
 - preserve heading hierarchy, headline text, and outline order
 - expand one heading section at a time during execution planning
 - return only final Org artifact
+- output must be Org-mode text only; do not return Markdown sections or fenced code blocks
 - preserve original task language unless explicitly overridden
 
 ** Requirements
 - generate concrete long-form content for each section
 - do not emit heading-only output
+- do not output Markdown formatting wrappers (for example, ```markdown fences)
 - keep style/terminology consistent across sections
 - use bounded, section-scoped reads for source grounding
 - do not perform broad/unbounded repository traversal

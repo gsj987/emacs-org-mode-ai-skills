@@ -210,3 +210,10 @@ For planner/execution/callback issues, follow this order and do not skip stages:
 - Keep default logs concise, but ensure each stage (A-E) has at least one inspectable signal.
 - Add temporary deep logs only when needed for active incident diagnosis, and remove them during cleanup.
 - If a bug required deep logs to solve, convert the minimum necessary signals into stable observability flags/settings.
+
+### 8.4 Incident Triage Tips (Network vs Runtime)
+
+- If failures show transport signatures (for example `Could not parse HTTP response`, missing `http-status`, or `header_bytes=0`), treat environment/network constraints as first hypothesis.
+- In sandboxed runs, request escalation early for network-dependent E2E diagnosis instead of repeatedly retrying non-escalated commands.
+- Before changing runtime logic, verify whether a direct provider probe (same key/model route) succeeds under current permissions.
+- For long live runs, rely on heartbeat + sub-step signals (`step-execution`, `tool-call`, `tool-result`) to distinguish true stalls from active progress.

@@ -1,0 +1,26 @@
+#+TITLE: BDD 015 - Planner expands outline headline by headline
+
+* Feature
+As a user, planner mode should expand an existing outline section-by-section for long reports.
+
+* Scenario: Planner enforces one-heading-per-step long report expansion
+Given target heading "Long Report Draft"
+And fixture source is "inline section: Fixture Input"
+And planner task "根据提纲逐节生成长报告，按标题逐节扩写"
+And model "qwen/qwen3-8b"
+And provider mode "live"
+When user runs command "org-ai-skills-plan-run"
+Then run status should be one of "applied,success,done"
+And dag info should contain "skills: outline-driven-long-report"
+And dag info should contain "[success] s1"
+And dag info should contain "[success] s2"
+And dag info should not contain "skills: article-compose-from-outline"
+
+* Fixture Input
+** Long Report Draft
+*** Background
+**** Problem
+Outline-only note requiring expansion into complete prose.
+*** Architecture
+**** Components
+Summarize module responsibilities with concrete details.
